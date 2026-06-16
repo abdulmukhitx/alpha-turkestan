@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: geoai-postgis
+    environment:
+      POSTGRES_USER: geoai
+      POSTGRES_PASSWORD: geoai_secret
+      POSTGRES_DB: geoai_tko
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geoai -d geoai_tko"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: geoai-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: geoai_admin
+      MINIO_ROOT_PASSWORD: geoai_secret_minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgis_data:
+    driver: local
+  minio_data:
+    driver: local

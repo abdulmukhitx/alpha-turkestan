@@ -1,0 +1,26 @@
+{
+  "project": "GeoAI-TKO",
+  "date": "2026-06-16T12:29:15.222882",
+  "bbox": [
+    67.5,
+    40.8,
+    71.5,
+    44.0
+  ],
+  "period": {
+    "start": "2023-06-01",
+    "end": "2023-09-30"
+  },
+  "cloud_cover_max": 30,
+  "bands": [
+    "B2",
+    "B3",
+    "B4",
+    "B8"
+  ],
+  "crs": "EPSG:32642",
+  "scale_m": 10,
+  "images_in_collection": 826,
+  "gee_task_id": "4GGFSFDHWGGIZHUNWWPFIJN3",
+  "output_file": "C:\\Users\\oqa1a\\GeoAI-TKO\\data\\raw\\sentinel2_day1.tif"
+}
