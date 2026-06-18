@@ -20,7 +20,8 @@ env/
 # Python
 __pycache__/
 *.pyc
-*.pyo
+.venv/
+venv/
 *.pyd
 .Python
 *.egg-info/
