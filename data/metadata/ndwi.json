@@ -1,0 +1,17 @@
+{
+  "layer": "ndwi",
+  "name": "Normalized Difference Water Index",
+  "formula": "(Green - NIR) / (Green + NIR) = (B3 - B8) / (B3 + B8)",
+  "value_range": {
+    "min": -0.96,
+    "max": 1.0,
+    "mean": -0.26
+  },
+  "crs": "EPSG:32642",
+  "resolution_m": 10,
+  "source": "COPERNICUS/S2_SR_HARMONIZED",
+  "acquisition_period": "2023-06-01 to 2023-09-30",
+  "scenes": 1632,
+  "composite_method": "median",
+  "file": "data/processed/ndwi_tko_final.tif"
+}

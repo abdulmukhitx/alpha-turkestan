@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoAI · Туркестанская область</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════ BOOT SCREEN ═══ -->
+<div id="boot-screen">
+  <div class="boot-inner">
+    <div class="boot-logo">
+      <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+        <circle cx="24" cy="24" r="22" stroke="#00FF87" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <circle cx="24" cy="24" r="14" stroke="#38BDF8" stroke-width="1" opacity="0.6"/>
+        <circle cx="24" cy="24" r="5" fill="#00FF87"/>
+        <line x1="24" y1="2" x2="24" y2="10" stroke="#00FF87" stroke-width="1.5"/>
+        <line x1="24" y1="38" x2="24" y2="46" stroke="#00FF87" stroke-width="1.5"/>
+        <line x1="2" y1="24" x2="10" y2="24" stroke="#00FF87" stroke-width="1.5"/>
+        <line x1="38" y1="24" x2="46" y2="24" stroke="#00FF87" stroke-width="1.5"/>
+      </svg>
+    </div>
+    <div class="boot-title">GeoAI Platform</div>
+    <div class="boot-sub">Туркестанская область · Казахстан</div>
+    <div class="boot-bar"><div class="boot-fill" id="boot-fill"></div></div>
+    <div class="boot-status" id="boot-status">Инициализация системы...</div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════ MAIN APP ════════ -->
+<div id="app" style="display:none">
+
+  <!-- TOP NAV ─────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand-mark">
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+          <circle cx="14" cy="14" r="12" stroke="#00FF87" stroke-width="1.2" stroke-dasharray="3 2"/>
+          <circle cx="14" cy="14" r="3" fill="#00FF87"/>
+        </svg>
+      </div>
+      <span class="brand-name">GeoAI<span class="brand-dot">·</span>TKO</span>
+    </div>
+    <div class="topbar-center">
+      <div class="coord-display" id="coord-display">
+        <span class="coord-label">LAT</span><span class="coord-val" id="lat-val">—</span>
+        <span class="coord-sep">·</span>
+        <span class="coord-label">LON</span><span class="coord-val" id="lon-val">—</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="status-pill">
+        <span class="status-dot"></span>
+        <span>Sentinel-2 · 2023</span>
+      </div>
+      <button class="icon-btn" title="Обновить данные" onclick="refreshData()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 1 1 1.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M2 12V8h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- WORKSPACE ───────────────────────────────────────────────── -->
+  <main class="workspace">
+
+    <!-- LEFT PANEL ─── Слои и управление ───────────────────────── -->
+    <aside class="panel panel-left" id="panel-left">
+      <div class="panel-header">
+        <span class="panel-eyebrow">Мониторинг</span>
+        <h2 class="panel-title">Индексы</h2>
+      </div>
+
+      <!-- Активный слой -->
+      <div class="section-label">Активный слой</div>
+      <div class="layer-list" id="layer-list">
+
+        <button class="layer-btn active" data-layer="ndvi" onclick="switchLayer('ndvi', this)">
+          <div class="layer-swatch" style="background: linear-gradient(90deg,#d73027,#f9f097,#1a9850)"></div>
+          <div class="layer-info">
+            <span class="layer-name">NDVI</span>
+            <span class="layer-desc">Растительность</span>
+          </div>
+          <div class="layer-badge" id="badge-ndvi">—</div>
+        </button>
+
+        <button class="layer-btn" data-layer="ndwi" onclick="switchLayer('ndwi', this)">
+          <div class="layer-swatch" style="background: linear-gradient(90deg,#f7fbff,#2171b5)"></div>
+          <div class="layer-info">
+            <span class="layer-name">NDWI</span>
+            <span class="layer-desc">Водные ресурсы</span>
+          </div>
+          <div class="layer-badge" id="badge-ndwi">—</div>
+        </button>
+
+        <button class="layer-btn disabled" data-layer="lst" title="Скоро">
+          <div class="layer-swatch" style="background: linear-gradient(90deg,#ffffcc,#bd0026); opacity:0.4"></div>
+          <div class="layer-info">
+            <span class="layer-name">LST</span>
+            <span class="layer-desc">Температура</span>
+          </div>
+          <span class="coming-soon">Скоро</span>
+        </button>
+
+        <button class="layer-btn disabled" data-layer="change" title="Скоро">
+          <div class="layer-swatch" style="background: linear-gradient(90deg,#440154,#fde725); opacity:0.4"></div>
+          <div class="layer-info">
+            <span class="layer-name">Change</span>
+            <span class="layer-desc">Изменения 2017–2023</span>
+          </div>
+          <span class="coming-soon">Скоро</span>
+        </button>
+
+      </div>
+
+      <!-- Прозрачность -->
+      <div class="section-label" style="margin-top:20px">Прозрачность</div>
+      <div class="opacity-row">
+        <input type="range" id="opacity-slider" class="slider" min="0" max="100" value="85"
+          oninput="setLayerOpacity(this.value)" />
+        <span class="opacity-val" id="opacity-label">85%</span>
+      </div>
+
+      <!-- Год -->
+      <div class="section-label" style="margin-top:20px">Временной период</div>
+      <div class="year-selector" id="year-selector">
+        <button class="year-btn" onclick="selectYear(2020,this)">2020</button>
+        <button class="year-btn" onclick="selectYear(2021,this)">2021</button>
+        <button class="year-btn" onclick="selectYear(2022,this)">2022</button>
+        <button class="year-btn active" onclick="selectYear(2023,this)">2023</button>
+      </div>
+      <div class="year-note">* Данные за 2024 в обработке</div>
+
+      <!-- Алерты -->
+      <div class="section-label" style="margin-top:20px">Алерты системы</div>
+      <div id="alert-list">
+        <div class="alert-item alert-fire">
+          <div class="alert-icon">🔥</div>
+          <div class="alert-body">
+            <div class="alert-title">Пожары — 3 очага</div>
+            <div class="alert-meta">Шардаринский р-н · обнаружено сегодня</div>
+          </div>
+        </div>
+        <div class="alert-item alert-drought">
+          <div class="alert-icon">⚠️</div>
+          <div class="alert-body">
+            <div class="alert-title">Засуха — средний уровень</div>
+            <div class="alert-meta">NDVI снизился на 12% за квартал</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Colorbar -->
+      <div class="colorbar-wrap" id="colorbar-wrap">
+        <div class="colorbar-title" id="colorbar-title">NDVI · 2023</div>
+        <div class="colorbar" id="colorbar-gradient"></div>
+        <div class="colorbar-labels">
+          <span id="cb-min">−0.2</span>
+          <span>0</span>
+          <span id="cb-max">0.8</span>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- MAP CENTER ──────────────────────────────────────────────── -->
+    <section class="map-section">
+      <div id="map"></div>
+
+      <!-- Scan line effect -->
+      <div class="scan-line" id="scan-line"></div>
+
+      <!-- Map toolbar -->
+      <div class="map-toolbar">
+        <button class="map-tool-btn" title="Приближение" onclick="mapInstance.zoomIn()">+</button>
+        <button class="map-tool-btn" title="Отдаление" onclick="mapInstance.zoomOut()">−</button>
+        <div class="map-tool-sep"></div>
+        <button class="map-tool-btn" title="По всей области" onclick="fitTKO()">⊕</button>
+        <button class="map-tool-btn" title="Переключить подложку" onclick="toggleBasemap()">⊞</button>
+      </div>
+
+      <!-- Bottom info strip -->
+      <div class="map-footer">
+        <span id="map-zoom-label">Zoom: 8</span>
+        <span class="map-footer-sep">·</span>
+        <span>EPSG:32642</span>
+        <span class="map-footer-sep">·</span>
+        <span id="map-pixel-info">Наведите курсор на карту</span>
+      </div>
+    </section>
+
+    <!-- RIGHT PANEL ─── AI анализ ──────────────────────────────── -->
+    <aside class="panel panel-right" id="panel-right">
+      <div class="panel-header">
+        <span class="panel-eyebrow">Powered by DeepSeek</span>
+        <h2 class="panel-title">AI Анализ</h2>
+      </div>
+
+      <!-- Точка анализа -->
+      <div class="click-prompt" id="click-prompt">
+        <div class="click-icon">
+          <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+            <circle cx="16" cy="16" r="14" stroke="#00FF87" stroke-width="1" stroke-dasharray="3 2" opacity="0.5"/>
+            <circle cx="16" cy="16" r="6" stroke="#00FF87" stroke-width="1.5"/>
+            <circle cx="16" cy="16" r="2" fill="#00FF87"/>
+            <line x1="16" y1="4" x2="16" y2="10" stroke="#00FF87" stroke-width="1.5"/>
+            <line x1="16" y1="22" x2="16" y2="28" stroke="#00FF87" stroke-width="1.5"/>
+            <line x1="4" y1="16" x2="10" y2="16" stroke="#00FF87" stroke-width="1.5"/>
+            <line x1="22" y1="16" x2="28" y2="16" stroke="#00FF87" stroke-width="1.5"/>
+          </svg>
+        </div>
+        <p class="click-text">Кликните на любую точку карты, чтобы получить AI-анализ этого места</p>
+      </div>
+
+      <!-- Результат анализа -->
+      <div id="analysis-result" style="display:none">
+
+        <div class="result-location" id="result-location">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="5" r="3" stroke="#00FF87" stroke-width="1.2"/><path d="M6 9C6 9 2 6.5 2 5a4 4 0 0 1 8 0C10 6.5 6 9 6 9z" stroke="#00FF87" stroke-width="1.2"/></svg>
+          <span id="result-coords">42.123°N · 69.456°E</span>
+        </div>
+
+        <!-- Значения индексов -->
+        <div class="metrics-grid" id="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-label">NDVI</div>
+            <div class="metric-value" id="m-ndvi">—</div>
+            <div class="metric-bar"><div class="metric-fill ndvi-fill" id="bar-ndvi"></div></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">NDWI</div>
+            <div class="metric-value" id="m-ndwi">—</div>
+            <div class="metric-bar"><div class="metric-fill ndwi-fill" id="bar-ndwi"></div></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Класс</div>
+            <div class="metric-value small" id="m-class">—</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Тренд</div>
+            <div class="metric-value small" id="m-trend">—</div>
+          </div>
+        </div>
+
+        <!-- AI вывод -->
+        <div class="ai-block">
+          <div class="ai-header">
+            <div class="ai-pulse"></div>
+            <span>AI — интерпретация</span>
+          </div>
+          <div class="ai-text" id="ai-text">
+            <span class="ai-loading" id="ai-loading">
+              <span class="dot-1">.</span><span class="dot-2">.</span><span class="dot-3">.</span>
+            </span>
+          </div>
+        </div>
+
+        <!-- Мини-график -->
+        <div class="chart-section">
+          <div class="chart-label">NDVI — динамика по годам</div>
+          <div class="chart-area">
+            <canvas id="trend-chart" width="200" height="80"></canvas>
+          </div>
+        </div>
+
+        <!-- Рекомендации -->
+        <div id="recommendations" style="display:none">
+          <div class="section-label">Рекомендации</div>
+          <div id="rec-list"></div>
+        </div>
+
+      </div>
+
+      <!-- Статистика по области -->
+      <div class="stats-section">
+        <div class="section-label" style="margin-top:16px">Область целиком</div>
+        <div class="stat-row">
+          <span class="stat-label">Ср. NDVI 2023</span>
+          <span class="stat-val green" id="stat-ndvi">0.31</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Покрытие данных</span>
+          <span class="stat-val" id="stat-coverage">97.4%</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Облачность</span>
+          <span class="stat-val" id="stat-cloud">3.8%</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Разрешение</span>
+          <span class="stat-val">10 м / пиксель</span>
+        </div>
+
+        <!-- Мини land-cover bars -->
+        <div class="section-label" style="margin-top:14px">Землепользование</div>
+        <div class="lc-bars" id="lc-bars">
+          <div class="lc-item">
+            <div class="lc-row"><span>Пустыня / солончак</span><span>62%</span></div>
+            <div class="lc-track"><div class="lc-fill" style="width:62%;background:#8B7355"></div></div>
+          </div>
+          <div class="lc-item">
+            <div class="lc-row"><span>Ирригац. поля</span><span>18%</span></div>
+            <div class="lc-track"><div class="lc-fill" style="width:18%;background:#00FF87"></div></div>
+          </div>
+          <div class="lc-item">
+            <div class="lc-row"><span>Пастбища</span><span>11%</span></div>
+            <div class="lc-track"><div class="lc-fill" style="width:11%;background:#7ECB35"></div></div>
+          </div>
+          <div class="lc-item">
+            <div class="lc-row"><span>Вода</span><span>5%</span></div>
+            <div class="lc-track"><div class="lc-fill" style="width:5%;background:#38BDF8"></div></div>
+          </div>
+          <div class="lc-item">
+            <div class="lc-row"><span>Застройка</span><span>4%</span></div>
+            <div class="lc-track"><div class="lc-fill" style="width:4%;background:#94A3B8"></div></div>
+          </div>
+        </div>
+      </div>
+
+    </aside>
+  </main>
+
+</div><!-- /app -->
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js?v=3"></script>
+</body>
+</html>

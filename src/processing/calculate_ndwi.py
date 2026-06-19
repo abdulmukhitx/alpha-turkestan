@@ -1,6 +1,6 @@
 from pathlib import Path
-import rasterio
 import numpy as np 
+import rasterio
 
 BASE_DIR= Path(__file__).resolve().parents[2]
 INPUT_RASTER= BASE_DIR / "data" / "raw" / "sentinel2_day1.tif"

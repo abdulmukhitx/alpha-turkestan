@@ -1,0 +1,18 @@
+{
+  "layer": "ndvi",
+  "name": "Normalized Difference Vegetation Index",
+  "formula": "(NIR - Red) / (NIR + Red) = (B8 - B4) / (B8 + B4)",
+  "value_range": {
+    "min": -1.0,
+    "max": 1.0,
+    "mean": 0.16
+  },
+  "crs": "EPSG:32642",
+  "resolution_m": 10,
+  "source": "COPERNICUS/S2_SR_HARMONIZED",
+  "acquisition_period": "2023-06-01 to 2023-09-30",
+  "scenes": 1632,
+  "composite_method": "median",
+  "nodata_inside_pct": 0.0,
+  "file": "data/processed/ndvi_tko_final.tif"
+}

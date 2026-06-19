@@ -13,10 +13,12 @@ import geopandas as gpd
 import rasterio
 from rasterio.features import geometry_mask
 from raster_utils import save_single_band
-
 import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+
+matplotlib.use('Agg')
+
 
 # ── Пути ──
 RASTER = Path(r'C:\Users\oqa1a\GeoAI-TKO\data\raw\sentinel2_day1_full.tif')
