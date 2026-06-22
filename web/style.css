@@ -336,9 +336,11 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 /* Leaflet dark overrides */
 .leaflet-container { background: #090E1A !important; }
-.leaflet-tile-pane { filter: brightness(0.7) saturate(0.6) hue-rotate(200deg); }
 .leaflet-control-attribution { display: none !important; }
 .leaflet-control-zoom { display: none !important; }
+
+/* Фильтр затемнения — ТОЛЬКО для basemap, не для слоёв NDVI/NDWI */
+.basemap-dark-pane { filter: brightness(0.85) saturate(0.5); }
 
 /* Custom marker pulse */
 .pulse-marker {

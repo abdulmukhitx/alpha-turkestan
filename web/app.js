@@ -11,10 +11,10 @@ const CONFIG = {
   // Бэкенд URL — поменяй если FastAPI на другом порту
   API_BASE: 'http://localhost:8000',
 
-  // Bounds Туркестанской области [SW, NE] в WGS84
-  TKO_BOUNDS: [[40.8, 67.5], [44.0, 71.5]],
-  TKO_CENTER: [42.3, 69.5],
-  TKO_ZOOM:   8,
+  // Bounds NDVI GeoTIFF → WGS84 (из geotiff)
+  TKO_BOUNDS: [[41.5068, 66.0286], [45.8942, 73.1803]],
+  TKO_CENTER: [43.70, 69.60],
+  TKO_ZOOM:   7,
 
   // Слои: id → конфигурация
   LAYERS: {
@@ -67,8 +67,9 @@ const state = {
   layerOpacity: 0.85,
   activeBasemap:'dark',
   selectedPoint: null,
-  overlays:     {},     // layerId → leaflet ImageOverlay
+  overlays:     {},     // layerId → leaflet TileLayer
   marker:       null,
+  boundsSynced: false,   // подгонялась ли карта под реальные bounds COG
   isLoading:    false,
 };
 
@@ -122,9 +123,15 @@ function initMap() {
     preferCanvas:    true,
   });
 
+  // Отдельный pane для подложки — чтобы CSS-фильтр затемнения
+  // не применялся к слоям NDVI/NDWI (иначе цвета индексов искажались)
+  mapInstance.createPane('basemapPane');
+  mapInstance.getPane('basemapPane').style.zIndex = 200;
+  mapInstance.getPane('basemapPane').classList.add('basemap-dark-pane');
+
   // Подложка
   basemapLayer = L.tileLayer(CONFIG.BASEMAPS.dark, {
-    maxZoom: 18, subdomains: 'abcd',
+    maxZoom: 18, subdomains: 'abcd', pane: 'basemapPane',
   }).addTo(mapInstance);
 
   // Граница области
@@ -165,40 +172,31 @@ async function loadBoundary() {
   }
 }
 
-// ── Загрузка растрового слоя ─────────────────────────────────────
+// ── Загрузка растрового слоя через динамические XYZ-тайлы ────────
 async function loadLayer(layerId) {
   const cfg = CONFIG.LAYERS[layerId];
   if (!cfg) return;
 
-  // Убрать предыдущий overlay того же слоя (если есть)
   if (state.overlays[layerId]) {
     mapInstance.removeLayer(state.overlays[layerId]);
     delete state.overlays[layerId];
   }
 
-  try {
-    // FastAPI отдаёт PNG напрямую по endpoint
-    // URL формируем с параметром year для будущего переключения
-    const url = `${CONFIG.API_BASE}${cfg.endpoint}?year=${state.activeYear}&format=png`;
+  const tileUrl = `${CONFIG.API_BASE}/cog/tiles/${layerId}/${state.activeYear}/{z}/{x}/{y}.png`;
 
-    const overlay = L.imageOverlay(url, CONFIG.TKO_BOUNDS, {
-      opacity:     state.layerOpacity,
-      interactive: false,
-      // className помогает стилизовать через CSS если надо
-      className:   `layer-overlay layer-${layerId}`,
-    });
+  const tileLayer = L.tileLayer(tileUrl, {
+    opacity:     state.layerOpacity,
+    tileSize:    256,
+    minZoom:     6,
+    maxZoom:     16,
+    crossOrigin: true,
+  });
 
-    overlay.addTo(mapInstance);
-    state.overlays[layerId] = overlay;
+  tileLayer.addTo(mapInstance);
+  state.overlays[layerId] = tileLayer;
 
-    // Обновить badge с годом
-    const badge = document.getElementById(`badge-${layerId}`);
-    if (badge) badge.textContent = state.activeYear;
-
-  } catch (e) {
-    console.error(`Ошибка загрузки слоя ${layerId}:`, e);
-    showLayerError(layerId);
-  }
+  const badge = document.getElementById(`badge-${layerId}`);
+  if (badge) badge.textContent = state.activeYear;
 }
 
 // ── Показать только активный слой ────────────────────────────────
@@ -248,13 +246,12 @@ function selectYear(year, btn) {
   document.querySelectorAll('.year-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
 
-  // Перезагрузить все уже загруженные слои с новым годом
-  const loadedIds = Object.keys(state.overlays);
-  loadedIds.forEach(id => {
-    mapInstance.removeLayer(state.overlays[id]);
-    delete state.overlays[id];
+  Object.entries(state.overlays).forEach(([id]) => {
+    const newUrl = `${CONFIG.API_BASE}/cog/tiles/${id}/${state.activeYear}/{z}/{x}/{y}.png`;
+    state.overlays[id].setUrl(newUrl);
+    const badge = document.getElementById(`badge-${id}`);
+    if (badge) badge.textContent = state.activeYear;
   });
-  loadLayer(state.activeLayer);
 }
 
 // Переключить подложку
@@ -269,14 +266,9 @@ function fitTKO() {
   mapInstance.fitBounds(CONFIG.TKO_BOUNDS, { padding: [20, 20] });
 }
 
-// Refresh
+// Refresh — перезапросить тайлы заново (полезно если сервер обновил данные)
 function refreshData() {
-  const loadedIds = Object.keys(state.overlays);
-  loadedIds.forEach(id => {
-    mapInstance.removeLayer(state.overlays[id]);
-    delete state.overlays[id];
-  });
-  loadLayer(state.activeLayer);
+  Object.values(state.overlays).forEach(layer => layer.redraw());
 }
 
 // ── Colorbar ─────────────────────────────────────────────────────
