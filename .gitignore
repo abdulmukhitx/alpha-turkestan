@@ -33,6 +33,10 @@ htmlcov/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# Node
+node_modules/
+.vite/
+
 # IDE
 .vscode/
 .idea/
@@ -48,3 +52,4 @@ Thumbs.db
 tmp_*/
 build/
 dist/
+*.log
