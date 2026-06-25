@@ -18,16 +18,6 @@ function Typewriter({ text }) {
   return <>{shown}</>
 }
 
-function classify(ndvi, ndwi) {
-  if (ndvi == null) return ['—', '—']
-  if (ndwi != null && ndwi > 0.2) return ['Водная поверхность', '→ стабильно']
-  if (ndvi > 0.50) return ['Густая растительность', '↑ активный рост']
-  if (ndvi > 0.30) return ['Ирригированное поле', '↑ хорошее состояние']
-  if (ndvi > 0.15) return ['Пастбище', '→ умеренное']
-  if (ndvi > 0.05) return ['Деградирующие земли', '↓ требует мониторинга']
-  return ['Голая почва / пустыня', '→ минимальная активность']
-}
-
 // order + Russian labels for the spectral indices panel
 const INDICES = [
   { key: 'ndvi', code: 'NDVI', label: 'Растительность' },
@@ -90,12 +80,6 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
     )
   }
 
-  const ndvi = pixel?.ndvi ?? null
-  const ndwi = pixel?.ndwi ?? null
-  const [autoClass, autoTrend] = classify(ndvi, ndwi)
-  const landClass = pixel?.land_class || autoClass
-  const trend = pixel?.trend_label || autoTrend
-
   return (
     <aside className="panel panel-right">
       <div className="panel-header">
@@ -142,17 +126,6 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
             </div>
           )
         })}
-      </div>
-
-      <div className="metrics-grid">
-        <div className="metric-card">
-          <div className="metric-label">Класс</div>
-          <div className="metric-value small">{pixel ? landClass : '…'}</div>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">Тренд</div>
-          <div className="metric-value small">{pixel ? trend : '…'}</div>
-        </div>
       </div>
 
       <div className="ai-block">

@@ -71,7 +71,6 @@ export default function App() {
       const analysis = await fetchAnalysis({
         lat, lon: lng,
         ndvi: px.ndvi, ndwi: px.ndwi, ndre: px.ndre, ndmi: px.ndmi, bsi: px.bsi,
-        land_class: px.land_class,
         ml_class_ru: px.ml_class_ru, ml_confidence: px.ml_confidence,
       })
       if (requestIdRef.current !== reqId) return

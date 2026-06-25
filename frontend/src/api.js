@@ -18,11 +18,11 @@ export async function fetchPixel(lat, lon) {
   return r.json()
 }
 
-export async function fetchAnalysis({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, land_class, ml_class_ru, ml_confidence }) {
+export async function fetchAnalysis({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, ml_class_ru, ml_confidence }) {
   const r = await fetch('/api/analyze', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, land_class, ml_class_ru, ml_confidence }),
+    body:    JSON.stringify({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, ml_class_ru, ml_confidence }),
   })
   if (!r.ok) throw new Error(`Analysis failed: ${r.status}`)
   return r.json()

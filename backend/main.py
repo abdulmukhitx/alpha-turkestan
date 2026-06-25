@@ -405,15 +405,6 @@ async def tile(layer: str, z: int, x: int, y: int):
 #   PIXEL VALUES
 # ════════════════════════════════════════════════════════════════
 
-def _classify(ndvi, ndwi):
-    if ndvi is None:          return "Нет данных",            "—"
-    if ndwi and ndwi > 0.2:  return "Водная поверхность",    "→ стабильно"
-    if ndvi > 0.50:           return "Густая растительность", "↑ активный рост"
-    if ndvi > 0.30:           return "Ирригированное поле",   "↑ хорошее состояние"
-    if ndvi > 0.15:           return "Пастбище",              "→ умеренное"
-    if ndvi > 0.05:           return "Деградирующие земли",   "↓ требует мониторинга"
-    return "Голая почва / пустыня", "→ минимальная активность"
-
 def _demo(lat, lon):
     import math
     s = abs(math.sin(lat * 100) * math.cos(lon * 100))
@@ -490,15 +481,12 @@ async def pixel(
         return None if (v is None or (isinstance(v,float) and math.isnan(v))) else v
 
     ndvi, ndre, ndwi, ndmi, bsi = (safe(result.get(k)) for k in ("ndvi","ndre","ndwi","ndmi","bsi"))
-    land, trend = _classify(ndvi, ndwi)
     ml = classify_ml(ndvi, ndre, ndwi, ndmi, bsi, (result.get("bands") or {}).get("B08"))
 
     return {
         "lat": lat, "lon": lon,
         "ndvi": ndvi, "ndwi": ndwi, "ndre": ndre, "ndmi": ndmi, "bsi": bsi,
         "bands":      result.get("bands", {}),
-        "land_class": land,
-        "trend_label":trend,
         "ml_class":         ml["class"]         if ml else None,
         "ml_class_ru":      ml["class_ru"]      if ml else None,
         "ml_confidence":    ml["confidence"]    if ml else None,
@@ -519,23 +507,12 @@ class AnalyzeReq(BaseModel):
     ndre:       float | None = None
     ndmi:       float | None = None
     bsi:        float | None = None
-    land_class: str   | None = None
     ml_class_ru:    str   | None = None
     ml_confidence:  float | None = None
 
 
-def _surface_hint(ndvi, ndwi, bsi) -> str:
-    """Coarse land-cover guess to anchor the AI prompt with correct context."""
-    if ndwi is not None and ndwi > 0.2:   return "водный объект (река, озеро или канал)"
-    if ndvi is not None and ndvi > 0.40:  return "густая растительность (посевы или природная)"
-    if ndvi is not None and ndvi > 0.15:  return "разреженная растительность / сельхозугодья"
-    if bsi  is not None and bsi  > 0.10:  return "голая почва или деградированные земли"
-    return "смешанная / переходная зона"
-
-
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeReq):
-    hint = _surface_hint(req.ndvi, req.ndwi, req.bsi)
     idx_lines = []
     if req.ndvi is not None: idx_lines.append(f"NDVI (растительность)={req.ndvi:.3f}")
     if req.ndwi is not None: idx_lines.append(f"NDWI (вода)={req.ndwi:.3f}")
@@ -545,12 +522,10 @@ async def analyze(req: AnalyzeReq):
 
     prompt = (
         f"Точка {req.lat:.4f}°N, {req.lon:.4f}°E — Туркестанская область Казахстана.\n"
-        f"Предполагаемый тип поверхности: {hint}.\n"
-        + (f"ML-классификация (RandomForest): {req.ml_class_ru} "
+        + (f"Классификация земного покрова (ML-модель): {req.ml_class_ru} "
            f"(уверенность {req.ml_confidence*100:.0f}%).\n"
            if req.ml_class_ru and req.ml_confidence is not None else "")
         + ("Спектральные индексы: " + "; ".join(idx_lines) + ".\n" if idx_lines else "")
-        + (f"Класс: {req.land_class}.\n" if req.land_class else "")
         + "Дай краткую экспертную интерпретацию (2–3 предложения) на русском: "
           "тип землепользования, экологическое состояние и сельскохозяйственное значение."
     )
