@@ -88,20 +88,22 @@ _B02, _B03, _B04, _B05, _B08, _B8A, _B11 = 0, 1, 2, 3, 4, 5, 6
 
 
 # ── Layer config ──────────────────────────────────────────────────
+# Ranges tuned for this arid Central-Asian mosaic (scene NDVI peaks ≈0.4), so the
+# colour stretch actually spans the data instead of washing out to a flat hue.
 LAYERS = {
     "rgb":  {"label": "RGB снимок",            "range": None,          "cmap": None},
-    "ndvi": {"label": "NDVI — растительность", "range": (-0.2,  0.8), "cmap": "rdylgn"},
-    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.5,  0.6), "cmap": "blues"},
-    "ndre": {"label": "NDRE — стресс растений","range": (-0.2,  0.6), "cmap": "greens"},
-    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.5,  0.5), "cmap": "rdbu"},
-    "bsi":  {"label": "BSI — голая почва",     "range": (-0.5,  0.5), "cmap": "oranges"},
+    "ndvi": {"label": "NDVI — растительность", "range": (-0.05, 0.55), "cmap": "rdylgn"},
+    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.4,  0.4),  "cmap": "rdbu"},
+    "ndre": {"label": "NDRE — стресс растений","range": (-0.1,  0.45), "cmap": "rdylgn"},
+    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.5,  0.3),  "cmap": "rdbu"},
+    "bsi":  {"label": "BSI — голая почва",     "range": (-0.1,  0.35), "cmap": "oranges"},
 }
 
 CMAP_CSS = {
     "rgb":  None,
     "ndvi": "linear-gradient(to right,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)",
-    "ndwi": "linear-gradient(to right,#f7fbff,#74a9cf,#0570b0,#023858)",
-    "ndre": "linear-gradient(to right,#f7fcf5,#c7e9c0,#41ab5d,#00441b)",
+    "ndwi": "linear-gradient(to right,#b2182b,#f7f7f7,#2166ac)",   # rdbu: dry→water
+    "ndre": "linear-gradient(to right,#d73027,#fee08b,#1a9850)",   # rdylgn: stress→healthy
     "ndmi": "linear-gradient(to right,#67001f,#f4a582,#f7f7f7,#92c5de,#053061)",
     "bsi":  "linear-gradient(to right,#fff5eb,#fdd0a2,#fd8d3c,#d94801,#7f2704)",
 }
@@ -354,11 +356,11 @@ def _demo(lat, lon):
     b02,b03,b04 = b["B02"],b["B03"],b["B04"]
     b05,b08,b8a,b11 = b["B05"],b["B08"],b["B8A"],b["B11"]
     return {
-        "ndvi": round((b08-b04)/(b08+b04+eps),3),
-        "ndwi": round((b03-b08)/(b03+b08+eps),3),
-        "ndre": round((b08-b05)/(b08+b05+eps),3),
-        "ndmi": round((b8a-b11)/(b8a+b11+eps),3),
-        "bsi":  round(((b11+b04)-(b08+b02))/((b11+b04)+(b08+b02)+eps),3),
+        "ndvi": round((b08-b04)/(b08+b04+eps),4),
+        "ndwi": round((b03-b08)/(b03+b08+eps),4),
+        "ndre": round((b08-b05)/(b08+b05+eps),4),
+        "ndmi": round((b8a-b11)/(b8a+b11+eps),4),
+        "bsi":  round(((b11+b04)-(b08+b02))/((b11+b04)+(b08+b02)+eps),4),
         "bands": b, "demo": True,
     }
 
@@ -386,11 +388,11 @@ async def pixel(
             b   = raw[:7] / 10000  # reflectance
             eps = 1e-10
             return {
-                "ndvi": round((b[4]-b[2])/(b[4]+b[2]+eps),3),
-                "ndwi": round((b[1]-b[4])/(b[1]+b[4]+eps),3),
-                "ndre": round((b[4]-b[3])/(b[4]+b[3]+eps),3),
-                "ndmi": round((b[5]-b[6])/(b[5]+b[6]+eps),3),
-                "bsi":  round(((b[6]+b[2])-(b[4]+b[0]))/((b[6]+b[2])+(b[4]+b[0])+eps),3),
+                "ndvi": round((b[4]-b[2])/(b[4]+b[2]+eps),4),
+                "ndwi": round((b[1]-b[4])/(b[1]+b[4]+eps),4),
+                "ndre": round((b[4]-b[3])/(b[4]+b[3]+eps),4),
+                "ndmi": round((b[5]-b[6])/(b[5]+b[6]+eps),4),
+                "bsi":  round(((b[6]+b[2])-(b[4]+b[0]))/((b[6]+b[2])+(b[4]+b[0])+eps),4),
                 "bands": {
                     "B02":round(b[0],4),"B03":round(b[1],4),"B04":round(b[2],4),
                     "B05":round(b[3],4),"B08":round(b[4],4),"B8A":round(b[5],4),

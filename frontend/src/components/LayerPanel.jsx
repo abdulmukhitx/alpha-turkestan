@@ -1,8 +1,8 @@
 const SWATCH = {
   rgb:  'linear-gradient(90deg,#444,#bbb,#fff)',
   ndvi: 'linear-gradient(90deg,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)',
-  ndwi: 'linear-gradient(90deg,#f7fbff,#74a9cf,#0570b0,#023858)',
-  ndre: 'linear-gradient(90deg,#f7fcf5,#c7e9c0,#41ab5d,#00441b)',
+  ndwi: 'linear-gradient(90deg,#b2182b,#f7f7f7,#2166ac)',
+  ndre: 'linear-gradient(90deg,#d73027,#fee08b,#1a9850)',
   ndmi: 'linear-gradient(90deg,#67001f,#f4a582,#f7f7f7,#92c5de,#053061)',
   bsi:  'linear-gradient(90deg,#fff5eb,#fdd0a2,#fd8d3c,#d94801,#7f2704)',
 }
@@ -14,6 +14,15 @@ const NAMES = {
   ndre: ['NDRE', 'Стресс растений'],
   ndmi: ['NDMI', 'Влажность почвы'],
   bsi:  ['BSI', 'Голая почва'],
+}
+
+// Descriptive 3-stop labels (low / mid / high) shown under the colorbar
+const LABELS = {
+  ndvi: ['Пустыня', 'Разреженная', 'Густая'],
+  ndwi: ['Сухо', 'Норма', 'Вода'],
+  ndre: ['Стресс', '', 'Здоровая'],
+  ndmi: ['Сухая', 'Норма', 'Влажная'],
+  bsi:  ['Покрытая', '', 'Голая почва'],
 }
 
 export default function LayerPanel({ layers, activeLayer, onSelect, opacity, onOpacityChange }) {
@@ -63,9 +72,9 @@ export default function LayerPanel({ layers, activeLayer, onSelect, opacity, onO
           <div className="colorbar-title">{(NAMES[activeLayer] || [activeLayer])[0]}</div>
           <div className="colorbar" style={{ background: active.cssGradient }} />
           <div className="colorbar-labels">
-            <span>{active.range[0]}</span>
-            <span>0</span>
-            <span>{active.range[1]}</span>
+            {(LABELS[activeLayer] || [active.range[0], 0, active.range[1]]).map((t, i) => (
+              <span key={i}>{t}</span>
+            ))}
           </div>
         </div>
       )}

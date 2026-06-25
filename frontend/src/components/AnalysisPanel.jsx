@@ -28,6 +28,48 @@ function classify(ndvi, ndwi) {
   return ['Голая почва / пустыня', '→ минимальная активность']
 }
 
+// order + Russian labels for the spectral indices panel
+const INDICES = [
+  { key: 'ndvi', code: 'NDVI', label: 'Растительность' },
+  { key: 'ndre', code: 'NDRE', label: 'Стресс растений' },
+  { key: 'ndwi', code: 'NDWI', label: 'Водные ресурсы' },
+  { key: 'ndmi', code: 'NDMI', label: 'Влажность почвы' },
+  { key: 'bsi',  code: 'BSI',  label: 'Голая почва' },
+]
+
+// semantic colour per index value (green=good veg, blue=water, red/orange=dry/bare)
+function indexColor(key, v) {
+  if (v == null) return 'var(--text3)'
+  switch (key) {
+    case 'ndvi':
+      if (v > 0.4) return '#16a34a'
+      if (v > 0.2) return '#84cc16'
+      if (v > 0.1) return '#eab308'
+      return '#ef4444'
+    case 'ndre':
+      if (v > 0.4) return '#16a34a'
+      if (v > 0.2) return '#84cc16'
+      if (v > 0.05) return '#eab308'
+      return '#ef4444'
+    case 'ndwi':
+      if (v > 0.2) return '#2563eb'
+      if (v > 0) return '#60a5fa'
+      if (v > -0.2) return '#f59e0b'
+      return '#ef4444'
+    case 'ndmi':
+      if (v > 0.1) return '#2563eb'
+      if (v > -0.1) return '#f59e0b'
+      return '#ef4444'
+    case 'bsi':
+      if (v > 0.2) return '#dc2626'
+      if (v > 0.1) return '#f97316'
+      if (v > 0) return '#fbbf24'
+      return '#22c55e'
+    default:
+      return 'var(--text3)'
+  }
+}
+
 export default function AnalysisPanel({ point, pixel, aiText, loading, error }) {
   if (!point) {
     return (
@@ -54,9 +96,6 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
   const landClass = pixel?.land_class || autoClass
   const trend = pixel?.trend_label || autoTrend
 
-  const ndviPct = ndvi != null ? Math.max(0, Math.min(100, ((ndvi + 0.2) / 1.0) * 100)) : 0
-  const ndwiPct = ndwi != null ? Math.max(0, Math.min(100, ((ndwi + 0.5) / 1.1) * 100)) : 0
-
   return (
     <aside className="panel panel-right">
       <div className="panel-header">
@@ -72,17 +111,27 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
         <span>{point.lat.toFixed(4)}°N · {point.lng.toFixed(4)}°E</span>
       </div>
 
+      <div className="section-label">Спектральные индексы</div>
+      <div className="indices-list">
+        {INDICES.map(({ key, code, label }) => {
+          const v = pixel ? (pixel[key] ?? null) : null
+          const pct = v != null ? Math.max(2, Math.min(100, ((v + 1) / 2) * 100)) : 0
+          const color = indexColor(key, v)
+          return (
+            <div className="index-row" key={key}>
+              <div className="index-head">
+                <span className="index-name">{label} <span className="index-code">{code}</span></span>
+                <span className="index-val" style={{ color }}>{v != null ? v.toFixed(4) : '…'}</span>
+              </div>
+              <div className="index-track">
+                <div className="index-fill" style={{ width: `${pct}%`, background: color }} />
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
       <div className="metrics-grid">
-        <div className="metric-card">
-          <div className="metric-label">NDVI</div>
-          <div className="metric-value">{ndvi != null ? ndvi.toFixed(2) : '…'}</div>
-          <div className="metric-bar"><div className="metric-fill ndvi-fill" style={{ width: `${ndviPct}%` }} /></div>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">NDWI</div>
-          <div className="metric-value">{ndwi != null ? ndwi.toFixed(2) : '…'}</div>
-          <div className="metric-bar"><div className="metric-fill ndwi-fill" style={{ width: `${ndwiPct}%` }} /></div>
-        </div>
         <div className="metric-card">
           <div className="metric-label">Класс</div>
           <div className="metric-value small">{pixel ? landClass : '…'}</div>

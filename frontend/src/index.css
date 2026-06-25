@@ -251,6 +251,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .ndvi-fill { background: var(--signal); }
 .ndwi-fill { background: var(--data); }
 
+/* ── SPECTRAL INDICES LIST ────────────────────────────────────── */
+.indices-list { display: flex; flex-direction: column; gap: 9px; margin-bottom: 14px; }
+.index-row { display: flex; flex-direction: column; gap: 5px; }
+.index-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.index-name { font-family: var(--font-head); font-size: 11px; font-weight: 500; color: var(--text2); }
+.index-code { font-family: var(--font-mono); font-size: 9px; color: var(--text3); letter-spacing: 0.06em; }
+.index-val  { font-family: var(--font-mono); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.index-track { height: 6px; background: var(--bg3); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+.index-fill  { height: 100%; border-radius: 3px; width: 0%; transition: width 0.4s cubic-bezier(0.4,0,0.2,1), background 0.3s ease; }
+
 .ai-block {
   background: var(--signal-bg);
   border: 1px solid var(--border2);
