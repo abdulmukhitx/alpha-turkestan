@@ -111,6 +111,19 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
         <span>{point.lat.toFixed(4)}°N · {point.lng.toFixed(4)}°E</span>
       </div>
 
+      {pixel?.ml_class_ru && (
+        <div className="ml-block">
+          <div className="ml-header">
+            <span>ML-классификация</span>
+            <span className="ml-confidence">{Math.round((pixel.ml_confidence ?? 0) * 100)}%</span>
+          </div>
+          <div className="ml-class-name">{pixel.ml_class_ru}</div>
+          <div className="ml-bar">
+            <div className="ml-bar-fill" style={{ width: `${Math.round((pixel.ml_confidence ?? 0) * 100)}%` }} />
+          </div>
+        </div>
+      )}
+
       <div className="section-label">Спектральные индексы</div>
       <div className="indices-list">
         {INDICES.map(({ key, code, label }) => {

@@ -54,11 +54,20 @@ try:
 except ImportError:
     AI_OK = False
 
+try:
+    import pickle
+    import sklearn  # noqa: F401  needed so pickle.load can resolve the saved estimator
+    SKLEARN_OK = True
+except ImportError:
+    SKLEARN_OK = False
+    print("⚠  scikit-learn not available — ML land-cover classification disabled")
+
 # ── Paths ─────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
 COG_PATH  = Path(os.getenv("S2_COG_PATH", r"D:\data\s2_mosaic_cog.tif"))
+LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\lulc_classifier.pkl"))
 
 def s2_assets() -> list[str]:
     """Sorted list of all S2 GeoTIFF paths (fallback source)."""
@@ -80,6 +89,53 @@ def cog_bounds_wgs84() -> list[float] | None:
             l, b, r, t = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds)
             _COG_BOUNDS_WGS84 = (b, l, t, r)  # S, W, N, E
     return list(_COG_BOUNDS_WGS84)
+
+
+# ── ML land-cover classifier (RandomForest, trained on ESA WorldCover) ──
+# Trained by src/processing/train_lulc_rf.py. Optional: if the pickle isn't
+# there yet, /api/pixel just omits the ml_* fields and everything else works.
+CLASSIFIER  = None
+CLASS_NAMES: "list[str] | None" = None
+
+_ML_CLASS_RU = {
+    "water":              "Вода",
+    "dense_vegetation":   "Густая растительность",
+    "agriculture":        "Сельхозугодья",
+    "sparse_vegetation":  "Разреженная растительность",
+    "bare_soil":          "Голая почва",
+    "urban":              "Застройка",
+}
+
+def load_classifier():
+    global CLASSIFIER, CLASS_NAMES
+    if not (SKLEARN_OK and LULC_MODEL_PATH.exists()):
+        return
+    try:
+        with open(LULC_MODEL_PATH, "rb") as f:
+            saved = pickle.load(f)
+        CLASSIFIER  = saved["model"]
+        CLASS_NAMES = list(saved["label_encoder"].classes_)
+        print(f"✓ LULC classifier loaded: {len(CLASS_NAMES)} classes")
+    except Exception as e:
+        print(f"⚠  failed to load LULC classifier: {e}")
+
+load_classifier()
+
+
+def classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08):
+    """RandomForest land-cover prediction from the 5 indices + B08. None if unavailable."""
+    if CLASSIFIER is None or None in (ndvi, ndre, ndwi, ndmi, bsi, b08):
+        return None
+    feats = np.array([[ndvi, ndre, ndwi, ndmi, bsi, b08]], dtype=np.float32)
+    proba = CLASSIFIER.predict_proba(feats)[0]
+    idx   = int(np.argmax(proba))
+    cls   = CLASS_NAMES[idx]
+    return {
+        "class":         cls,
+        "class_ru":      _ML_CLASS_RU.get(cls, cls),
+        "confidence":    round(float(proba[idx]), 4),
+        "probabilities": {CLASS_NAMES[i]: round(float(p), 4) for i, p in enumerate(proba)},
+    }
 
 
 # ── Band indices (0-based) inside the 8-band S2 TIF ──────────────
@@ -295,6 +351,7 @@ async def health():
         "s2_tiles":  len(assets),
         "s2_dir":    str(S2_DIR),
         "ai_ready":  bool(os.getenv("GROQ_API_KEY") or os.getenv("DEEPSEEK_API_KEY")),
+        "lulc_classifier": CLASSIFIER is not None,
     }
 
 
@@ -422,17 +479,20 @@ async def pixel(
     def safe(v):
         return None if (v is None or (isinstance(v,float) and math.isnan(v))) else v
 
-    land, trend = _classify(safe(result.get("ndvi")), safe(result.get("ndwi")))
+    ndvi, ndre, ndwi, ndmi, bsi = (safe(result.get(k)) for k in ("ndvi","ndre","ndwi","ndmi","bsi"))
+    land, trend = _classify(ndvi, ndwi)
+    ml = classify_ml(ndvi, ndre, ndwi, ndmi, bsi, (result.get("bands") or {}).get("B08"))
+
     return {
         "lat": lat, "lon": lon,
-        "ndvi": safe(result.get("ndvi")),
-        "ndwi": safe(result.get("ndwi")),
-        "ndre": safe(result.get("ndre")),
-        "ndmi": safe(result.get("ndmi")),
-        "bsi":  safe(result.get("bsi")),
+        "ndvi": ndvi, "ndwi": ndwi, "ndre": ndre, "ndmi": ndmi, "bsi": bsi,
         "bands":      result.get("bands", {}),
         "land_class": land,
         "trend_label":trend,
+        "ml_class":         ml["class"]         if ml else None,
+        "ml_class_ru":      ml["class_ru"]      if ml else None,
+        "ml_confidence":    ml["confidence"]    if ml else None,
+        "ml_probabilities": ml["probabilities"] if ml else None,
         "demo":       result.get("demo", False),
     }
 
@@ -450,6 +510,8 @@ class AnalyzeReq(BaseModel):
     ndmi:       float | None = None
     bsi:        float | None = None
     land_class: str   | None = None
+    ml_class_ru:    str   | None = None
+    ml_confidence:  float | None = None
 
 
 def _surface_hint(ndvi, ndwi, bsi) -> str:
@@ -474,6 +536,9 @@ async def analyze(req: AnalyzeReq):
     prompt = (
         f"Точка {req.lat:.4f}°N, {req.lon:.4f}°E — Туркестанская область Казахстана.\n"
         f"Предполагаемый тип поверхности: {hint}.\n"
+        + (f"ML-классификация (RandomForest): {req.ml_class_ru} "
+           f"(уверенность {req.ml_confidence*100:.0f}%).\n"
+           if req.ml_class_ru and req.ml_confidence is not None else "")
         + ("Спектральные индексы: " + "; ".join(idx_lines) + ".\n" if idx_lines else "")
         + (f"Класс: {req.land_class}.\n" if req.land_class else "")
         + "Дай краткую экспертную интерпретацию (2–3 предложения) на русском: "

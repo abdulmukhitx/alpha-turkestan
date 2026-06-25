@@ -251,6 +251,23 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .ndvi-fill { background: var(--signal); }
 .ndwi-fill { background: var(--data); }
 
+/* ── ML CLASSIFICATION ────────────────────────────────────────── */
+.ml-block {
+  background: var(--data-bg);
+  border: 1px solid rgba(37,99,235,0.25);
+  border-radius: var(--radius-lg);
+  padding: 12px; margin-bottom: 14px;
+}
+.ml-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-family: var(--font-mono); font-size: 9px; color: var(--data);
+  letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px;
+}
+.ml-confidence { font-weight: 600; }
+.ml-class-name { font-family: var(--font-head); font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.ml-bar { height: 4px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; overflow: hidden; }
+.ml-bar-fill { height: 100%; background: var(--data); border-radius: 2px; transition: width 0.5s cubic-bezier(0.4,0,0.2,1); }
+
 /* ── SPECTRAL INDICES LIST ────────────────────────────────────── */
 .indices-list { display: flex; flex-direction: column; gap: 9px; margin-bottom: 14px; }
 .index-row { display: flex; flex-direction: column; gap: 5px; }
