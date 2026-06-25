@@ -5,7 +5,7 @@ import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
 import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis } from './api'
 
-const FALLBACK_CENTER = [43.7, 69.6]
+const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
 
 const BOOT_STEPS = [

@@ -144,15 +144,18 @@ _B02, _B03, _B04, _B05, _B08, _B8A, _B11 = 0, 1, 2, 3, 4, 5, 6
 
 
 # ── Layer config ──────────────────────────────────────────────────
-# Ranges tuned for this arid Central-Asian mosaic (scene NDVI peaks ≈0.4), so the
-# colour stretch actually spans the data instead of washing out to a flat hue.
+# Ranges measured from the actual mosaic (random full-res sample, ~12.4M valid px),
+# not textbook guesses — this region's real NDVI/NDRE etc. sit far narrower and/or
+# off-centre than generic ranges assume (e.g. NDVI p5–p95 ≈ 0.03–0.15, NDRE is
+# almost entirely negative), so a generic (-1,1)-ish stretch washes out to one flat
+# hue. Bounds below track roughly the 1st–99th percentile of real data per index.
 LAYERS = {
     "rgb":  {"label": "RGB снимок",            "range": None,          "cmap": None},
-    "ndvi": {"label": "NDVI — растительность", "range": (-0.05, 0.55), "cmap": "rdylgn"},
-    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.4,  0.4),  "cmap": "rdbu"},
-    "ndre": {"label": "NDRE — стресс растений","range": (-0.1,  0.45), "cmap": "rdylgn"},
-    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.5,  0.3),  "cmap": "rdbu"},
-    "bsi":  {"label": "BSI — голая почва",     "range": (-0.1,  0.35), "cmap": "oranges"},
+    "ndvi": {"label": "NDVI — растительность", "range": (-0.05, 0.30), "cmap": "rdylgn"},
+    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.30, 0.15), "cmap": "rdbu"},
+    "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.15), "cmap": "rdylgn"},
+    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.25, 0.30), "cmap": "rdbu"},
+    "bsi":  {"label": "BSI — голая почва",     "range": (0.00,  0.32), "cmap": "oranges"},
 }
 
 CMAP_CSS = {
@@ -216,13 +219,20 @@ def mosaic_tile(x: int, y: int, z: int):
     Returns (data: float32 array (bands, 256, 256), mask: uint8 (256, 256))
     or (None, None) when no coverage.
 
-    rio-tiler mask convention: 255 = valid pixel, 0 = nodata.
+    Mask is derived from the raw bands ourselves — valid unless ALL bands == 0 —
+    rather than trusting rio-tiler's img.mask. rio-tiler flags a pixel nodata as
+    soon as ANY single band reads 0, which is too aggressive here: it kills real
+    pixels where one band legitimately reads ~0 (and the computed index is ≈0)
+    while the rest of the bands, and the COG's actual nodata convention (all 7
+    bands == 0), say the pixel is valid.
     """
     if cog_available():
         try:
             with Reader(str(COG_PATH)) as src:
                 img = src.tile(x, y, z, tilesize=256)
-            return img.data.astype(np.float32), img.mask
+            data = img.data.astype(np.float32)
+            mask = (~np.all(data == 0, axis=0)).astype(np.uint8) * 255
+            return data, mask
         except TileOutsideBounds:
             return None, None
         except Exception as e:
@@ -250,8 +260,8 @@ def _mosaic_tile_legacy(x: int, y: int, z: int):
             print(f"  skip {Path(asset).name}: {e}")
             continue
 
-        d = img.data.astype(np.float32)   # (bands, 256, 256)
-        m = img.mask                       # (256, 256)  255=valid
+        d = img.data.astype(np.float32)                       # (bands, 256, 256)
+        m = (~np.all(d == 0, axis=0)).astype(np.uint8) * 255  # valid unless ALL bands == 0
 
         if result_data is None:
             result_data = d.copy()
@@ -580,7 +590,7 @@ async def analyze(req: AnalyzeReq):
 
 @app.get("/metadata")
 async def metadata():
-    bounds = cog_bounds_wgs84() or [40.8, 67.5, 44.0, 71.5]  # S,W,N,E
+    bounds = cog_bounds_wgs84() or [40.31, 65.36, 46.46, 71.36]  # S,W,N,E
     center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
     return {
         "region": {

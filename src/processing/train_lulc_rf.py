@@ -26,7 +26,7 @@ MODEL_PATH = Path(r"D:\data\lulc_classifier.pkl")
 
 # Every 30th pixel on both axes (~300m spacing). The COG is 41812x61041px
 # (~2.55B px) so sampling every pixel is neither necessary nor finishable.
-SAMPLE_STEP = 100
+SAMPLE_STEP = 50
 BLOCK_ROWS = 512  # one read per ~tile-height instead of one per sample point
 
 # ESA WorldCover class code -> simplified land-cover label for this region
@@ -114,8 +114,8 @@ def main():
 
     print("\nTraining RandomForest...")
     clf = RandomForestClassifier(
-        n_estimators=100, max_depth=20,
-        min_samples_split=10, min_samples_leaf=5,
+        n_estimators=300, max_depth=25,
+        min_samples_split=5,min_samples_leaf=5,
         class_weight="balanced", oob_score=True,
         random_state=42, n_jobs=-1,
     )
