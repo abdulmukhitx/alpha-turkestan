@@ -144,18 +144,19 @@ _B02, _B03, _B04, _B05, _B08, _B8A, _B11 = 0, 1, 2, 3, 4, 5, 6
 
 
 # ── Layer config ──────────────────────────────────────────────────
-# Ranges measured from the actual mosaic (random full-res sample, ~12.4M valid px),
+# Ranges measured from the actual mosaic (random full-res sample, ~15.4M valid px),
 # not textbook guesses — this region's real NDVI/NDRE etc. sit far narrower and/or
-# off-centre than generic ranges assume (e.g. NDVI p5–p95 ≈ 0.03–0.15, NDRE is
-# almost entirely negative), so a generic (-1,1)-ish stretch washes out to one flat
-# hue. Bounds below track roughly the 1st–99th percentile of real data per index.
+# off-centre than generic ranges assume, so a generic (-1,1)-ish stretch washes out
+# to one flat hue. Bounds track the 2nd–98th percentile of real data per index —
+# tighter than 1st–99th for more contrast, at the cost of hard-clipping the rarest
+# extreme pixels (e.g. open water on NDWI, very dense canopy on NDVI) to the edge colour.
 LAYERS = {
     "rgb":  {"label": "RGB снимок",            "range": None,          "cmap": None},
-    "ndvi": {"label": "NDVI — растительность", "range": (-0.05, 0.30), "cmap": "rdylgn"},
-    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.30, 0.15), "cmap": "rdbu"},
-    "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.15), "cmap": "rdylgn"},
-    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.25, 0.30), "cmap": "rdbu"},
-    "bsi":  {"label": "BSI — голая почва",     "range": (0.00,  0.32), "cmap": "oranges"},
+    "ndvi": {"label": "NDVI — растительность", "range": (0.02,  0.21), "cmap": "rdylgn"},
+    "ndwi": {"label": "NDWI — водные объекты", "range": (-0.27, -0.10),"cmap": "rdbu"},
+    "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.00), "cmap": "rdylgn"},
+    "ndmi": {"label": "NDMI — влажность почвы","range": (-0.20, 0.16), "cmap": "rdbu"},
+    "bsi":  {"label": "BSI — голая почва",     "range": (0.12,  0.29), "cmap": "oranges"},
 }
 
 CMAP_CSS = {
@@ -507,28 +508,89 @@ class AnalyzeReq(BaseModel):
     ndre:       float | None = None
     ndmi:       float | None = None
     bsi:        float | None = None
+    ml_class:       str   | None = None
     ml_class_ru:    str   | None = None
     ml_confidence:  float | None = None
 
 
+# Expected index ranges per ML land-cover class for this region — lets the
+# prompt flag real deviations (water stress, salinization, degradation)
+# instead of just restating the classification.
+REGIONAL_NORMS = {
+    "agriculture":       {"ndvi": (0.35, 0.65), "ndmi": (0.10, 0.40)},
+    "sparse_vegetation": {"ndvi": (0.05, 0.20), "ndmi": (-0.20, 0.05)},
+    "bare_soil":         {"ndvi": (-0.05, 0.10), "bsi": (0.10, 0.35)},
+    "water":             {"ndwi": (0.20, 0.60)},
+    "urban":             {"bsi": (0.05, 0.25), "ndvi": (-0.05, 0.15)},
+    "dense_vegetation":  {"ndvi": (0.45, 0.75), "ndmi": (0.15, 0.50)},
+}
+
+
+def build_groq_prompt(lat, lon, indices, ml_class, ml_class_ru, ml_confidence):
+    """Builds the analysis prompt around deviations from this region's normal
+    index ranges for the ML-predicted class, rather than just restating it."""
+    ndvi, ndwi, ndmi, bsi, ndre = (indices.get(k) for k in ("NDVI","NDWI","NDMI","BSI","NDRE"))
+    norms = REGIONAL_NORMS.get(ml_class, {})
+
+    warnings = []
+    recommendations = []
+
+    if ml_class == "agriculture":
+        ndvi_norm = norms.get("ndvi", (0.35, 0.65))
+        ndmi_norm = norms.get("ndmi", (0.10, 0.40))
+
+        if ndvi is not None and ndvi < ndvi_norm[0]:
+            deficit = round((ndvi_norm[0] - ndvi) / ndvi_norm[0] * 100)
+            warnings.append(f"NDVI={ndvi:.3f} ниже нормы ({ndvi_norm[0]}-{ndvi_norm[1]}) на {deficit}%")
+            recommendations.append("проверить состояние посевов, возможен дефицит питания")
+
+        if ndmi is not None and ndmi < ndmi_norm[0]:
+            warnings.append(f"NDMI={ndmi:.3f} указывает на недостаток влаги")
+            recommendations.append("увеличить полив или проверить ирригационные каналы")
+
+        if bsi is not None and bsi > 0.15:
+            warnings.append(f"BSI={bsi:.3f} повышен — возможно засоление почвы")
+            recommendations.append("провести анализ почвы на засоление")
+
+    elif ml_class == "water":
+        if ndwi is not None and ndwi < 0.3:
+            warnings.append(f"NDWI={ndwi:.3f} низкий для водного объекта — возможно обмеление")
+            recommendations.append("мониторить уровень воды")
+
+    elif ml_class == "bare_soil":
+        if bsi is not None and bsi > 0.25:
+            warnings.append(f"BSI={bsi:.3f} критически высокий — сильная деградация")
+            recommendations.append("необходима рекультивация, посадка защитных полос")
+        if ndre is not None and ndre > 0.1:
+            warnings.append("есть потенциал для восстановления растительности")
+
+    warnings_text = "; ".join(warnings) if warnings else "отклонений от нормы не выявлено"
+
+    def fmt(v):
+        return f"{v:.3f}" if v is not None else "н/д"
+
+    class_label = ml_class_ru or ml_class or "неизвестен"
+    confidence_pct = round((ml_confidence or 0) * 100)
+
+    return f"""Ты агроэколог и эксперт по землепользованию Туркестанской области Казахстана.
+
+Данные Sentinel-2 для точки {lat:.4f}°N, {lon:.4f}°E (лето 2023):
+- Тип покрова: {class_label} (уверенность {confidence_pct}%)
+- NDVI={fmt(ndvi)}, NDRE={fmt(ndre)}, NDWI={fmt(ndwi)}, NDMI={fmt(ndmi)}, BSI={fmt(bsi)}
+- Выявленные отклонения: {warnings_text}
+
+Напиши 2-3 предложения на русском языке:
+1. Конкретная проблема или состояние (не описывай то что уже известно из класса)
+2. Практическая рекомендация для землепользователя или агронома
+3. Риск если не принять меры (только если есть реальная проблема)
+
+Будь конкретным и практичным. Не повторяй класс покрова."""
+
+
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeReq):
-    idx_lines = []
-    if req.ndvi is not None: idx_lines.append(f"NDVI (растительность)={req.ndvi:.3f}")
-    if req.ndwi is not None: idx_lines.append(f"NDWI (вода)={req.ndwi:.3f}")
-    if req.ndre is not None: idx_lines.append(f"NDRE (стресс растений)={req.ndre:.3f}")
-    if req.ndmi is not None: idx_lines.append(f"NDMI (влажность)={req.ndmi:.3f}")
-    if req.bsi  is not None: idx_lines.append(f"BSI (голая почва)={req.bsi:.3f}")
-
-    prompt = (
-        f"Точка {req.lat:.4f}°N, {req.lon:.4f}°E — Туркестанская область Казахстана.\n"
-        + (f"Классификация земного покрова (ML-модель): {req.ml_class_ru} "
-           f"(уверенность {req.ml_confidence*100:.0f}%).\n"
-           if req.ml_class_ru and req.ml_confidence is not None else "")
-        + ("Спектральные индексы: " + "; ".join(idx_lines) + ".\n" if idx_lines else "")
-        + "Дай краткую экспертную интерпретацию (2–3 предложения) на русском: "
-          "тип землепользования, экологическое состояние и сельскохозяйственное значение."
-    )
+    indices = {"NDVI": req.ndvi, "NDWI": req.ndwi, "NDRE": req.ndre, "NDMI": req.ndmi, "BSI": req.bsi}
+    prompt = build_groq_prompt(req.lat, req.lon, indices, req.ml_class, req.ml_class_ru, req.ml_confidence)
     system = ("Эксперт по дистанционному зондированию Центральной Азии. "
               "Анализируешь Sentinel-2. Отвечай кратко и конкретно на русском.")
 

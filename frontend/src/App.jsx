@@ -71,7 +71,7 @@ export default function App() {
       const analysis = await fetchAnalysis({
         lat, lon: lng,
         ndvi: px.ndvi, ndwi: px.ndwi, ndre: px.ndre, ndmi: px.ndmi, bsi: px.bsi,
-        ml_class_ru: px.ml_class_ru, ml_confidence: px.ml_confidence,
+        ml_class: px.ml_class, ml_class_ru: px.ml_class_ru, ml_confidence: px.ml_confidence,
       })
       if (requestIdRef.current !== reqId) return
       setAiText(analysis.analysis || 'Анализ недоступен')
