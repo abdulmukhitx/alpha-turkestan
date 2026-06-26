@@ -5,15 +5,29 @@ import 'leaflet-boundary-canvas'   // attaches L.TileLayer.boundaryCanvas
 import { tileUrl } from '../api'
 
 const BASEMAPS = {
-  light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-  sat:   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  satellite: {
+    name: 'Спутник',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    attribution: '© Esri',
+  },
+  terrain: {
+    name: 'Рельеф',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}',
+    attribution: '© Esri',
+  },
+  dark: {
+    name: 'Тёмная',
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+    attribution: '© CARTO',
+  },
 }
+const BASEMAP_ORDER = ['satellite', 'terrain', 'dark']
 
 export default function MapView({ activeLayer, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange }) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
   const basemapRef  = useRef(null)
-  const basemapKind = useRef('light')
+  const basemapKind = useRef('satellite')
   const overlaysRef = useRef({})
   const markerRef   = useRef(null)
   const boundaryRef = useRef(null)
@@ -24,6 +38,7 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
 
   const [zoomLevel, setZoomLevel] = useState(zoom)
   const [hover, setHover] = useState(null)
+  const [basemapName, setBasemapName] = useState(BASEMAPS.satellite.name)
   // undefined = boundary still loading, object = clip GeoJSON, null = no clip (fallback)
   const [clipGeo, setClipGeo] = useState(undefined)
 
@@ -35,7 +50,11 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
     mapRef.current = map
 
     // basemap stays UNclipped — visible across the whole view
-    basemapRef.current = L.tileLayer(BASEMAPS.light, { maxZoom: 18, subdomains: 'abcd' }).addTo(map)
+    basemapRef.current = L.tileLayer(BASEMAPS.satellite.url, {
+      maxZoom: 18,
+      subdomains: 'abcd',
+      attribution: BASEMAPS.satellite.attribution,
+    }).addTo(map)
 
     map.on('click', (e) => {
       const { lat, lng } = e.latlng
@@ -147,8 +166,11 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
     if (b) map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: [20, 20] })
   }
   function toggleBasemap() {
-    basemapKind.current = basemapKind.current === 'light' ? 'sat' : 'light'
-    basemapRef.current.setUrl(BASEMAPS[basemapKind.current])
+    const idx = BASEMAP_ORDER.indexOf(basemapKind.current)
+    const next = BASEMAP_ORDER[(idx + 1) % BASEMAP_ORDER.length]
+    basemapKind.current = next
+    basemapRef.current.setUrl(BASEMAPS[next].url)
+    setBasemapName(BASEMAPS[next].name)
   }
 
   return (
@@ -160,7 +182,7 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
         <button className="map-tool-btn" title="Отдаление" onClick={zoomOut}>−</button>
         <div className="map-tool-sep" />
         <button className="map-tool-btn" title="По всей области" onClick={fit}>⊕</button>
-        <button className="map-tool-btn" title="Спутник / карта" onClick={toggleBasemap}>⊞</button>
+        <button className="map-tool-btn" title={`Базовая карта: ${basemapName} (нажмите для переключения)`} onClick={toggleBasemap}>⊞</button>
       </div>
 
       <div className="map-footer">
