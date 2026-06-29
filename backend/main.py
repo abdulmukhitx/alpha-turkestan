@@ -72,6 +72,7 @@ DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
 COG_PATH  = Path(os.getenv("S2_COG_PATH", r"D:\data\s2_mosaic_cog.tif"))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\lulc_classifier.pkl"))
+LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\lulc_classifier_v2.pkl"))
 
 def s2_assets() -> list[str]:
     """Sorted list of all S2 GeoTIFF paths (fallback source)."""
@@ -95,11 +96,23 @@ def cog_bounds_wgs84() -> list[float] | None:
     return list(_COG_BOUNDS_WGS84)
 
 
-# ── ML land-cover classifier (RandomForest, trained on ESA WorldCover) ──
-# Trained by src/processing/train_lulc_rf.py. Optional: if the pickle isn't
-# there yet, /api/pixel just omits the ml_* fields and everything else works.
+# ── ML land-cover classifier ─────────────────────────────────────
+# v1: RandomForest (6 features: NDVI/NDRE/NDWI/NDMI/BSI/B08), trained by
+#     src/processing/train_lulc_rf.py (legacy). Kept loaded and in active use
+#     by /api/zone_stats's bulk per-pixel classification, which builds the
+#     6-feature array — swapping the global model there would break it, so
+#     v1 and v2 are deliberately kept as separate models/globals.
+# v2: XGBoost (13 features: v1's 6 + 7 std_* 3x3-texture features), trained
+#     by src/processing/extract_samples.py + train_xgb.py. Used only by
+#     /api/pixel via classify_ml_v2(). CV accuracy 88.9% vs v1's OOB 74.25%.
+# Both optional: if a pickle isn't there yet, the relevant ml_* fields are
+# just omitted and everything else keeps working.
 CLASSIFIER  = None
 CLASS_NAMES: "list[str] | None" = None
+
+CLASSIFIER_V2 = None
+LABEL_ENCODER_V2 = None
+CLASS_NAMES_V2: "list[str] | None" = None
 
 _ML_CLASS_RU = {
     "water":              "Вода",
@@ -126,8 +139,26 @@ def load_classifier():
 load_classifier()
 
 
+def load_classifier_v2():
+    global CLASSIFIER_V2, LABEL_ENCODER_V2, CLASS_NAMES_V2
+    if not LULC_MODEL_V2_PATH.exists():
+        return
+    try:
+        with open(LULC_MODEL_V2_PATH, "rb") as f:
+            saved = pickle.load(f)
+        CLASSIFIER_V2    = saved["model"]
+        LABEL_ENCODER_V2 = saved["label_encoder"]
+        CLASS_NAMES_V2   = list(saved["classes"])
+        print(f"✓ LULC classifier v2 (XGBoost) loaded: {len(CLASS_NAMES_V2)} classes")
+    except Exception as e:
+        print(f"⚠  failed to load LULC classifier v2: {e}")
+
+load_classifier_v2()
+
+
 def classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08):
-    """RandomForest land-cover prediction from the 5 indices + B08. None if unavailable."""
+    """RandomForest land-cover prediction from the 5 indices + B08. None if unavailable.
+    Legacy v1 — kept for /api/zone_stats's bulk classification (6 features)."""
     if CLASSIFIER is None or None in (ndvi, ndre, ndwi, ndmi, bsi, b08):
         return None
     feats = np.array([[ndvi, ndre, ndwi, ndmi, bsi, b08]], dtype=np.float32)
@@ -139,6 +170,27 @@ def classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08):
         "class_ru":      _ML_CLASS_RU.get(cls, cls),
         "confidence":    round(float(proba[idx]), 4),
         "probabilities": {CLASS_NAMES[i]: round(float(p), 4) for i, p in enumerate(proba)},
+    }
+
+
+def classify_ml_v2(ndvi, ndre, ndwi, ndmi, bsi, b08, std_bands: "dict | None"):
+    """XGBoost land-cover prediction from the 6 v1 features + 7 std_* texture
+    features (3x3 window std per band, raw DN). Used by /api/pixel only."""
+    if CLASSIFIER_V2 is None or None in (ndvi, ndre, ndwi, ndmi, bsi, b08) or not std_bands:
+        return None
+    feats = np.array([[
+        ndvi, ndre, ndwi, ndmi, bsi, b08,
+        std_bands["B02"], std_bands["B03"], std_bands["B04"],
+        std_bands["B05"], std_bands["B08"], std_bands["B8A"], std_bands["B11"],
+    ]], dtype=np.float32)
+    proba = CLASSIFIER_V2.predict_proba(feats)[0]
+    idx   = int(np.argmax(proba))
+    cls   = LABEL_ENCODER_V2.inverse_transform([idx])[0]
+    return {
+        "class":         cls,
+        "class_ru":      _ML_CLASS_RU.get(cls, cls),
+        "confidence":    round(float(proba[idx]), 4),
+        "probabilities": {CLASS_NAMES_V2[i]: round(float(p), 4) for i, p in enumerate(proba)},
     }
 
 
@@ -354,6 +406,7 @@ async def health():
         "s2_dir":    str(S2_DIR),
         "ai_ready":  bool(os.getenv("GROQ_API_KEY") or os.getenv("DEEPSEEK_API_KEY")),
         "lulc_classifier": CLASSIFIER is not None,
+        "lulc_classifier_v2": CLASSIFIER_V2 is not None,
     }
 
 
@@ -434,6 +487,24 @@ async def pixel(
                 return None
             b   = raw[:7] / 10000  # reflectance
             eps = 1e-10
+
+            # 3x3 window (clipped at raster edges) for the v2 classifier's
+            # texture features — std per band of raw DN, same convention as
+            # src/processing/extract_samples.py's read_point_window().
+            row_off, col_off = max(0, row - 1), max(0, col - 1)
+            row_end, col_end = min(src.height, row + 2), min(src.width, col + 2)
+            win = src.read(window=((row_off, row_end), (col_off, col_end))).astype(np.float32)
+            win_nodata = np.all(win == 0, axis=0)
+            valid_px = ~win_nodata
+            if valid_px.sum() < 3:
+                std_vals = np.zeros(7, dtype=np.float32)
+            else:
+                std_vals = win[:, valid_px].std(axis=1)
+            std_bands = {
+                name: round(float(v), 4)
+                for name, v in zip(("B02", "B03", "B04", "B05", "B08", "B8A", "B11"), std_vals)
+            }
+
             return {
                 "ndvi": round((b[4]-b[2])/(b[4]+b[2]+eps),4),
                 "ndwi": round((b[1]-b[4])/(b[1]+b[4]+eps),4),
@@ -445,6 +516,7 @@ async def pixel(
                     "B05":round(b[3],4),"B08":round(b[4],4),"B8A":round(b[5],4),
                     "B11":round(b[6],4),
                 },
+                "std_bands": std_bands,
                 "demo": False,
             }
 
@@ -470,7 +542,10 @@ async def pixel(
         return None if (v is None or (isinstance(v,float) and math.isnan(v))) else v
 
     ndvi, ndre, ndwi, ndmi, bsi = (safe(result.get(k)) for k in ("ndvi","ndre","ndwi","ndmi","bsi"))
-    ml = classify_ml(ndvi, ndre, ndwi, ndmi, bsi, (result.get("bands") or {}).get("B08"))
+    b08 = (result.get("bands") or {}).get("B08")
+    ml = classify_ml_v2(ndvi, ndre, ndwi, ndmi, bsi, b08, result.get("std_bands"))
+    if ml is None:
+        ml = classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08)  # fall back to v1 if v2 unavailable
 
     return {
         "lat": lat, "lon": lon,
