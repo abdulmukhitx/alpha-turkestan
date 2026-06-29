@@ -212,6 +212,8 @@ LAYERS = {
     "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.00), "cmap": "rdylgn"},
     "ndmi": {"label": "NDMI — влажность почвы","range": (-0.20, 0.16), "cmap": "rdbu"},
     "bsi":  {"label": "BSI — голая почва",     "range": (0.12,  0.29), "cmap": "oranges"},
+    "savi": {"label": "SAVI — покрытие раст.", "range": (-0.10, 0.35), "cmap": "rdylgn"},
+    "nbr":  {"label": "NBR — деградация",      "range": (-0.35, 0.15), "cmap": "rdylgn"},
 }
 
 CMAP_CSS = {
@@ -220,6 +222,8 @@ CMAP_CSS = {
     "ndre": "linear-gradient(to right,#d73027,#fee08b,#1a9850)",   # rdylgn: stress→healthy
     "ndmi": "linear-gradient(to right,#67001f,#f4a582,#f7f7f7,#92c5de,#053061)",
     "bsi":  "linear-gradient(to right,#fff5eb,#fdd0a2,#fd8d3c,#d94801,#7f2704)",
+    "savi": "linear-gradient(to right,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)",
+    "nbr":  "linear-gradient(to right,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)",
 }
 
 # 6-stop discrete colormaps (index → RGB)
@@ -356,6 +360,8 @@ def compute_index(data: "np.ndarray", layer: str) -> "np.ndarray":
         num = (b11 + b04) - (b08 + b02)
         den = (b11 + b04) + (b08 + b02)
         return num / (den + eps)
+    elif layer == "savi": return (b08 - b04) / (b08 + b04 + 0.5 + eps) * 1.5
+    elif layer == "nbr":  return (b08 - b11) / (b08 + b11 + eps)
     return np.zeros(data.shape[1:], dtype=np.float32)
 
 
@@ -461,6 +467,8 @@ def _demo(lat, lon):
         "ndre": round((b08-b05)/(b08+b05+eps),4),
         "ndmi": round((b8a-b11)/(b8a+b11+eps),4),
         "bsi":  round(((b11+b04)-(b08+b02))/((b11+b04)+(b08+b02)+eps),4),
+        "savi": round((b08-b04)/(b08+b04+0.5+eps)*1.5,4),
+        "nbr":  round((b08-b11)/(b08+b11+eps),4),
         "bands": b, "demo": True,
     }
 
@@ -511,6 +519,8 @@ async def pixel(
                 "ndre": round((b[4]-b[3])/(b[4]+b[3]+eps),4),
                 "ndmi": round((b[5]-b[6])/(b[5]+b[6]+eps),4),
                 "bsi":  round(((b[6]+b[2])-(b[4]+b[0]))/((b[6]+b[2])+(b[4]+b[0])+eps),4),
+                "savi": round((b[4]-b[2])/(b[4]+b[2]+0.5+eps)*1.5,4),
+                "nbr":  round((b[4]-b[6])/(b[4]+b[6]+eps),4),
                 "bands": {
                     "B02":round(b[0],4),"B03":round(b[1],4),"B04":round(b[2],4),
                     "B05":round(b[3],4),"B08":round(b[4],4),"B8A":round(b[5],4),
@@ -541,7 +551,9 @@ async def pixel(
     def safe(v):
         return None if (v is None or (isinstance(v,float) and math.isnan(v))) else v
 
-    ndvi, ndre, ndwi, ndmi, bsi = (safe(result.get(k)) for k in ("ndvi","ndre","ndwi","ndmi","bsi"))
+    ndvi, ndre, ndwi, ndmi, bsi, savi, nbr = (
+        safe(result.get(k)) for k in ("ndvi","ndre","ndwi","ndmi","bsi","savi","nbr")
+    )
     b08 = (result.get("bands") or {}).get("B08")
     ml = classify_ml_v2(ndvi, ndre, ndwi, ndmi, bsi, b08, result.get("std_bands"))
     if ml is None:
@@ -549,7 +561,7 @@ async def pixel(
 
     return {
         "lat": lat, "lon": lon,
-        "ndvi": ndvi, "ndwi": ndwi, "ndre": ndre, "ndmi": ndmi, "bsi": bsi,
+        "ndvi": ndvi, "ndwi": ndwi, "ndre": ndre, "ndmi": ndmi, "bsi": bsi, "savi": savi, "nbr": nbr,
         "bands":      result.get("bands", {}),
         "ml_class":         ml["class"]         if ml else None,
         "ml_class_ru":      ml["class_ru"]      if ml else None,
@@ -654,6 +666,8 @@ async def zone_stats(req: ZoneStatsReq):
     ndre = (b08 - b05) / (b08 + b05 + eps)
     ndmi = (b8a - b11) / (b8a + b11 + eps)
     bsi  = ((b11 + b04) - (b08 + b02)) / ((b11 + b04) + (b08 + b02) + eps)
+    savi = (b08 - b04) / (b08 + b04 + 0.5 + eps) * 1.5
+    nbr  = (b08 - b11) / (b08 + b11 + eps)
 
     indices = {
         "ndvi": _zone_index_stats(ndvi),
@@ -661,6 +675,8 @@ async def zone_stats(req: ZoneStatsReq):
         "ndre": _zone_index_stats(ndre),
         "ndmi": _zone_index_stats(ndmi),
         "bsi":  _zone_index_stats(bsi),
+        "savi": _zone_index_stats(savi),
+        "nbr":  _zone_index_stats(nbr),
     }
 
     px_area_ha = 0.01  # 10m x 10m pixel

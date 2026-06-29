@@ -5,6 +5,8 @@ const SWATCH = {
   ndre: 'linear-gradient(90deg,#d73027,#fee08b,#1a9850)',
   ndmi: 'linear-gradient(90deg,#67001f,#f4a582,#f7f7f7,#92c5de,#053061)',
   bsi:  'linear-gradient(90deg,#fff5eb,#fdd0a2,#fd8d3c,#d94801,#7f2704)',
+  savi: 'linear-gradient(90deg,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)',
+  nbr:  'linear-gradient(90deg,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)',
 }
 
 const NAMES = {
@@ -14,6 +16,8 @@ const NAMES = {
   ndre: ['NDRE', 'Стресс растений'],
   ndmi: ['NDMI', 'Влажность почвы'],
   bsi:  ['BSI', 'Голая почва'],
+  savi: ['SAVI', 'Покрытие растительностью'],
+  nbr:  ['NBR', 'Деградация территорий'],
 }
 
 // Descriptive 3-stop labels (low / mid / high) shown under the colorbar
@@ -23,6 +27,8 @@ const LABELS = {
   ndre: ['Стресс', '', 'Здоровая'],
   ndmi: ['Сухая', 'Норма', 'Влажная'],
   bsi:  ['Покрытая', '', 'Голая почва'],
+  savi: ['Пустыня', 'Разреженная', 'Густая'],
+  nbr:  ['Деградация', '', 'Здоровая'],
 }
 
 export default function LayerPanel({

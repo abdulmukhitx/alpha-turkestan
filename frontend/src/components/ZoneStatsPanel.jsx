@@ -6,8 +6,10 @@ const INDEX_LABELS = {
   ndre: ['NDRE', 'Стресс растений'],
   ndmi: ['NDMI', 'Влажность почвы'],
   bsi:  ['BSI',  'Голая почва'],
+  savi: ['SAVI', 'Покрытие раст.'],
+  nbr:  ['NBR',  'Деградация'],
 }
-const INDEX_ORDER = ['ndvi', 'ndre', 'ndwi', 'ndmi', 'bsi']
+const INDEX_ORDER = ['ndvi', 'ndre', 'ndwi', 'ndmi', 'bsi', 'savi', 'nbr']
 
 const LULC_LABELS = {
   agriculture:       ['🟢', 'Сельхоз угодья'],
@@ -27,7 +29,17 @@ const LULC_COLORS = {
 }
 const LULC_ORDER = ['agriculture', 'dense_vegetation', 'sparse_vegetation', 'bare_soil', 'urban', 'water']
 
-function indexBarColor(mean) {
+function indexBarColor(mean, key) {
+  if (key === 'savi') {
+    if (mean > 0.15) return '#16a34a'
+    if (mean >= 0) return '#eab308'
+    return '#ef4444'
+  }
+  if (key === 'nbr') {
+    if (mean > 0) return '#16a34a'
+    if (mean >= -0.15) return '#eab308'
+    return '#ef4444'
+  }
   if (mean > 0.2) return '#16a34a'
   if (mean >= 0) return '#eab308'
   return '#ef4444'
@@ -67,7 +79,7 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
                 const s = stats.indices[key]
                 const [code, label] = INDEX_LABELS[key]
                 const pct = Math.max(2, Math.min(100, ((s.mean + 1) / 2) * 100))
-                const color = indexBarColor(s.mean)
+                const color = indexBarColor(s.mean, key)
                 return (
                   <div className="index-row" key={key}>
                     <div className="index-head">

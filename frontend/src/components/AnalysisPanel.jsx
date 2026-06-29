@@ -26,6 +26,8 @@ const INDICES = [
   { key: 'ndwi', code: 'NDWI', label: 'Водные ресурсы' },
   { key: 'ndmi', code: 'NDMI', label: 'Влажность почвы' },
   { key: 'bsi',  code: 'BSI',  label: 'Голая почва' },
+  { key: 'savi', code: 'SAVI', label: 'Покрытие раст.' },
+  { key: 'nbr',  code: 'NBR',  label: 'Деградация' },
 ]
 
 // semantic colour per index value (green=good veg, blue=water, red/orange=dry/bare)
@@ -56,6 +58,14 @@ function indexColor(key, v) {
       if (v > 0.1) return '#f97316'
       if (v > 0) return '#fbbf24'
       return '#22c55e'
+    case 'savi':
+      if (v > 0.15) return '#16a34a'
+      if (v >= 0) return '#eab308'
+      return '#ef4444'
+    case 'nbr':
+      if (v > 0) return '#16a34a'
+      if (v >= -0.15) return '#eab308'
+      return '#ef4444'
     default:
       return 'var(--text3)'
   }
