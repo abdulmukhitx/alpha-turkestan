@@ -3,7 +3,7 @@ import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
-import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis } from './api'
+import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis, fetchZoneStats } from './api'
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
@@ -33,7 +33,17 @@ export default function App() {
   const [aiLoading, setAiLoading] = useState(false)
   const [aiError, setAiError] = useState(null)
 
+  const [drawMode, setDrawMode] = useState(false)
+  const [zonePolygon, setZonePolygon] = useState(null)
+  const [zoneStats, setZoneStats] = useState(null)
+  const [zoneLoading, setZoneLoading] = useState(false)
+  const [zoneError, setZoneError] = useState(null)
+  const [clearSignal, setClearSignal] = useState(0)
+  const [finishSignal, setFinishSignal] = useState(0)
+  const [drawPointCount, setDrawPointCount] = useState(0)
+
   const requestIdRef = useRef(0)
+  const zoneReqIdRef = useRef(0)
 
   useEffect(() => {
     const total = BOOT_STEPS[BOOT_STEPS.length - 1][0]
@@ -83,6 +93,37 @@ export default function App() {
     }
   }
 
+  async function handlePolygonDrawn(geometry) {
+    setDrawMode(false)
+    setZonePolygon(geometry)
+    setZoneStats(null)
+    setZoneError(null)
+    setZoneLoading(true)
+
+    const reqId = ++zoneReqIdRef.current
+    try {
+      const stats = await fetchZoneStats(geometry)
+      if (zoneReqIdRef.current !== reqId) return
+      setZoneStats(stats)
+    } catch (e) {
+      if (zoneReqIdRef.current !== reqId) return
+      setZoneError(e.message || 'Не удалось получить статистику зоны')
+    } finally {
+      if (zoneReqIdRef.current === reqId) setZoneLoading(false)
+    }
+  }
+
+  function handleClearZone() {
+    zoneReqIdRef.current += 1   // invalidate any in-flight request
+    setZonePolygon(null)
+    setZoneStats(null)
+    setZoneError(null)
+    setZoneLoading(false)
+    setDrawMode(false)
+    setDrawPointCount(0)
+    setClearSignal((n) => n + 1)
+  }
+
   const layers = {}
   if (meta?.layers) {
     for (const [id, cfg] of Object.entries(meta.layers)) {
@@ -117,6 +158,12 @@ export default function App() {
           onSelect={setActiveLayer}
           opacity={opacity}
           onOpacityChange={setOpacity}
+          drawMode={drawMode}
+          onToggleDraw={() => setDrawMode((d) => !d)}
+          onClearZone={handleClearZone}
+          onFinishDraw={() => setFinishSignal((n) => n + 1)}
+          hasZone={!!zonePolygon}
+          drawPointCount={drawPointCount}
         />
 
         <MapView
@@ -128,6 +175,11 @@ export default function App() {
           onPointClick={handlePointClick}
           onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
           onZoomChange={() => {}}
+          drawMode={drawMode}
+          onPolygonDrawn={handlePolygonDrawn}
+          clearSignal={clearSignal}
+          finishSignal={finishSignal}
+          onDrawPointsChange={setDrawPointCount}
         />
 
         <AnalysisPanel
@@ -136,6 +188,11 @@ export default function App() {
           aiText={aiText}
           loading={aiLoading}
           error={aiError}
+          zoneStats={zoneStats}
+          zoneLoading={zoneLoading}
+          zoneError={zoneError}
+          zoneGeometry={zonePolygon}
+          activeLayer={activeLayer}
         />
       </main>
     </div>

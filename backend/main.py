@@ -7,8 +7,10 @@ Fallback: src/processing/s2_work/*.tif (per-scene tiles, merged on the fly)
 
 Endpoints:
   GET  /health                          service check
-  GET  /tiles/{layer}/{z}/{x}/{y}.png   XYZ tiles  (rgb / ndvi / ndwi / ndre / ndmi / bsi)
+  GET  /tiles/{layer}/{z}/{x}/{y}.png   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
   GET  /api/pixel?lat=&lon=             per-pixel spectral values + indices
+  POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
+  POST /api/zone_report                 structured Groq report for a drawn zone (PDF built on frontend)
   POST /api/analyze                     AI interpretation (Groq / DeepSeek / local fallback)
   GET  /metadata                        region + layer metadata
   GET  /data/...                        static data files
@@ -42,6 +44,8 @@ except ImportError as e:
 
 try:
     import rasterio
+    from rasterio.windows import from_bounds as window_from_bounds
+    from rasterio.features import geometry_mask
     from pyproj import Transformer
     RASTERIO_OK = True
 except ImportError:
@@ -151,7 +155,6 @@ _B02, _B03, _B04, _B05, _B08, _B8A, _B11 = 0, 1, 2, 3, 4, 5, 6
 # tighter than 1st–99th for more contrast, at the cost of hard-clipping the rarest
 # extreme pixels (e.g. open water on NDWI, very dense canopy on NDVI) to the edge colour.
 LAYERS = {
-    "rgb":  {"label": "RGB снимок",            "range": None,          "cmap": None},
     "ndvi": {"label": "NDVI — растительность", "range": (0.02,  0.21), "cmap": "rdylgn"},
     "ndwi": {"label": "NDWI — водные объекты", "range": (-0.27, -0.10),"cmap": "rdbu"},
     "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.00), "cmap": "rdylgn"},
@@ -160,7 +163,6 @@ LAYERS = {
 }
 
 CMAP_CSS = {
-    "rgb":  None,
     "ndvi": "linear-gradient(to right,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)",
     "ndwi": "linear-gradient(to right,#b2182b,#f7f7f7,#2166ac)",   # rdbu: dry→water
     "ndre": "linear-gradient(to right,#d73027,#fee08b,#1a9850)",   # rdylgn: stress→healthy
@@ -306,17 +308,6 @@ def compute_index(data: "np.ndarray", layer: str) -> "np.ndarray":
 
 
 # ── PNG renderers ─────────────────────────────────────────────────
-def render_rgb(data: "np.ndarray", mask: "np.ndarray") -> bytes:
-    # Stretch: 0–2500 DN → 0–255 uint8 (good for S2 SR)
-    r = np.clip(data[_B04] / 2500 * 255, 0, 255).astype(np.uint8)
-    g = np.clip(data[_B03] / 2500 * 255, 0, 255).astype(np.uint8)
-    b = np.clip(data[_B02] / 2500 * 255, 0, 255).astype(np.uint8)
-    rgba = np.stack([r, g, b, mask], axis=-1)
-    buf  = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, "PNG")
-    return buf.getvalue()
-
-
 def render_index(index: "np.ndarray", mask: "np.ndarray",
                  cmap: str, vmin: float, vmax: float) -> bytes:
     clipped  = np.clip(index, vmin, vmax)
@@ -387,13 +378,10 @@ async def tile(layer: str, z: int, x: int, y: int):
     mask = (mask > 0).astype(np.uint8) * 255
 
     try:
-        if layer == "rgb":
-            content = render_rgb(data, mask)
-        else:
-            cfg     = LAYERS[layer]
-            vmin, vmax = cfg["range"]
-            index   = compute_index(data, layer)
-            content = render_index(index, mask, cfg["cmap"], vmin, vmax)
+        cfg     = LAYERS[layer]
+        vmin, vmax = cfg["range"]
+        index   = compute_index(data, layer)
+        content = render_index(index, mask, cfg["cmap"], vmin, vmax)
     except Exception as e:
         print(f"render error {layer}/{z}/{x}/{y}: {e}")
         return Response(content=blank_tile(), media_type="image/png")
@@ -493,6 +481,131 @@ async def pixel(
         "ml_confidence":    ml["confidence"]    if ml else None,
         "ml_probabilities": ml["probabilities"] if ml else None,
         "demo":       result.get("demo", False),
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+#   ZONE STATISTICS
+# ════════════════════════════════════════════════════════════════
+
+class ZoneStatsReq(BaseModel):
+    geometry: dict
+
+
+_ZONE_INDEX_KEYS = ["ndvi", "ndwi", "ndre", "ndmi", "bsi"]
+
+
+def _zone_index_stats(arr: "np.ndarray") -> dict:
+    """arr: 1-D float32 array of valid (already masked) index values."""
+    p10, p90 = np.percentile(arr, [10, 90])
+    return {
+        "mean": round(float(np.mean(arr)), 4),
+        "min":  round(float(np.min(arr)), 4),
+        "max":  round(float(np.max(arr)), 4),
+        "std":  round(float(np.std(arr)), 4),
+        "p10":  round(float(p10), 4),
+        "p90":  round(float(p90), 4),
+    }
+
+
+@app.post("/api/zone_stats")
+async def zone_stats(req: ZoneStatsReq):
+    if not (RASTERIO_OK and cog_available()):
+        raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
+
+    geom = req.geometry
+    if not geom or geom.get("type") != "Polygon" or not geom.get("coordinates"):
+        raise HTTPException(status_code=400, detail="Ожидается GeoJSON Polygon")
+
+    try:
+        with rasterio.open(COG_PATH) as ds:
+            # Reproject ring(s) from WGS84 → raster CRS
+            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            rings_proj = []
+            for ring in geom["coordinates"]:
+                rings_proj.append([transformer.transform(lon, lat) for lon, lat in ring])
+
+            xs = [pt[0] for ring in rings_proj for pt in ring]
+            ys = [pt[1] for ring in rings_proj for pt in ring]
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+
+            ds_l, ds_b, ds_r, ds_t = ds.bounds
+            if maxx < ds_l or minx > ds_r or maxy < ds_b or miny > ds_t:
+                raise HTTPException(status_code=400, detail="Полигон находится за пределами области покрытия")
+
+            # Clip the requested bbox to the dataset bounds before windowing
+            minx, maxx = max(minx, ds_l), min(maxx, ds_r)
+            miny, maxy = max(miny, ds_b), min(maxy, ds_t)
+
+            window = window_from_bounds(minx, miny, maxx, maxy, transform=ds.transform)
+            window = window.round_offsets().round_lengths()
+            if window.width <= 0 or window.height <= 0:
+                raise HTTPException(status_code=400, detail="Полигон слишком мал или вне покрытия")
+
+            win_transform = ds.window_transform(window)
+            data = ds.read(window=window).astype(np.float32)  # (7, h, w)
+
+            polygon_geom = {"type": "Polygon", "coordinates": [
+                [list(pt) for pt in ring] for ring in rings_proj
+            ]}
+            poly_mask = geometry_mask(
+                [polygon_geom], out_shape=(int(window.height), int(window.width)),
+                transform=win_transform, invert=True,  # True = inside polygon
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+
+    nodata_mask = np.all(data == 0, axis=0)          # all 7 bands == 0 → nodata
+    valid_mask = poly_mask & ~nodata_mask
+    pixel_count = int(np.count_nonzero(valid_mask))
+    if pixel_count == 0:
+        raise HTTPException(status_code=400, detail="Нет валидных пикселей внутри полигона")
+
+    b02 = data[0][valid_mask] / 10000
+    b03 = data[1][valid_mask] / 10000
+    b04 = data[2][valid_mask] / 10000
+    b05 = data[3][valid_mask] / 10000
+    b08 = data[4][valid_mask] / 10000
+    b8a = data[5][valid_mask] / 10000
+    b11 = data[6][valid_mask] / 10000
+    eps = 1e-10
+
+    ndvi = (b08 - b04) / (b08 + b04 + eps)
+    ndwi = (b03 - b08) / (b03 + b08 + eps)
+    ndre = (b08 - b05) / (b08 + b05 + eps)
+    ndmi = (b8a - b11) / (b8a + b11 + eps)
+    bsi  = ((b11 + b04) - (b08 + b02)) / ((b11 + b04) + (b08 + b02) + eps)
+
+    indices = {
+        "ndvi": _zone_index_stats(ndvi),
+        "ndwi": _zone_index_stats(ndwi),
+        "ndre": _zone_index_stats(ndre),
+        "ndmi": _zone_index_stats(ndmi),
+        "bsi":  _zone_index_stats(bsi),
+    }
+
+    px_area_ha = 0.01  # 10m x 10m pixel
+    lulc = {}
+    if CLASSIFIER is not None:
+        feats = np.stack([ndvi, ndre, ndwi, ndmi, bsi, b08], axis=1).astype(np.float32)
+        preds = CLASSIFIER.predict(feats)
+        for i, cls in enumerate(CLASS_NAMES):
+            n = int(np.count_nonzero(preds == i))
+            lulc[cls] = {
+                "pixels":  n,
+                "area_ha": round(n * px_area_ha, 2),
+                "percent": round(n / pixel_count * 100, 2) if pixel_count else 0.0,
+            }
+
+    return {
+        "area_ha":     round(pixel_count * px_area_ha, 2),
+        "pixel_count": pixel_count,
+        "indices":     indices,
+        "lulc":        lulc,
     }
 
 
@@ -619,6 +732,118 @@ async def analyze(req: AnalyzeReq):
     elif ndvi > 0.25: txt = f"NDVI={ndvi:.2f} — умеренная растительность. Характерно для пастбищ или полей в начале вегетационного сезона."
     else:             txt = f"NDVI={ndvi:.2f} — слабая растительность. Пустынные или деградированные земли. Возможны засоление и опустынивание."
     return {"analysis": txt, "source": "local"}
+
+
+# ════════════════════════════════════════════════════════════════
+#   ZONE REPORT (Groq) — PDF is assembled on the frontend
+# ════════════════════════════════════════════════════════════════
+
+class ZoneReportReq(BaseModel):
+    geometry:         dict
+    zone_stats:       dict
+    active_layer:     str | None = None
+    map_image_base64: str | None = None   # captured client-side, used only for the PDF
+
+
+_LULC_LABELS_RU = {
+    "agriculture":       "Сельхоз угодья",
+    "urban":             "Застройка",
+    "dense_vegetation":  "Густая растительность",
+    "sparse_vegetation": "Разреженная растительность",
+    "bare_soil":         "Голая почва",
+    "water":             "Водные объекты",
+}
+_LULC_ORDER = ["agriculture", "urban", "dense_vegetation", "sparse_vegetation", "bare_soil", "water"]
+
+
+def build_zone_report_prompt(stats: dict, active_layer: str | None) -> str:
+    """Detailed Russian prompt for a 4-section structured zone report (vs. the
+    short 2-3 sentence pixel-level prompt in build_groq_prompt above)."""
+    area_ha = stats.get("area_ha") or 0
+    idx     = stats.get("indices") or {}
+    lulc    = stats.get("lulc") or {}
+
+    def i(key, field):
+        v = (idx.get(key) or {}).get(field)
+        return f"{v:.3f}" if isinstance(v, (int, float)) else "н/д"
+
+    lulc_lines = "\n".join(
+        f"- {_LULC_LABELS_RU.get(k, k)}: {(lulc.get(k) or {}).get('area_ha', 0):.2f} га "
+        f"({(lulc.get(k) or {}).get('percent', 0):.2f}%)"
+        for k in _LULC_ORDER if k in lulc
+    ) or "- данные классификации отсутствуют"
+
+    return f"""Ты — эксперт по дистанционному зондированию и агрономии Казахстана. Проанализируй спутниковые данные Sentinel-2 для зоны в Туркестанской области.
+
+ДАННЫЕ ЗОНЫ:
+- Общая площадь: {area_ha:.2f} га
+- Активный слой при анализе: {active_layer or "ndvi"}
+
+СПЕКТРАЛЬНЫЕ ИНДЕКСЫ (среднее по зоне):
+- NDVI (растительность): {i('ndvi','mean')} (диапазон: {i('ndvi','min')} — {i('ndvi','max')})
+- NDWI (водные ресурсы): {i('ndwi','mean')}
+- NDRE (стресс растений): {i('ndre','mean')}
+- NDMI (влажность почвы): {i('ndmi','mean')}
+- BSI (голая почва): {i('bsi','mean')}
+
+КЛАССИФИКАЦИЯ ЗЕМЕЛЬ:
+{lulc_lines}
+
+Напиши структурированный отчёт из 4 разделов:
+1. ОБЩАЯ ХАРАКТЕРИСТИКА ЗОНЫ — опиши что представляет собой территория исходя из данных
+2. СОСТОЯНИЕ РАСТИТЕЛЬНОСТИ И ПОЧВ — интерпретируй индексы, укажи проблемные зоны
+3. ЗЕМЛЕПОЛЬЗОВАНИЕ — проанализируй соотношение классов, есть ли аномалии
+4. РЕКОМЕНДАЦИИ — конкретные агрономические и управленческие меры
+
+Пиши профессионально но понятно. Каждый раздел 3-4 предложения.
+Заголовок каждого раздела пиши ровно в формате "N. НАЗВАНИЕ" заглавными буквами на отдельной строке, без markdown-разметки (без звёздочек, решёток и слова "Раздел")."""
+
+
+def _local_zone_report(stats: dict) -> str:
+    """Template fallback used only if Groq is unreachable/unconfigured."""
+    area_ha = stats.get("area_ha") or 0
+    idx     = stats.get("indices") or {}
+    lulc    = stats.get("lulc") or {}
+    ndvi    = (idx.get("ndvi") or {}).get("mean")
+    top_class = max(lulc.items(), key=lambda kv: kv[1].get("area_ha", 0))[0] if lulc else None
+    top_label = _LULC_LABELS_RU.get(top_class, top_class or "неизвестно")
+    ndvi_text = f"{ndvi:.3f}" if ndvi is not None else "н/д"
+
+    return (
+        f"1. ОБЩАЯ ХАРАКТЕРИСТИКА ЗОНЫ\n"
+        f"Зона площадью {area_ha:.2f} га преимущественно представлена классом «{top_label}». "
+        f"Среднее значение NDVI составляет {ndvi_text}.\n\n"
+        f"2. СОСТОЯНИЕ РАСТИТЕЛЬНОСТИ И ПОЧВ\n"
+        f"Автоматический анализ ИИ временно недоступен — раздел сформирован по шаблону. "
+        f"Рекомендуется проверить ключ GROQ_API_KEY на сервере для получения полного заключения.\n\n"
+        f"3. ЗЕМЛЕПОЛЬЗОВАНИЕ\n"
+        f"Классификация земель приведена в таблице выше.\n\n"
+        f"4. РЕКОМЕНДАЦИИ\n"
+        f"Повторите генерацию отчёта позже, когда AI-сервис будет доступен."
+    )
+
+
+@app.post("/api/zone_report")
+async def zone_report(req: ZoneReportReq):
+    prompt = build_zone_report_prompt(req.zone_stats, req.active_layer)
+    system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
+              "Пишешь развёрнутые структурированные аналитические отчёты на русском языке.")
+
+    if AI_OK:
+        key = os.getenv("GROQ_API_KEY")
+        if key:
+            try:
+                # llama3-8b-8192 was decommissioned by Groq — llama-3.1-8b-instant is
+                # its direct successor in the same fast/cheap 8B tier.
+                r = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                    model="llama-3.1-8b-instant", max_tokens=1500, temperature=0.4,
+                    messages=[{"role": "system", "content": system},
+                              {"role": "user", "content": prompt}])
+                return {"groq_analysis": r.choices[0].message.content}
+            except Exception as e:
+                print(f"Zone report AI error: {e}")
+
+    return {"groq_analysis": _local_zone_report(req.zone_stats)}
 
 
 # ════════════════════════════════════════════════════════════════

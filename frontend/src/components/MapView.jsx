@@ -23,11 +23,17 @@ const BASEMAPS = {
 }
 const BASEMAP_ORDER = ['satellite', 'terrain', 'dark']
 
-export default function MapView({ activeLayer, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange }) {
+const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png'
+
+export default function MapView({
+  activeLayer, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
+  drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
+}) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
   const basemapRef  = useRef(null)
   const basemapKind = useRef('satellite')
+  const labelsRef   = useRef(null)
   const overlaysRef = useRef({})
   const markerRef   = useRef(null)
   const boundaryRef = useRef(null)
@@ -36,9 +42,22 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
   const callbacksRef = useRef({ onPointClick, onMouseMove, onZoomChange })
   callbacksRef.current = { onPointClick, onMouseMove, onZoomChange }
 
+  const drawModeRef    = useRef(drawMode)
+  drawModeRef.current  = drawMode
+  const onPolygonDrawnRef = useRef(onPolygonDrawn)
+  onPolygonDrawnRef.current = onPolygonDrawn
+  const onDrawPointsChangeRef = useRef(onDrawPointsChange)
+  onDrawPointsChangeRef.current = onDrawPointsChange
+  const drawPointsRef   = useRef([])   // [[lat,lng],...] in progress
+  const drawLayerRef    = useRef(null) // live polyline/polygon while drawing
+  const drawMarkersRef  = useRef([])
+  const resultLayerRef  = useRef(null) // final drawn polygon overlay
+  const previewLineRef  = useRef(null) // rubber-band line: last point → cursor
+
   const [zoomLevel, setZoomLevel] = useState(zoom)
   const [hover, setHover] = useState(null)
   const [basemapName, setBasemapName] = useState(BASEMAPS.satellite.name)
+  const [labelsOn, setLabelsOn] = useState(true)
   // undefined = boundary still loading, object = clip GeoJSON, null = no clip (fallback)
   const [clipGeo, setClipGeo] = useState(undefined)
 
@@ -50,21 +69,48 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
     mapRef.current = map
 
     // basemap stays UNclipped — visible across the whole view
+    // crossOrigin so html2canvas (zone-report screenshot) can read these tiles
+    // without tainting its canvas — same reason the index tile layers set it below.
     basemapRef.current = L.tileLayer(BASEMAPS.satellite.url, {
       maxZoom: 18,
       subdomains: 'abcd',
       attribution: BASEMAPS.satellite.attribution,
+      crossOrigin: true,
+    }).addTo(map)
+
+    // dedicated pane so labels always render above index layers, regardless of add order
+    map.createPane('labels')
+    map.getPane('labels').style.zIndex = 650
+    map.getPane('labels').style.pointerEvents = 'none'
+    labelsRef.current = L.tileLayer(LABELS_URL, {
+      maxZoom: 18,
+      subdomains: 'abcd',
+      attribution: '© CARTO',
+      crossOrigin: true,
+      pane: 'labels',
     }).addTo(map)
 
     map.on('click', (e) => {
       const { lat, lng } = e.latlng
+      if (drawModeRef.current) {
+        addDrawPoint(map, lat, lng)
+        return
+      }
       if (!insideAOI(lat, lng, ringsRef.current, boundsRef.current)) return
       placeMarker(map, markerRef, lat, lng)
       callbacksRef.current.onPointClick(lat, lng)
     })
+    map.on('dblclick', (e) => {
+      if (!drawModeRef.current) return
+      if (e.originalEvent) L.DomEvent.stop(e.originalEvent)
+      finishDraw(map)
+    })
     map.on('mousemove', (e) => {
       setHover(e.latlng)
       callbacksRef.current.onMouseMove(e.latlng.lat, e.latlng.lng)
+      if (drawModeRef.current && drawPointsRef.current.length > 0) {
+        updatePreviewLine(map, e.latlng)
+      }
     })
     map.on('zoomend', () => {
       setZoomLevel(map.getZoom())
@@ -77,6 +123,109 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
 
   // keep bbox ref current (used for fallback click-gating and fit button)
   useEffect(() => { boundsRef.current = bounds }, [bounds])
+
+  // toggle draw mode: cursor + disable double-click zoom (dblclick finishes the polygon instead)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const container = map.getContainer()
+    if (drawMode) {
+      container.style.cursor = 'crosshair'
+      map.doubleClickZoom.disable()
+    } else {
+      container.style.cursor = ''
+      map.doubleClickZoom.enable()
+      clearDraw(map)
+    }
+  }, [drawMode])
+
+  // external "clear" trigger (e.g. a Clear button in the side panel)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || clearSignal == null) return
+    clearDraw(map)
+    if (resultLayerRef.current) { map.removeLayer(resultLayerRef.current); resultLayerRef.current = null }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearSignal])
+
+  // external "finish" trigger (explicit button — double-click can be flaky on trackpads)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || finishSignal == null) return
+    finishDraw(map)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finishSignal])
+
+  function addDrawPoint(map, lat, lng) {
+    const pts = drawPointsRef.current
+
+    // clicking back near the first vertex closes the polygon, same as most GIS tools
+    if (pts.length >= 3) {
+      const firstPx = map.latLngToContainerPoint(pts[0])
+      const clickPx = map.latLngToContainerPoint([lat, lng])
+      if (firstPx.distanceTo(clickPx) < 14) {
+        finishDraw(map)
+        return
+      }
+    }
+
+    pts.push([lat, lng])
+    const isFirst = pts.length === 1
+    const m = L.circleMarker([lat, lng], {
+      radius: isFirst ? 6 : 4, color: '#3B82F6', weight: 2, fillColor: isFirst ? '#FFFFFF' : '#3B82F6', fillOpacity: 1,
+    }).addTo(map)
+    drawMarkersRef.current.push(m)
+
+    if (drawLayerRef.current) map.removeLayer(drawLayerRef.current)
+    if (pts.length > 1) {
+      drawLayerRef.current = L.polyline(pts, { color: '#3B82F6', weight: 2 }).addTo(map)
+    }
+    onDrawPointsChangeRef.current?.(pts.length)
+  }
+
+  function updatePreviewLine(map, latlng) {
+    const last = drawPointsRef.current[drawPointsRef.current.length - 1]
+    if (!last) return
+    const path = [last, [latlng.lat, latlng.lng]]
+    if (previewLineRef.current) {
+      previewLineRef.current.setLatLngs(path)
+    } else {
+      previewLineRef.current = L.polyline(path, {
+        color: '#3B82F6', weight: 2, dashArray: '6 6', opacity: 0.85,
+      }).addTo(map)
+    }
+  }
+
+  function clearDraw(map) {
+    drawPointsRef.current = []
+    if (drawLayerRef.current) { map.removeLayer(drawLayerRef.current); drawLayerRef.current = null }
+    if (previewLineRef.current) { map.removeLayer(previewLineRef.current); previewLineRef.current = null }
+    drawMarkersRef.current.forEach((m) => map.removeLayer(m))
+    drawMarkersRef.current = []
+    onDrawPointsChangeRef.current?.(0)
+  }
+
+  function finishDraw(map) {
+    const pts = [...drawPointsRef.current]
+    // dblclick's two click events both land ~same spot — drop the duplicate vertex
+    if (pts.length >= 2) {
+      const [lat1, lng1] = pts[pts.length - 1]
+      const [lat2, lng2] = pts[pts.length - 2]
+      if (Math.abs(lat1 - lat2) < 1e-9 && Math.abs(lng1 - lng2) < 1e-9) pts.pop()
+    }
+    clearDraw(map)
+    if (pts.length < 3) return
+
+    if (resultLayerRef.current) { map.removeLayer(resultLayerRef.current); resultLayerRef.current = null }
+    resultLayerRef.current = L.polygon(pts, {
+      color: '#3B82F6', weight: 2, fillColor: '#3B82F6', fillOpacity: 0.2,
+    }).addTo(map)
+
+    // GeoJSON ring is [lng,lat] and must be closed
+    const ring = pts.map(([lat, lng]) => [lng, lat])
+    ring.push(ring[0])
+    onPolygonDrawnRef.current?.({ type: 'Polygon', coordinates: [ring] })
+  }
 
   // load the real oblast boundary once → outline + remember it for clipping data tiles
   useEffect(() => {
@@ -101,8 +250,13 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
 
         // dashed boundary outline (no fill — basemap shows through)
         boundaryRef.current = L.geoJSON(geo, {
-          style: { color: '#2563EB', weight: 2, fill: false, opacity: 0.9, dashArray: '5 4' },
+          renderer: L.svg(),   // className+CSS filter only apply on the SVG renderer, not Canvas
+          style: {
+            color: '#ffffff', weight: 2, opacity: 0.9, fill: false,
+            lineCap: 'round', lineJoin: 'round',
+          },
           interactive: false,
+          className: 'boundary-glow',
         }).addTo(map)
         if (boundaryRef.current.getBounds) {
           map.fitBounds(boundaryRef.current.getBounds(), { padding: [16, 16] })
@@ -116,7 +270,9 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
         if (b) {
           const lb = [[b[0], b[1]], [b[2], b[3]]]
           boundaryRef.current = L.rectangle(lb, {
-            color: '#2563EB', weight: 1.5, fill: false, opacity: 0.6, dashArray: '6 4',
+            renderer: L.svg(),
+            color: '#ffffff', weight: 2, fill: false, opacity: 0.9,
+            lineCap: 'round', lineJoin: 'round', className: 'boundary-glow',
           }).addTo(map)
           map.fitBounds(lb, { padding: [20, 20] })
         }
@@ -140,6 +296,12 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
     const map = mapRef.current
     if (!map || !activeLayer) return
     if (clipGeo === undefined) return   // wait until boundary load resolves
+
+    // "satellite" is a virtual layer — no index tiles, just the basemap/boundary/labels underneath
+    if (activeLayer === 'satellite') {
+      Object.values(overlaysRef.current).forEach((layer) => layer.setOpacity(0))
+      return
+    }
 
     if (!overlaysRef.current[activeLayer]) {
       const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
@@ -165,6 +327,13 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
     const b = boundsRef.current
     if (b) map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: [20, 20] })
   }
+  function toggleLabels() {
+    setLabelsOn((on) => {
+      const next = !on
+      labelsRef.current?.setOpacity(next ? 1 : 0)
+      return next
+    })
+  }
   function toggleBasemap() {
     const idx = BASEMAP_ORDER.indexOf(basemapKind.current)
     const next = BASEMAP_ORDER[(idx + 1) % BASEMAP_ORDER.length]
@@ -183,6 +352,15 @@ export default function MapView({ activeLayer, opacity, bounds, center, zoom, on
         <div className="map-tool-sep" />
         <button className="map-tool-btn" title="По всей области" onClick={fit}>⊕</button>
         <button className="map-tool-btn" title={`Базовая карта: ${basemapName} (нажмите для переключения)`} onClick={toggleBasemap}>⊞</button>
+        <div className="map-tool-sep" />
+        <button
+          className="map-tool-btn"
+          title={labelsOn ? 'Скрыть подписи (города, дороги)' : 'Показать подписи'}
+          aria-pressed={labelsOn}
+          onClick={toggleLabels}
+        >
+          {labelsOn ? 'Abc' : 'abc'}
+        </button>
       </div>
 
       <div className="map-footer">

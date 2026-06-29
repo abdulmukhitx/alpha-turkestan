@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import ZoneStatsPanel from './ZoneStatsPanel.jsx'
 
 function Typewriter({ text }) {
   const [shown, setShown] = useState('')
@@ -60,7 +61,10 @@ function indexColor(key, v) {
   }
 }
 
-export default function AnalysisPanel({ point, pixel, aiText, loading, error }) {
+export default function AnalysisPanel({
+  point, pixel, aiText, loading, error,
+  zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer,
+}) {
   if (!point) {
     return (
       <aside className="panel panel-right">
@@ -76,6 +80,10 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
           </svg>
           <p className="click-text">Кликните на любую точку карты, чтобы получить AI-анализ этого места</p>
         </div>
+        <ZoneStatsPanel
+          stats={zoneStats} loading={zoneLoading} error={zoneError}
+          geometry={zoneGeometry} activeLayer={activeLayer}
+        />
       </aside>
     )
   }
@@ -143,6 +151,11 @@ export default function AnalysisPanel({ point, pixel, aiText, loading, error }) 
           )}
         </div>
       </div>
+
+      <ZoneStatsPanel
+        stats={zoneStats} loading={zoneLoading} error={zoneError}
+        geometry={zoneGeometry} activeLayer={activeLayer}
+      />
     </aside>
   )
 }

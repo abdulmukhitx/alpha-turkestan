@@ -1,5 +1,5 @@
 const SWATCH = {
-  rgb:  'linear-gradient(90deg,#444,#bbb,#fff)',
+  satellite: 'linear-gradient(90deg,#1b3a2b,#3a7a4f,#8fbf6f)',
   ndvi: 'linear-gradient(90deg,#a50026,#fdae61,#ffffbf,#a6d96a,#1a9850)',
   ndwi: 'linear-gradient(90deg,#b2182b,#f7f7f7,#2166ac)',
   ndre: 'linear-gradient(90deg,#d73027,#fee08b,#1a9850)',
@@ -8,7 +8,7 @@ const SWATCH = {
 }
 
 const NAMES = {
-  rgb:  ['RGB', 'Снимок'],
+  satellite: ['Снимок', 'Спутниковый снимок'],
   ndvi: ['NDVI', 'Растительность'],
   ndwi: ['NDWI', 'Водные ресурсы'],
   ndre: ['NDRE', 'Стресс растений'],
@@ -25,8 +25,12 @@ const LABELS = {
   bsi:  ['Покрытая', '', 'Голая почва'],
 }
 
-export default function LayerPanel({ layers, activeLayer, onSelect, opacity, onOpacityChange }) {
-  const ids = Object.keys(layers).length ? Object.keys(layers) : Object.keys(NAMES)
+export default function LayerPanel({
+  layers, activeLayer, onSelect, opacity, onOpacityChange,
+  drawMode, onToggleDraw, onClearZone, onFinishDraw, hasZone, drawPointCount = 0,
+}) {
+  const indexIds = Object.keys(layers).length ? Object.keys(layers) : Object.keys(NAMES).filter((id) => id !== 'satellite')
+  const ids = ['satellite', ...indexIds.filter((id) => id !== 'satellite')]
   const active = layers[activeLayer]
 
   return (
@@ -55,6 +59,33 @@ export default function LayerPanel({ layers, activeLayer, onSelect, opacity, onO
             </button>
           )
         })}
+      </div>
+
+      <div className="section-label" style={{ marginTop: 20 }}>Зональная статистика</div>
+      <div className="zone-tools">
+        <button
+          className={`zone-tool-btn ${drawMode ? 'active' : ''}`}
+          onClick={onToggleDraw}
+        >
+          {drawMode ? 'Отменить рисование' : '✏ Нарисовать зону'}
+        </button>
+        {drawMode && (
+          <>
+            <div className="zone-hint">
+              Точки: {drawPointCount}. Кликните по первой точке или нажмите «Завершить», либо дважды кликните по карте.
+            </div>
+            <button
+              className="zone-tool-btn zone-tool-finish"
+              onClick={onFinishDraw}
+              disabled={drawPointCount < 3}
+            >
+              ✓ Завершить ({drawPointCount})
+            </button>
+          </>
+        )}
+        {hasZone && (
+          <button className="zone-tool-btn zone-tool-clear" onClick={onClearZone}>Очистить</button>
+        )}
       </div>
 
       <div className="section-label" style={{ marginTop: 20 }}>Прозрачность</div>
