@@ -28,6 +28,7 @@ const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_l
 export default function MapView({
   activeLayer, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
+  lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
 }) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
@@ -53,6 +54,18 @@ export default function MapView({
   const drawMarkersRef  = useRef([])
   const resultLayerRef  = useRef(null) // final drawn polygon overlay
   const previewLineRef  = useRef(null) // rubber-band line: last point → cursor
+
+  const lineDrawModeRef    = useRef(lineDrawMode)
+  lineDrawModeRef.current  = lineDrawMode
+  const onLineDrawnRef = useRef(onLineDrawn)
+  onLineDrawnRef.current = onLineDrawn
+  const onLineDrawPointsChangeRef = useRef(onLineDrawPointsChange)
+  onLineDrawPointsChangeRef.current = onLineDrawPointsChange
+  const linePointsRef    = useRef([])   // [[lat,lng],...] in progress
+  const lineLayerRef     = useRef(null) // live polyline while drawing
+  const lineMarkersRef   = useRef([])
+  const lineResultRef    = useRef(null) // final drawn line overlay
+  const linePreviewRef   = useRef(null) // rubber-band line: last point → cursor
 
   const [zoomLevel, setZoomLevel] = useState(zoom)
   const [hover, setHover] = useState(null)
@@ -92,6 +105,10 @@ export default function MapView({
 
     map.on('click', (e) => {
       const { lat, lng } = e.latlng
+      if (lineDrawModeRef.current) {
+        addLinePoint(map, lat, lng)
+        return
+      }
       if (drawModeRef.current) {
         addDrawPoint(map, lat, lng)
         return
@@ -101,6 +118,11 @@ export default function MapView({
       callbacksRef.current.onPointClick(lat, lng)
     })
     map.on('dblclick', (e) => {
+      if (lineDrawModeRef.current) {
+        if (e.originalEvent) L.DomEvent.stop(e.originalEvent)
+        finishLineDraw(map)
+        return
+      }
       if (!drawModeRef.current) return
       if (e.originalEvent) L.DomEvent.stop(e.originalEvent)
       finishDraw(map)
@@ -108,6 +130,9 @@ export default function MapView({
     map.on('mousemove', (e) => {
       setHover(e.latlng)
       callbacksRef.current.onMouseMove(e.latlng.lat, e.latlng.lng)
+      if (lineDrawModeRef.current && linePointsRef.current.length > 0) {
+        updateLinePreview(map, e.latlng)
+      }
       if (drawModeRef.current && drawPointsRef.current.length > 0) {
         updatePreviewLine(map, e.latlng)
       }
@@ -155,6 +180,36 @@ export default function MapView({
     finishDraw(map)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishSignal])
+
+  // toggle line-draw mode (transect tool) — independent of polygon draw mode
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const container = map.getContainer()
+    if (lineDrawMode) {
+      container.style.cursor = 'crosshair'
+      map.doubleClickZoom.disable()
+    } else {
+      container.style.cursor = ''
+      map.doubleClickZoom.enable()
+      clearLineDraw(map)
+    }
+  }, [lineDrawMode])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || lineClearSignal == null) return
+    clearLineDraw(map)
+    if (lineResultRef.current) { map.removeLayer(lineResultRef.current); lineResultRef.current = null }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineClearSignal])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || lineFinishSignal == null) return
+    finishLineDraw(map)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineFinishSignal])
 
   function addDrawPoint(map, lat, lng) {
     const pts = drawPointsRef.current
@@ -225,6 +280,62 @@ export default function MapView({
     const ring = pts.map(([lat, lng]) => [lng, lat])
     ring.push(ring[0])
     onPolygonDrawnRef.current?.({ type: 'Polygon', coordinates: [ring] })
+  }
+
+  function addLinePoint(map, lat, lng) {
+    const pts = linePointsRef.current
+    pts.push([lat, lng])
+    const isFirst = pts.length === 1
+    const m = L.circleMarker([lat, lng], {
+      radius: isFirst ? 6 : 4, color: '#3B82F6', weight: 2, fillColor: isFirst ? '#FFFFFF' : '#3B82F6', fillOpacity: 1,
+      dashArray: '4 3',
+    }).addTo(map)
+    lineMarkersRef.current.push(m)
+
+    if (lineLayerRef.current) map.removeLayer(lineLayerRef.current)
+    if (pts.length > 1) {
+      lineLayerRef.current = L.polyline(pts, { color: '#3B82F6', weight: 3, dashArray: '8 6' }).addTo(map)
+    }
+    onLineDrawPointsChangeRef.current?.(pts.length)
+  }
+
+  function updateLinePreview(map, latlng) {
+    const last = linePointsRef.current[linePointsRef.current.length - 1]
+    if (!last) return
+    const path = [last, [latlng.lat, latlng.lng]]
+    if (linePreviewRef.current) {
+      linePreviewRef.current.setLatLngs(path)
+    } else {
+      linePreviewRef.current = L.polyline(path, {
+        color: '#3B82F6', weight: 2, dashArray: '4 4', opacity: 0.7,
+      }).addTo(map)
+    }
+  }
+
+  function clearLineDraw(map) {
+    linePointsRef.current = []
+    if (lineLayerRef.current) { map.removeLayer(lineLayerRef.current); lineLayerRef.current = null }
+    if (linePreviewRef.current) { map.removeLayer(linePreviewRef.current); linePreviewRef.current = null }
+    lineMarkersRef.current.forEach((m) => map.removeLayer(m))
+    lineMarkersRef.current = []
+    onLineDrawPointsChangeRef.current?.(0)
+  }
+
+  function finishLineDraw(map) {
+    const pts = [...linePointsRef.current]
+    if (pts.length >= 2) {
+      const [lat1, lng1] = pts[pts.length - 1]
+      const [lat2, lng2] = pts[pts.length - 2]
+      if (Math.abs(lat1 - lat2) < 1e-9 && Math.abs(lng1 - lng2) < 1e-9) pts.pop()
+    }
+    clearLineDraw(map)
+    if (pts.length < 2) return
+
+    if (lineResultRef.current) { map.removeLayer(lineResultRef.current); lineResultRef.current = null }
+    lineResultRef.current = L.polyline(pts, { color: '#3B82F6', weight: 3, dashArray: '8 6' }).addTo(map)
+
+    const coordinates = pts.map(([lat, lng]) => [lng, lat])
+    onLineDrawnRef.current?.({ type: 'LineString', coordinates })
   }
 
   // load the real oblast boundary once → outline + remember it for clipping data tiles

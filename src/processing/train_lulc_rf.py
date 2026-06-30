@@ -33,9 +33,9 @@ from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import classification_report, confusion_matrix
 from xgboost import XGBClassifier
 
-COG_PATH = Path(r"D:\data\s2_mosaic_cog.tif")
-WORLDCOVER_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"D:\data\esa_worldcover_turkestan.tif")
-MODEL_PATH = Path(r"D:\data\lulc_classifier_v2.pkl")  # new file — old lulc_classifier.pkl is left untouched
+COG_PATH = Path(r"D:\data\mosaics\2023_summer\s2_mosaic_cog.tif")
+WORLDCOVER_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"D:\data\reference\esa_worldcover_turkestan.tif")
+MODEL_PATH = Path(r"D:\data\classifiers\lulc_classifier_v2.pkl")  # new file — old lulc_classifier.pkl is left untouched
 
 # Every 30th pixel on both axes (~300m spacing). The COG is 41812x61041px
 # (~2.55B px) so sampling every pixel is neither necessary nor finishable.

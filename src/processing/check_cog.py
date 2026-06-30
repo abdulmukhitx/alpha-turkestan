@@ -2,7 +2,7 @@ import rasterio
 from rasterio.warp import transform_bounds
 import numpy as np
 
-COG_PATH = r"D:\data\s2_mosaic_cog.tif"
+COG_PATH = r"D:\data\mosaics\2023_summer\s2_mosaic_cog.tif"
 
 with rasterio.open(COG_PATH) as src:
     print(f"CRS: {src.crs}")

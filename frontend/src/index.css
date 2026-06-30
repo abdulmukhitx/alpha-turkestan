@@ -388,6 +388,31 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .zone-lulc-area { font-family: var(--font-mono); color: var(--text); }
 .zone-lulc-pct { font-family: var(--font-mono); color: var(--text3); min-width: 38px; text-align: right; }
 
+/* ── TRANSECT CHART ───────────────────────────────────────────── */
+.transect-block { padding-top: 10px; }
+.transect-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 6px;
+}
+.transect-length {
+  font-family: var(--font-mono); font-size: 10px; color: var(--text2);
+}
+.transect-chart-wrap {
+  background: #0f172a; border-radius: var(--radius); padding: 4px 0 0;
+  margin: 0 -4px;
+}
+.transect-stats {
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: var(--text2); margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.transect-stats strong { color: var(--text); font-family: var(--font-mono); }
+.transect-tooltip {
+  background: #0f172a; border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px;
+  font-size: 11px; color: var(--text); font-family: var(--font-mono);
+}
+
 .panel::-webkit-scrollbar { width: 4px; }
 .panel::-webkit-scrollbar-track { background: transparent; }
 .panel::-webkit-scrollbar-thumb { background: var(--border-soft); border-radius: 2px; }

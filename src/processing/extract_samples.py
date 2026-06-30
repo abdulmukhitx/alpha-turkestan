@@ -28,9 +28,9 @@ import rasterio
 from rasterio.windows import Window
 from pyproj import Transformer
 
-COG_PATH = Path(r"D:\data\s2_mosaic_cog.tif")
-WORLDCOVER_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"D:\data\esa_worldcover_turkestan.tif")
-OUT_PATH = Path(r"D:\data\lulc_samples_v2.npz")
+COG_PATH = Path(r"D:\data\mosaics\2023_summer\s2_mosaic_cog.tif")
+WORLDCOVER_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"D:\data\reference\esa_worldcover_turkestan.tif")
+OUT_PATH = Path(r"D:\data\samples\lulc_samples_v2.npz")
 
 SAMPLE_STEP = 50          # ~500m spacing in COG pixels (10m/px)
 CAP_PER_CLASS = 150_000   # per-class cap: balances classes and bounds runtime/output size

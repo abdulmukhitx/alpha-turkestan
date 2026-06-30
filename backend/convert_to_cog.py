@@ -21,7 +21,7 @@ from rasterio.warp import transform_bounds
 
 # ── Конфиг ──────────────────────────────────────────────────────────────────
 TILES_DIR  = Path(r"C:\Users\USER\alpha-turkestan\src\processing\s2_work")
-COG_OUTPUT = Path(r"D:\data\s2_mosaic_cog.tif")
+COG_OUTPUT = Path(r"D:\data\mosaics\2023_summer\s2_mosaic_cog.tif")
 
 # Размер окна записи — чем меньше, тем меньше RAM (256 = ~50 MB на запись)
 BLOCK_SIZE = 512

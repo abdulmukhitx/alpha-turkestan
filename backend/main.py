@@ -10,6 +10,7 @@ Endpoints:
   GET  /tiles/{layer}/{z}/{x}/{y}.png   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
   GET  /api/pixel?lat=&lon=             per-pixel spectral values + indices
   POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
+  POST /api/transect                    index profile (line profile) along a drawn line
   POST /api/zone_report                 structured Groq report for a drawn zone (PDF built on frontend)
   POST /api/analyze                     AI interpretation (Groq / DeepSeek / local fallback)
   GET  /metadata                        region + layer metadata
@@ -70,9 +71,12 @@ except ImportError:
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
-COG_PATH  = Path(os.getenv("S2_COG_PATH", r"D:\data\s2_mosaic_cog.tif"))
-LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\lulc_classifier.pkl"))
-LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\lulc_classifier_v2.pkl"))
+MOSAICS_DIR  = Path(r"D:\data\mosaics")
+DEFAULT_PERIOD = "2023_summer"
+COG_PATH  = Path(os.getenv("S2_COG_PATH", str(MOSAICS_DIR / DEFAULT_PERIOD / "s2_mosaic_cog.tif")))
+LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
+LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v2.pkl"))
+WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worldcover_turkestan.tif"))
 
 def s2_assets() -> list[str]:
     """Sorted list of all S2 GeoTIFF paths (fallback source)."""
@@ -697,6 +701,139 @@ async def zone_stats(req: ZoneStatsReq):
         "pixel_count": pixel_count,
         "indices":     indices,
         "lulc":        lulc,
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+#   TRANSECT (line profile)
+# ════════════════════════════════════════════════════════════════
+
+_TRANSECT_LAYERS = {"ndvi", "ndwi", "ndre", "ndmi", "bsi", "savi", "nbr"}
+_TRANSECT_MAX_POINTS = 5000
+
+
+class TransectReq(BaseModel):
+    geometry: dict
+    layer:    str
+
+
+def _transect_index(layer: str, b02, b03, b04, b05, b08, b8a, b11, eps: float):
+    if layer == "ndvi": return (b08 - b04) / (b08 + b04 + eps)
+    if layer == "ndwi": return (b03 - b08) / (b03 + b08 + eps)
+    if layer == "ndre": return (b08 - b05) / (b08 + b05 + eps)
+    if layer == "ndmi": return (b08 - b11) / (b08 + b11 + eps)
+    if layer == "bsi":  return ((b11 + b04) - (b08 + b02)) / ((b11 + b04) + (b08 + b02) + eps)
+    if layer == "savi": return (b08 - b04) / (b08 + b04 + 0.5 + eps) * 1.5
+    if layer == "nbr":  return (b08 - b11) / (b08 + b11 + eps)
+    raise ValueError(f"unknown layer {layer}")
+
+
+@app.post("/api/transect")
+async def transect(req: TransectReq):
+    if not (RASTERIO_OK and cog_available()):
+        raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
+
+    if req.layer not in _TRANSECT_LAYERS:
+        raise HTTPException(status_code=400, detail=f"layer должен быть одним из: {sorted(_TRANSECT_LAYERS)}")
+
+    geom = req.geometry
+    if not geom or geom.get("type") != "LineString" or not geom.get("coordinates"):
+        raise HTTPException(status_code=400, detail="Ожидается GeoJSON LineString")
+    coords = geom["coordinates"]
+    if len(coords) < 2:
+        raise HTTPException(status_code=400, detail="Линия должна содержать минимум 2 точки")
+
+    try:
+        with rasterio.open(COG_PATH) as ds:
+            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            verts_proj = [transformer.transform(lon, lat) for lon, lat in coords]
+
+            xs = [p[0] for p in verts_proj]
+            ys = [p[1] for p in verts_proj]
+            ds_l, ds_b, ds_r, ds_t = ds.bounds
+            if max(xs) < ds_l or min(xs) > ds_r or max(ys) < ds_b or min(ys) > ds_t:
+                raise HTTPException(status_code=400, detail="Линия находится за пределами области покрытия")
+
+            px = abs(ds.transform.a)  # pixel size in meters (10m)
+
+            # cumulative segment lengths
+            seg_lengths = []
+            total_length = 0.0
+            for i in range(len(verts_proj) - 1):
+                x1, y1 = verts_proj[i]
+                x2, y2 = verts_proj[i + 1]
+                d = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                seg_lengths.append(d)
+                total_length += d
+            if total_length <= 0:
+                raise HTTPException(status_code=400, detail="Длина линии равна нулю")
+
+            step = px
+            n_samples = int(total_length / step) + 1
+            if n_samples > _TRANSECT_MAX_POINTS:
+                step = total_length / _TRANSECT_MAX_POINTS
+                n_samples = _TRANSECT_MAX_POINTS
+
+            sample_xy_proj = []   # (x, y) in raster CRS
+            sample_lonlat  = []   # (lon, lat)
+            sample_dist    = []
+            transformer_inv = Transformer.from_crs(ds.crs, "EPSG:4326", always_xy=True)
+
+            d = 0.0
+            seg_idx = 0
+            seg_start_dist = 0.0
+            while d <= total_length + 1e-6:
+                dd = min(d, total_length)
+                while seg_idx < len(seg_lengths) - 1 and dd > seg_start_dist + seg_lengths[seg_idx] + 1e-9:
+                    seg_start_dist += seg_lengths[seg_idx]
+                    seg_idx += 1
+                seg_len = seg_lengths[seg_idx] or 1e-9
+                t = (dd - seg_start_dist) / seg_len
+                t = max(0.0, min(1.0, t))
+                x1, y1 = verts_proj[seg_idx]
+                x2, y2 = verts_proj[seg_idx + 1]
+                x = x1 + (x2 - x1) * t
+                y = y1 + (y2 - y1) * t
+                lon, lat = transformer_inv.transform(x, y)
+                sample_xy_proj.append((x, y))
+                sample_lonlat.append((lon, lat))
+                sample_dist.append(dd)
+                d += step
+
+            samples = list(ds.sample(sample_xy_proj))  # list of (7,) arrays
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+
+    eps = 1e-10
+    points = []
+    valid_values = []
+    for dist, (lon, lat), band_vals in zip(sample_dist, sample_lonlat, samples):
+        band_vals = band_vals.astype(np.float32)
+        if np.all(band_vals == 0):
+            points.append({"distance_m": round(dist, 2), "value": None, "lon": round(lon, 6), "lat": round(lat, 6)})
+            continue
+        b02, b03, b04, b05, b08, b8a, b11 = (band_vals / 10000)
+        value = float(_transect_index(req.layer, b02, b03, b04, b05, b08, b8a, b11, eps))
+        points.append({"distance_m": round(dist, 2), "value": round(value, 4), "lon": round(lon, 6), "lat": round(lat, 6)})
+        valid_values.append(value)
+
+    if not valid_values:
+        raise HTTPException(status_code=400, detail="Нет валидных пикселей вдоль линии")
+
+    stats = {
+        "min":  round(float(np.min(valid_values)), 4),
+        "max":  round(float(np.max(valid_values)), 4),
+        "mean": round(float(np.mean(valid_values)), 4),
+    }
+
+    return {
+        "layer":          req.layer,
+        "total_length_m": round(total_length, 2),
+        "points":         points,
+        "stats":          stats,
     }
 
 

@@ -44,6 +44,19 @@ export async function fetchZoneStats(geometry) {
   return r.json()
 }
 
+export async function fetchTransect(geometry, layer) {
+  const r = await fetch('/api/transect', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ geometry, layer }),
+  })
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Transect failed: ${r.status}`)
+  }
+  return r.json()
+}
+
 export async function fetchZoneReport({ geometry, zoneStats, activeLayer, mapImageBase64 }) {
   const r = await fetch('/api/zone_report', {
     method:  'POST',

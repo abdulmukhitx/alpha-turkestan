@@ -1,6 +1,6 @@
 """
 GeoAI-TKO · src/processing/train_xgb.py
-Loads the samples extracted by extract_samples.py (D:\\data\\lulc_samples_v2.npz)
+Loads the samples extracted by extract_samples.py (D:\\data\\samples\\lulc_samples_v2.npz)
 and trains the v2 XGBoost LULC classifier. Kept separate from extraction so
 re-tuning the model doesn't require re-scanning the 34.5GB COG.
 
@@ -16,8 +16,8 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
-SAMPLES_PATH = "D:/data/lulc_samples_v2.npz"
-MODEL_PATH = "D:/data/lulc_classifier_v2.pkl"
+SAMPLES_PATH = "D:/data/samples/lulc_samples_v2.npz"
+MODEL_PATH = "D:/data/classifiers/lulc_classifier_v2.pkl"
 
 # Must match extract_samples.py's FEATURE_NAMES order exactly.
 FEAT_NAMES = [

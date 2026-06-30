@@ -3,7 +3,7 @@ import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
-import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis, fetchZoneStats } from './api'
+import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect } from './api'
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
@@ -42,8 +42,18 @@ export default function App() {
   const [finishSignal, setFinishSignal] = useState(0)
   const [drawPointCount, setDrawPointCount] = useState(0)
 
+  const [lineDrawMode, setLineDrawMode] = useState(false)
+  const [transectLine, setTransectLine] = useState(null)
+  const [transectData, setTransectData] = useState(null)
+  const [transectLoading, setTransectLoading] = useState(false)
+  const [transectError, setTransectError] = useState(null)
+  const [lineClearSignal, setLineClearSignal] = useState(0)
+  const [lineFinishSignal, setLineFinishSignal] = useState(0)
+  const [lineDrawPointCount, setLineDrawPointCount] = useState(0)
+
   const requestIdRef = useRef(0)
   const zoneReqIdRef = useRef(0)
+  const transectReqIdRef = useRef(0)
 
   useEffect(() => {
     const total = BOOT_STEPS[BOOT_STEPS.length - 1][0]
@@ -124,6 +134,48 @@ export default function App() {
     setClearSignal((n) => n + 1)
   }
 
+  async function runTransect(geometry, layer) {
+    setTransectData(null)
+    setTransectError(null)
+    setTransectLoading(true)
+
+    const reqId = ++transectReqIdRef.current
+    try {
+      const data = await fetchTransect(geometry, layer)
+      if (transectReqIdRef.current !== reqId) return
+      setTransectData(data)
+    } catch (e) {
+      if (transectReqIdRef.current !== reqId) return
+      setTransectError(e.message || 'Не удалось получить профиль по линии')
+    } finally {
+      if (transectReqIdRef.current === reqId) setTransectLoading(false)
+    }
+  }
+
+  function handleLineDrawn(geometry) {
+    setLineDrawMode(false)
+    setTransectLine(geometry)
+    runTransect(geometry, activeLayer)
+  }
+
+  function handleClearLine() {
+    transectReqIdRef.current += 1
+    setTransectLine(null)
+    setTransectData(null)
+    setTransectError(null)
+    setTransectLoading(false)
+    setLineDrawMode(false)
+    setLineDrawPointCount(0)
+    setLineClearSignal((n) => n + 1)
+  }
+
+  // re-fetch the transect when the active layer changes while a line is already drawn
+  useEffect(() => {
+    if (!transectLine) return
+    runTransect(transectLine, activeLayer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeLayer])
+
   const layers = {}
   if (meta?.layers) {
     for (const [id, cfg] of Object.entries(meta.layers)) {
@@ -164,6 +216,12 @@ export default function App() {
           onFinishDraw={() => setFinishSignal((n) => n + 1)}
           hasZone={!!zonePolygon}
           drawPointCount={drawPointCount}
+          lineDrawMode={lineDrawMode}
+          onToggleLineDraw={() => setLineDrawMode((d) => !d)}
+          onClearLine={handleClearLine}
+          onFinishLineDraw={() => setLineFinishSignal((n) => n + 1)}
+          hasLine={!!transectLine}
+          lineDrawPointCount={lineDrawPointCount}
         />
 
         <MapView
@@ -180,6 +238,11 @@ export default function App() {
           clearSignal={clearSignal}
           finishSignal={finishSignal}
           onDrawPointsChange={setDrawPointCount}
+          lineDrawMode={lineDrawMode}
+          onLineDrawn={handleLineDrawn}
+          lineClearSignal={lineClearSignal}
+          lineFinishSignal={lineFinishSignal}
+          onLineDrawPointsChange={setLineDrawPointCount}
         />
 
         <AnalysisPanel
@@ -193,6 +256,9 @@ export default function App() {
           zoneError={zoneError}
           zoneGeometry={zonePolygon}
           activeLayer={activeLayer}
+          transectData={transectData}
+          transectLoading={transectLoading}
+          transectError={transectError}
         />
       </main>
     </div>

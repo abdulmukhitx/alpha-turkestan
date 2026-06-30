@@ -34,6 +34,7 @@ const LABELS = {
 export default function LayerPanel({
   layers, activeLayer, onSelect, opacity, onOpacityChange,
   drawMode, onToggleDraw, onClearZone, onFinishDraw, hasZone, drawPointCount = 0,
+  lineDrawMode, onToggleLineDraw, onClearLine, onFinishLineDraw, hasLine, lineDrawPointCount = 0,
 }) {
   const indexIds = Object.keys(layers).length ? Object.keys(layers) : Object.keys(NAMES).filter((id) => id !== 'satellite')
   const ids = ['satellite', ...indexIds.filter((id) => id !== 'satellite')]
@@ -91,6 +92,30 @@ export default function LayerPanel({
         )}
         {hasZone && (
           <button className="zone-tool-btn zone-tool-clear" onClick={onClearZone}>Очистить</button>
+        )}
+
+        <button
+          className={`zone-tool-btn ${lineDrawMode ? 'active' : ''}`}
+          onClick={onToggleLineDraw}
+        >
+          {lineDrawMode ? 'Отменить рисование' : '📈 Профиль по линии'}
+        </button>
+        {lineDrawMode && (
+          <>
+            <div className="zone-hint">
+              Точки: {lineDrawPointCount}. Дважды кликните по карте, либо нажмите «Завершить» (мин. 2 точки).
+            </div>
+            <button
+              className="zone-tool-btn zone-tool-finish"
+              onClick={onFinishLineDraw}
+              disabled={lineDrawPointCount < 2}
+            >
+              ✓ Завершить ({lineDrawPointCount})
+            </button>
+          </>
+        )}
+        {hasLine && (
+          <button className="zone-tool-btn zone-tool-clear" onClick={onClearLine}>Очистить</button>
         )}
       </div>
 

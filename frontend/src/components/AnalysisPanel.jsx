@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import ZoneStatsPanel from './ZoneStatsPanel.jsx'
+import TransectChart from './TransectChart.jsx'
 
 function Typewriter({ text }) {
   const [shown, setShown] = useState('')
@@ -74,6 +75,7 @@ function indexColor(key, v) {
 export default function AnalysisPanel({
   point, pixel, aiText, loading, error,
   zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer,
+  transectData, transectLoading, transectError,
 }) {
   if (!point) {
     return (
@@ -94,6 +96,7 @@ export default function AnalysisPanel({
           stats={zoneStats} loading={zoneLoading} error={zoneError}
           geometry={zoneGeometry} activeLayer={activeLayer}
         />
+        <TransectChart data={transectData} loading={transectLoading} error={transectError} />
       </aside>
     )
   }
@@ -166,6 +169,7 @@ export default function AnalysisPanel({
         stats={zoneStats} loading={zoneLoading} error={zoneError}
         geometry={zoneGeometry} activeLayer={activeLayer}
       />
+      <TransectChart data={transectData} loading={transectLoading} error={transectError} />
     </aside>
   )
 }
