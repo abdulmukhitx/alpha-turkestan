@@ -12,8 +12,14 @@ export async function fetchMetadata() {
   return r.json()
 }
 
-export async function fetchPixel(lat, lon) {
-  const r = await fetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}`)
+export async function fetchPeriods() {
+  const r = await fetch('/api/periods')
+  if (!r.ok) throw new Error(`Periods fetch failed: ${r.status}`)
+  return r.json()
+}
+
+export async function fetchPixel(lat, lon, period) {
+  const r = await fetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&period=${period}`)
   if (!r.ok) throw new Error(`Pixel fetch failed: ${r.status}`)
   return r.json()
 }
@@ -28,14 +34,14 @@ export async function fetchAnalysis({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, sav
   return r.json()
 }
 
-/** Leaflet-compatible XYZ tile URL template for a given layer. */
-export const tileUrl = (layer) => `/tiles/${layer}/{z}/{x}/{y}.png`
+/** Leaflet-compatible XYZ tile URL template for a given layer + period. */
+export const tileUrl = (layer, period) => `/tiles/${layer}/{z}/{x}/{y}.png?period=${period}`
 
-export async function fetchZoneStats(geometry) {
+export async function fetchZoneStats(geometry, period) {
   const r = await fetch('/api/zone_stats', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ geometry }),
+    body:    JSON.stringify({ geometry, period }),
   })
   if (!r.ok) {
     const detail = await r.json().catch(() => null)
@@ -44,11 +50,11 @@ export async function fetchZoneStats(geometry) {
   return r.json()
 }
 
-export async function fetchTransect(geometry, layer) {
+export async function fetchTransect(geometry, layer, period) {
   const r = await fetch('/api/transect', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ geometry, layer }),
+    body:    JSON.stringify({ geometry, layer, period }),
   })
   if (!r.ok) {
     const detail = await r.json().catch(() => null)

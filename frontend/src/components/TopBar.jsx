@@ -1,4 +1,4 @@
-export default function TopBar({ lat, lon, health, onRefresh }) {
+export default function TopBar({ lat, lon, health, onRefresh, periods, period, onPeriodChange }) {
   const online = health && health.status === 'ok'
   const statusText = health
     ? (online ? `Sentinel-2 · ${health.cog ? 'COG mosaic' : health.s2_tiles + ' tiles'}` : 'Backend offline')
@@ -27,6 +27,18 @@ export default function TopBar({ lat, lon, health, onRefresh }) {
       </div>
 
       <div className="topbar-right">
+        {periods?.length > 0 && (
+          <select
+            className="period-select"
+            value={period}
+            onChange={(e) => onPeriodChange(e.target.value)}
+            title="Период съёмки"
+          >
+            {periods.map((p) => (
+              <option key={p.period_id} value={p.period_id}>{p.label}</option>
+            ))}
+          </select>
+        )}
         <div className={`status-pill ${online ? '' : 'offline'}`}>
           <span className="status-dot" />
           <span>{statusText}</span>

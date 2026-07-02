@@ -1,19 +1,20 @@
 """
 GeoAI-TKO — FastAPI Backend v4
 ================================
-Primary data source: merged COG mosaic (S2_COG_PATH, default D:\\data\\s2_mosaic_cog.tif)
+Primary data source: per-period COG mosaics (see PERIODS registry below).
   7 bands: B02=1 B03=2 B04=3 B05=4 B08=5 B8A=6 B11=7   CRS EPSG:32641, 10m
-Fallback: src/processing/s2_work/*.tif (per-scene tiles, merged on the fly)
+Fallback: src/processing/s2_work/*.tif (per-scene tiles, merged on the fly; default period only)
 
 Endpoints:
   GET  /health                          service check
-  GET  /tiles/{layer}/{z}/{x}/{y}.png   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
-  GET  /api/pixel?lat=&lon=             per-pixel spectral values + indices
+  GET  /api/periods                     list of available periods for the UI selector
+  GET  /tiles/{layer}/{z}/{x}/{y}.png?period=   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
+  GET  /api/pixel?lat=&lon=&period=     per-pixel spectral values + indices
   POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
   POST /api/transect                    index profile (line profile) along a drawn line
   POST /api/zone_report                 structured Groq report for a drawn zone (PDF built on frontend)
   POST /api/analyze                     AI interpretation (Groq / DeepSeek / local fallback)
-  GET  /metadata                        region + layer metadata
+  GET  /metadata                        region + layer metadata (default period only)
   GET  /data/...                        static data files
 
 Run:
@@ -72,23 +73,85 @@ BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
 MOSAICS_DIR  = Path(r"D:\data\mosaics")
-DEFAULT_PERIOD = "2023_summer"
-COG_PATH  = Path(os.getenv("S2_COG_PATH", str(MOSAICS_DIR / DEFAULT_PERIOD / "s2_mosaic_cog.tif")))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
 LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v2.pkl"))
 WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worldcover_turkestan.tif"))
+
+# ── Period registry ──────────────────────────────────────────────
+# Independent, non-comparable map states — each period is viewed on its own.
+# "storage" records the physical pixel format of that period's COG, since the
+# two mosaics are NOT stored the same way:
+#   "dn"          — raw uint16 digital numbers, nodata=0, reflectance = DN/10000
+#   "reflectance" — physical float32 reflectance already in 0..1, nodata=-9999
+# 2023_summer intentionally still points at the original uint16 file, not the
+# newer float32 v2 conversion (s2_mosaic_cog_v2.tif) — that file finished
+# converting today with no QA validation yet, whereas this file is the proven
+# production mosaic. 2023_summer's real rebuild (from CDSE) is planned for
+# tomorrow; don't touch these paths until that lands.
+PERIODS = {
+    "2023_summer": {
+        "label": "Лето 2023",
+        "date_range": "01.06.2023 – 31.08.2023",
+        "cog_path": MOSAICS_DIR / "2023_summer" / "s2_mosaic_cog.tif",
+        "storage": "dn",
+    },
+    "2025_summer": {
+        "label": "Лето 2025",
+        "date_range": "01.06.2025 – 31.08.2025",
+        "cog_path": MOSAICS_DIR / "2025_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
+}
+DEFAULT_PERIOD = "2023_summer"
+_REFLECTANCE_NODATA = -9999
+
+# Kept for the /health and /metadata endpoints, which stay tied to the
+# default period (not part of the period switcher).
+COG_PATH = PERIODS[DEFAULT_PERIOD]["cog_path"]
+
+
+def resolve_period(period_id: str) -> dict:
+    cfg = PERIODS.get(period_id)
+    if cfg is None:
+        raise HTTPException(status_code=400, detail=f"Неизвестный период: {period_id}")
+    return cfg
+
+
+def period_nodata_mask(data: "np.ndarray", period: dict) -> "np.ndarray":
+    """bool array (rows, cols) — True where all bands are nodata, per the period's storage format."""
+    if period["storage"] == "reflectance":
+        return np.all(data == _REFLECTANCE_NODATA, axis=0)
+    return np.all(data == 0, axis=0)
+
+
+def period_to_reflectance(data: "np.ndarray", period: dict) -> "np.ndarray":
+    """Bands → physical reflectance (0..1), regardless of the period's storage format."""
+    if period["storage"] == "reflectance":
+        return data
+    return data / 10000
+
+
+def period_to_dn_equivalent(window: "np.ndarray", period: dict) -> "np.ndarray":
+    """Bands → DN-equivalent magnitude, used only for classify_ml_v2's texture-std
+    features so they stay on the scale the model was trained on (raw DN), regardless
+    of whether the source period is stored as DN or as physical reflectance."""
+    if period["storage"] == "reflectance":
+        return window * 10000
+    return window
+
 
 def s2_assets() -> list[str]:
     """Sorted list of all S2 GeoTIFF paths (fallback source)."""
     return sorted(str(p) for p in S2_DIR.glob("*.tif")) if S2_DIR.exists() else []
 
-def cog_available() -> bool:
-    return RASTERIO_OK and COG_PATH.exists()
+def cog_available(period: dict | None = None) -> bool:
+    path = (period or PERIODS[DEFAULT_PERIOD])["cog_path"]
+    return RASTERIO_OK and path.exists()
 
 _COG_BOUNDS_WGS84: tuple | None = None
 
 def cog_bounds_wgs84() -> list[float] | None:
-    """[south, west, north, east] of the COG, reprojected to WGS84. Cached."""
+    """[south, west, north, east] of the default period's COG, reprojected to WGS84. Cached."""
     global _COG_BOUNDS_WGS84
     if not cog_available():
         return None
@@ -276,25 +339,25 @@ def blank_tile() -> bytes:
 
 
 # ── Mosaic reader (manual, rio-tiler version-agnostic) ────────────
-def mosaic_tile(x: int, y: int, z: int):
+def mosaic_tile(x: int, y: int, z: int, period: dict):
     """
     Read one 256×256 tile, preferring the merged COG mosaic.
     Returns (data: float32 array (bands, 256, 256), mask: uint8 (256, 256))
     or (None, None) when no coverage.
 
-    Mask is derived from the raw bands ourselves — valid unless ALL bands == 0 —
-    rather than trusting rio-tiler's img.mask. rio-tiler flags a pixel nodata as
-    soon as ANY single band reads 0, which is too aggressive here: it kills real
-    pixels where one band legitimately reads ~0 (and the computed index is ≈0)
-    while the rest of the bands, and the COG's actual nodata convention (all 7
-    bands == 0), say the pixel is valid.
+    Mask is derived from the raw bands ourselves — valid unless ALL bands are
+    the period's nodata value — rather than trusting rio-tiler's img.mask.
+    rio-tiler flags a pixel nodata as soon as ANY single band matches nodata,
+    which is too aggressive here: it kills real pixels where one band
+    legitimately reads ~0 (and the computed index is ≈0) while the rest of the
+    bands, and the COG's actual nodata convention, say the pixel is valid.
     """
-    if cog_available():
+    if cog_available(period):
         try:
-            with Reader(str(COG_PATH)) as src:
+            with Reader(str(period["cog_path"])) as src:
                 img = src.tile(x, y, z, tilesize=256)
             data = img.data.astype(np.float32)
-            mask = (~np.all(data == 0, axis=0)).astype(np.uint8) * 255
+            mask = (~period_nodata_mask(data, period)).astype(np.uint8) * 255
             return data, mask
         except TileOutsideBounds:
             return None, None
@@ -341,20 +404,20 @@ def _mosaic_tile_legacy(x: int, y: int, z: int):
 
 
 # ── Index computation ─────────────────────────────────────────────
-def compute_index(data: "np.ndarray", layer: str) -> "np.ndarray":
+def compute_index(data: "np.ndarray", layer: str, period: dict) -> "np.ndarray":
     """
-    data: float32 (bands, 256, 256) — raw DN ~0..10 000
+    data: float32 (bands, 256, 256) — period's native storage format (DN or reflectance)
     Returns float32 (256, 256) index values.
     """
     eps = 1e-10
-    # Convert to surface reflectance (0..1)
-    b02 = data[_B02] / 10000
-    b03 = data[_B03] / 10000
-    b04 = data[_B04] / 10000
-    b05 = data[_B05] / 10000
-    b08 = data[_B08] / 10000
-    b8a = data[_B8A] / 10000
-    b11 = data[_B11] / 10000
+    refl = period_to_reflectance(data, period)
+    b02 = refl[_B02]
+    b03 = refl[_B03]
+    b04 = refl[_B04]
+    b05 = refl[_B05]
+    b08 = refl[_B08]
+    b8a = refl[_B8A]
+    b11 = refl[_B11]
 
     if   layer == "ndvi": return (b08 - b04) / (b08 + b04 + eps)
     elif layer == "ndwi": return (b03 - b08) / (b03 + b08 + eps)
@@ -420,16 +483,25 @@ async def health():
     }
 
 
+@app.get("/api/periods")
+async def periods():
+    return [
+        {"period_id": k, "label": v["label"], "date_range": v["date_range"]}
+        for k, v in PERIODS.items()
+    ]
+
+
 # ════════════════════════════════════════════════════════════════
 #   TILE ENDPOINT
 # ════════════════════════════════════════════════════════════════
 
 @app.get("/tiles/{layer}/{z}/{x}/{y}.png")
-async def tile(layer: str, z: int, x: int, y: int):
+async def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_PERIOD)):
     if not TILER_OK or layer not in LAYERS:
         return Response(content=blank_tile(), media_type="image/png")
 
-    data, mask = mosaic_tile(x, y, z)
+    period_cfg = resolve_period(period)
+    data, mask = mosaic_tile(x, y, z, period_cfg)
 
     if data is None:
         return Response(content=blank_tile(), media_type="image/png",
@@ -443,7 +515,7 @@ async def tile(layer: str, z: int, x: int, y: int):
     try:
         cfg     = LAYERS[layer]
         vmin, vmax = cfg["range"]
-        index   = compute_index(data, layer)
+        index   = compute_index(data, layer, period_cfg)
         content = render_index(index, mask, cfg["cmap"], vmin, vmax)
     except Exception as e:
         print(f"render error {layer}/{z}/{x}/{y}: {e}")
@@ -483,9 +555,11 @@ async def pixel(
     # The old 40.8–44.0 / 67.5–71.5 box wrongly 422'd valid points like 44.15°N.
     lat: float = Query(..., ge=40.0, le=47.0),
     lon: float = Query(..., ge=65.0, le=72.0),
+    period: str = Query(DEFAULT_PERIOD),
 ):
     import math
     result = {}
+    period_cfg = resolve_period(period)
 
     def _pixel_from(path: str):
         with rasterio.open(path) as src:
@@ -495,23 +569,25 @@ async def pixel(
             if not (0 <= row < src.height and 0 <= col < src.width):
                 return None
             raw = src.read(window=((row, row + 1), (col, col + 1))).astype(float).flatten()
-            if len(raw) < 7 or not raw[:7].any():
+            if len(raw) < 7 or period_nodata_mask(raw[:7].reshape(7, 1, 1), period_cfg).all():
                 return None
-            b   = raw[:7] / 10000  # reflectance
+            b   = period_to_reflectance(raw[:7], period_cfg)
             eps = 1e-10
 
             # 3x3 window (clipped at raster edges) for the v2 classifier's
-            # texture features — std per band of raw DN, same convention as
-            # src/processing/extract_samples.py's read_point_window().
+            # texture features — std per band of DN-equivalent magnitude, same
+            # convention as src/processing/extract_samples.py's
+            # read_point_window() (which was trained on raw DN).
             row_off, col_off = max(0, row - 1), max(0, col - 1)
             row_end, col_end = min(src.height, row + 2), min(src.width, col + 2)
             win = src.read(window=((row_off, row_end), (col_off, col_end))).astype(np.float32)
-            win_nodata = np.all(win == 0, axis=0)
+            win_nodata = period_nodata_mask(win, period_cfg)
             valid_px = ~win_nodata
+            win_dn = period_to_dn_equivalent(win, period_cfg)
             if valid_px.sum() < 3:
                 std_vals = np.zeros(7, dtype=np.float32)
             else:
-                std_vals = win[:, valid_px].std(axis=1)
+                std_vals = win_dn[:, valid_px].std(axis=1)
             std_bands = {
                 name: round(float(v), 4)
                 for name, v in zip(("B02", "B03", "B04", "B05", "B08", "B8A", "B11"), std_vals)
@@ -534,9 +610,9 @@ async def pixel(
                 "demo": False,
             }
 
-    if RASTERIO_OK and cog_available():
+    if RASTERIO_OK and cog_available(period_cfg):
         try:
-            result = _pixel_from(str(COG_PATH)) or {}
+            result = _pixel_from(str(period_cfg["cog_path"])) or {}
         except Exception as e:
             print(f"COG pixel read failed: {e}")
 
@@ -581,6 +657,7 @@ async def pixel(
 
 class ZoneStatsReq(BaseModel):
     geometry: dict
+    period:   str = DEFAULT_PERIOD
 
 
 _ZONE_INDEX_KEYS = ["ndvi", "ndwi", "ndre", "ndmi", "bsi"]
@@ -601,7 +678,8 @@ def _zone_index_stats(arr: "np.ndarray") -> dict:
 
 @app.post("/api/zone_stats")
 async def zone_stats(req: ZoneStatsReq):
-    if not (RASTERIO_OK and cog_available()):
+    period_cfg = resolve_period(req.period)
+    if not (RASTERIO_OK and cog_available(period_cfg)):
         raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
 
     geom = req.geometry
@@ -609,7 +687,7 @@ async def zone_stats(req: ZoneStatsReq):
         raise HTTPException(status_code=400, detail="Ожидается GeoJSON Polygon")
 
     try:
-        with rasterio.open(COG_PATH) as ds:
+        with rasterio.open(period_cfg["cog_path"]) as ds:
             # Reproject ring(s) from WGS84 → raster CRS
             transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
             rings_proj = []
@@ -650,19 +728,20 @@ async def zone_stats(req: ZoneStatsReq):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
 
-    nodata_mask = np.all(data == 0, axis=0)          # all 7 bands == 0 → nodata
+    nodata_mask = period_nodata_mask(data, period_cfg)
     valid_mask = poly_mask & ~nodata_mask
     pixel_count = int(np.count_nonzero(valid_mask))
     if pixel_count == 0:
         raise HTTPException(status_code=400, detail="Нет валидных пикселей внутри полигона")
 
-    b02 = data[0][valid_mask] / 10000
-    b03 = data[1][valid_mask] / 10000
-    b04 = data[2][valid_mask] / 10000
-    b05 = data[3][valid_mask] / 10000
-    b08 = data[4][valid_mask] / 10000
-    b8a = data[5][valid_mask] / 10000
-    b11 = data[6][valid_mask] / 10000
+    refl = period_to_reflectance(data, period_cfg)
+    b02 = refl[0][valid_mask]
+    b03 = refl[1][valid_mask]
+    b04 = refl[2][valid_mask]
+    b05 = refl[3][valid_mask]
+    b08 = refl[4][valid_mask]
+    b8a = refl[5][valid_mask]
+    b11 = refl[6][valid_mask]
     eps = 1e-10
 
     ndvi = (b08 - b04) / (b08 + b04 + eps)
@@ -715,6 +794,7 @@ _TRANSECT_MAX_POINTS = 5000
 class TransectReq(BaseModel):
     geometry: dict
     layer:    str
+    period:   str = DEFAULT_PERIOD
 
 
 def _transect_index(layer: str, b02, b03, b04, b05, b08, b8a, b11, eps: float):
@@ -730,7 +810,8 @@ def _transect_index(layer: str, b02, b03, b04, b05, b08, b8a, b11, eps: float):
 
 @app.post("/api/transect")
 async def transect(req: TransectReq):
-    if not (RASTERIO_OK and cog_available()):
+    period_cfg = resolve_period(req.period)
+    if not (RASTERIO_OK and cog_available(period_cfg)):
         raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
 
     if req.layer not in _TRANSECT_LAYERS:
@@ -744,7 +825,7 @@ async def transect(req: TransectReq):
         raise HTTPException(status_code=400, detail="Линия должна содержать минимум 2 точки")
 
     try:
-        with rasterio.open(COG_PATH) as ds:
+        with rasterio.open(period_cfg["cog_path"]) as ds:
             transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
             verts_proj = [transformer.transform(lon, lat) for lon, lat in coords]
 
@@ -812,10 +893,10 @@ async def transect(req: TransectReq):
     valid_values = []
     for dist, (lon, lat), band_vals in zip(sample_dist, sample_lonlat, samples):
         band_vals = band_vals.astype(np.float32)
-        if np.all(band_vals == 0):
+        if period_nodata_mask(band_vals.reshape(7, 1, 1), period_cfg).all():
             points.append({"distance_m": round(dist, 2), "value": None, "lon": round(lon, 6), "lat": round(lat, 6)})
             continue
-        b02, b03, b04, b05, b08, b8a, b11 = (band_vals / 10000)
+        b02, b03, b04, b05, b08, b8a, b11 = period_to_reflectance(band_vals, period_cfg)
         value = float(_transect_index(req.layer, b02, b03, b04, b05, b08, b8a, b11, eps))
         points.append({"distance_m": round(dist, 2), "value": round(value, 4), "lon": round(lon, 6), "lat": round(lat, 6)})
         valid_values.append(value)

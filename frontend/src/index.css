@@ -103,6 +103,14 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--signal); }
 .status-pill.offline .status-dot { background: var(--danger); }
 
+.period-select {
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: 20px; padding: 5px 12px;
+  font-size: 11px; color: var(--text2); font-family: var(--font-mono); font-weight: 500;
+  cursor: pointer; outline: none; appearance: none;
+}
+.period-select:hover { border-color: var(--border2); color: var(--data); }
+
 .icon-btn {
   width: 32px; height: 32px; border-radius: var(--radius);
   background: var(--card-bg); border: 1px solid var(--border);

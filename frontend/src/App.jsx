@@ -3,7 +3,7 @@ import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
-import { fetchHealth, fetchMetadata, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect } from './api'
+import { fetchHealth, fetchMetadata, fetchPeriods, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect } from './api'
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
@@ -23,6 +23,8 @@ export default function App() {
 
   const [health, setHealth] = useState(null)
   const [meta, setMeta] = useState(null)
+  const [periods, setPeriods] = useState([])
+  const [period, setPeriod] = useState('2023_summer')
   const [activeLayer, setActiveLayer] = useState('ndvi')
   const [opacity, setOpacity] = useState(0.85)
   const [hoverPos, setHoverPos] = useState(null)
@@ -69,6 +71,7 @@ export default function App() {
   useEffect(() => {
     refreshHealth()
     fetchMetadata().then(setMeta).catch(() => setMeta(null))
+    fetchPeriods().then(setPeriods).catch(() => setPeriods([]))
   }, [])
 
   function refreshHealth() {
@@ -84,7 +87,7 @@ export default function App() {
 
     const reqId = ++requestIdRef.current
     try {
-      const px = await fetchPixel(lat, lng)
+      const px = await fetchPixel(lat, lng, period)
       if (requestIdRef.current !== reqId) return
       setPixel(px)
 
@@ -103,16 +106,14 @@ export default function App() {
     }
   }
 
-  async function handlePolygonDrawn(geometry) {
-    setDrawMode(false)
-    setZonePolygon(geometry)
+  async function runZoneStats(geometry) {
     setZoneStats(null)
     setZoneError(null)
     setZoneLoading(true)
 
     const reqId = ++zoneReqIdRef.current
     try {
-      const stats = await fetchZoneStats(geometry)
+      const stats = await fetchZoneStats(geometry, period)
       if (zoneReqIdRef.current !== reqId) return
       setZoneStats(stats)
     } catch (e) {
@@ -121,6 +122,12 @@ export default function App() {
     } finally {
       if (zoneReqIdRef.current === reqId) setZoneLoading(false)
     }
+  }
+
+  function handlePolygonDrawn(geometry) {
+    setDrawMode(false)
+    setZonePolygon(geometry)
+    runZoneStats(geometry)
   }
 
   function handleClearZone() {
@@ -141,7 +148,7 @@ export default function App() {
 
     const reqId = ++transectReqIdRef.current
     try {
-      const data = await fetchTransect(geometry, layer)
+      const data = await fetchTransect(geometry, layer, period)
       if (transectReqIdRef.current !== reqId) return
       setTransectData(data)
     } catch (e) {
@@ -176,6 +183,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeLayer])
 
+  // switching period keeps any drawn geometry as-is and just re-queries it —
+  // each period is viewed independently, no comparison between them
+  useEffect(() => {
+    if (transectLine) runTransect(transectLine, activeLayer)
+    if (zonePolygon) runZoneStats(zonePolygon)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period])
+
   const layers = {}
   if (meta?.layers) {
     for (const [id, cfg] of Object.entries(meta.layers)) {
@@ -201,6 +216,9 @@ export default function App() {
         lon={hoverPos?.lng}
         health={health}
         onRefresh={refreshHealth}
+        periods={periods}
+        period={period}
+        onPeriodChange={setPeriod}
       />
 
       <main className="workspace">
@@ -226,6 +244,7 @@ export default function App() {
 
         <MapView
           activeLayer={activeLayer}
+          period={period}
           opacity={opacity}
           bounds={meta?.region?.bounds}
           center={meta?.region?.center || FALLBACK_CENTER}

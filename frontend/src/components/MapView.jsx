@@ -26,7 +26,7 @@ const BASEMAP_ORDER = ['satellite', 'terrain', 'dark']
 const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png'
 
 export default function MapView({
-  activeLayer, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
+  activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
 }) {
@@ -414,20 +414,23 @@ export default function MapView({
       return
     }
 
-    if (!overlaysRef.current[activeLayer]) {
+    // keyed by layer+period — each period is a separate cached tile layer,
+    // toggled by opacity like the existing per-layer caching below
+    const key = `${activeLayer}:${period}`
+    if (!overlaysRef.current[key]) {
       const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
-      const url = tileUrl(activeLayer)
+      const url = tileUrl(activeLayer, period)
       const layer = (clipGeo && L.TileLayer.boundaryCanvas)
         ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
         : L.tileLayer(url, common)
       layer.addTo(map)
-      overlaysRef.current[activeLayer] = layer
+      overlaysRef.current[key] = layer
       boundaryRef.current?.bringToFront?.()   // keep outline above the data
     }
     Object.entries(overlaysRef.current).forEach(([id, layer]) => {
-      layer.setOpacity(id === activeLayer ? opacity : 0)
+      layer.setOpacity(id === key ? opacity : 0)
     })
-  }, [activeLayer, opacity, clipGeo])
+  }, [activeLayer, period, opacity, clipGeo])
 
   function zoomIn()  { mapRef.current?.zoomIn() }
   function zoomOut() { mapRef.current?.zoomOut() }
