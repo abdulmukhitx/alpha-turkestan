@@ -74,7 +74,7 @@ DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
 MOSAICS_DIR  = Path(r"D:\data\mosaics")
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
-LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v2.pkl"))
+LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v3.pkl"))
 WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worldcover_turkestan.tif"))
 
 # ── Period registry ──────────────────────────────────────────────
@@ -83,17 +83,20 @@ WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worl
 # two mosaics are NOT stored the same way:
 #   "dn"          — raw uint16 digital numbers, nodata=0, reflectance = DN/10000
 #   "reflectance" — physical float32 reflectance already in 0..1, nodata=-9999
-# 2023_summer intentionally still points at the original uint16 file, not the
-# newer float32 v2 conversion (s2_mosaic_cog_v2.tif) — that file finished
-# converting today with no QA validation yet, whereas this file is the proven
-# production mosaic. 2023_summer's real rebuild (from CDSE) is planned for
-# tomorrow; don't touch these paths until that lands.
+# 2023_summer now points at the CDSE-rebuilt mosaic (2023_summer_cdse/
+# s2_mosaic_cog.tif, float32 reflectance, QA-passed) instead of the original
+# Planetary Computer uint16 file — both periods are now sourced from CDSE
+# with identical processing, so cross-period comparison is no longer
+# masked by provider-specific preprocessing differences (see
+# D:\data\mosaics\2023_summer_cdse\metadata.json for full QA record). The
+# old PC-based files (2023_summer/s2_mosaic_cog.tif, s2_mosaic_cog_v2.tif)
+# are left on disk untouched as an archival reference, just no longer read.
 PERIODS = {
     "2023_summer": {
         "label": "Лето 2023",
         "date_range": "01.06.2023 – 31.08.2023",
-        "cog_path": MOSAICS_DIR / "2023_summer" / "s2_mosaic_cog.tif",
-        "storage": "dn",
+        "cog_path": MOSAICS_DIR / "2023_summer_cdse" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
     },
     "2025_summer": {
         "label": "Лето 2025",
@@ -102,7 +105,7 @@ PERIODS = {
         "storage": "reflectance",
     },
 }
-DEFAULT_PERIOD = "2023_summer"
+DEFAULT_PERIOD = "2025_summer"
 _REFLECTANCE_NODATA = -9999
 
 # Kept for the /health and /metadata endpoints, which stay tied to the

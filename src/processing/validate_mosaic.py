@@ -253,7 +253,7 @@ def _random_points_in_boundary(boundary_union, n: int, seed: int = 42) -> list[t
     return pts
 
 
-def check_5_ml_distribution(cog_path: Path, boundary_union, sample_n: int = 3000) -> dict:
+def check_5_ml_distribution(cog_path: Path, boundary_union, ref_period: str = REFERENCE_PERIOD, sample_n: int = 3000) -> dict:
     print("\n" + "=" * 70)
     print("  ПРОВЕРКА 5/5 — распределение классов ML (v1, как в /api/zone_stats) vs 2023_summer")
     print("=" * 70)
@@ -327,11 +327,11 @@ def check_5_ml_distribution(cog_path: Path, boundary_union, sample_n: int = 3000
             return {c: round(counts.get(c, 0) / total * 100, 2) for c in classes}, total
 
     dist_2025, n_2025 = sample_distribution(cog_path)
-    ref_path = MOSAICS_DIR / REFERENCE_PERIOD / "s2_mosaic_cog.tif"
+    ref_path = MOSAICS_DIR / ref_period / "s2_mosaic_cog.tif"
     dist_2023, n_2023 = sample_distribution(ref_path) if ref_path.exists() else ({}, 0)
-    print(f"  Валидных точек: 2025={n_2025}/{len(points)}, 2023={n_2023}/{len(points)}")
+    print(f"  Валидных точек: текущий={n_2025}/{len(points)}, референс({ref_period})={n_2023}/{len(points)}")
 
-    print(f"  {'Класс':<22} {'2025 %':>8} {'2023 %':>8} {'Δ':>8}")
+    print(f"  {'Класс':<22} {'текущий %':>10} {ref_period + ' %':>18} {'Δ':>8}")
     big_shifts = []
     for c in classes:
         v25 = dist_2025.get(c, 0.0)
@@ -353,6 +353,8 @@ def check_5_ml_distribution(cog_path: Path, boundary_union, sample_n: int = 3000
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--period", required=True)
+    parser.add_argument("--ref-period", default=REFERENCE_PERIOD,
+                         help="период для сравнения ML-распределения (по умолчанию 2023_summer)")
     args = parser.parse_args()
 
     period_dir = MOSAICS_DIR / args.period
@@ -375,7 +377,7 @@ def main():
     r2 = check_2_points(cog_path, boundary_union)
     r3 = check_3_gdalinfo_stats(cog_path, boundary_union)
     r4 = check_4_preview(cog_path, period_dir / "preview.png")
-    r5 = check_5_ml_distribution(cog_path, boundary_union)
+    r5 = check_5_ml_distribution(cog_path, boundary_union, ref_period=args.ref_period)
 
     all_passed = r1["passed"] and r2["passed"] and r3["passed"] and r5.get("passed", True)
 

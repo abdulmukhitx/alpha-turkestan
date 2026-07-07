@@ -24,7 +24,7 @@ export default function App() {
   const [health, setHealth] = useState(null)
   const [meta, setMeta] = useState(null)
   const [periods, setPeriods] = useState([])
-  const [period, setPeriod] = useState('2023_summer')
+  const [period, setPeriod] = useState('2025_summer')
   const [activeLayer, setActiveLayer] = useState('ndvi')
   const [opacity, setOpacity] = useState(0.85)
   const [hoverPos, setHoverPos] = useState(null)
