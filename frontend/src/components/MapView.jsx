@@ -2,7 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet-boundary-canvas'   // attaches L.TileLayer.boundaryCanvas
-import { tileUrl } from '../api'
+import { tileUrl, changeTileUrl } from '../api'
+
+// Change detection always compares these two periods — not the period switcher's
+// single "viewed" period, so it's fixed rather than plumbed through as a prop.
+const CHANGE_PERIOD_BEFORE = '2023_summer'
+const CHANGE_PERIOD_AFTER  = '2025_summer'
 
 const BASEMAPS = {
   satellite: {
@@ -29,6 +34,7 @@ export default function MapView({
   activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
+  changeIndex,
 }) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
@@ -405,8 +411,30 @@ export default function MapView({
   // rectangular AOI never spills past the region (basemap stays visible underneath)
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !activeLayer) return
+    if (!map) return
     if (clipGeo === undefined) return   // wait until boundary load resolves
+
+    // Change-detection mode is mutually exclusive with the normal index layers —
+    // its tile source replaces whatever activeLayer would otherwise show.
+    if (changeIndex) {
+      const key = `change:${changeIndex}`
+      if (!overlaysRef.current[key]) {
+        const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
+        const url = changeTileUrl(changeIndex, CHANGE_PERIOD_BEFORE, CHANGE_PERIOD_AFTER)
+        const layer = (clipGeo && L.TileLayer.boundaryCanvas)
+          ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
+          : L.tileLayer(url, common)
+        layer.addTo(map)
+        overlaysRef.current[key] = layer
+        boundaryRef.current?.bringToFront?.()
+      }
+      Object.entries(overlaysRef.current).forEach(([id, layer]) => {
+        layer.setOpacity(id === key ? opacity : 0)
+      })
+      return
+    }
+
+    if (!activeLayer) return
 
     // "satellite" is a virtual layer — no index tiles, just the basemap/boundary/labels underneath
     if (activeLayer === 'satellite') {
@@ -430,7 +458,7 @@ export default function MapView({
     Object.entries(overlaysRef.current).forEach(([id, layer]) => {
       layer.setOpacity(id === key ? opacity : 0)
     })
-  }, [activeLayer, period, opacity, clipGeo])
+  }, [activeLayer, period, opacity, clipGeo, changeIndex])
 
   function zoomIn()  { mapRef.current?.zoomIn() }
   function zoomOut() { mapRef.current?.zoomOut() }

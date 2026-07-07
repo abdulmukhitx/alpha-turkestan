@@ -3,10 +3,15 @@ import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
-import { fetchHealth, fetchMetadata, fetchPeriods, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect } from './api'
+import { fetchHealth, fetchMetadata, fetchPeriods, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect, fetchChangeStats } from './api'
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
+
+// Change detection always compares these two fixed periods (see MapView's
+// matching constants) — not the period switcher's single "viewed" period.
+const CHANGE_PERIOD_BEFORE = '2023_summer'
+const CHANGE_PERIOD_AFTER  = '2025_summer'
 
 const BOOT_STEPS = [
   [80,  'Подключение к серверу...'],
@@ -53,9 +58,20 @@ export default function App() {
   const [lineFinishSignal, setLineFinishSignal] = useState(0)
   const [lineDrawPointCount, setLineDrawPointCount] = useState(0)
 
+  // Change detection mode — mutually exclusive with the normal index layers.
+  // Reuses the same polygon-draw plumbing as the regular zone tool (drawMode,
+  // clearSignal, finishSignal, drawPointCount below); drawIntent decides which
+  // endpoint a just-finished polygon feeds.
+  const [changeIndex, setChangeIndex] = useState(null)
+  const [changeStats, setChangeStats] = useState(null)
+  const [changeLoading, setChangeLoading] = useState(false)
+  const [changeError, setChangeError] = useState(null)
+  const [drawIntent, setDrawIntent] = useState('zone')
+
   const requestIdRef = useRef(0)
   const zoneReqIdRef = useRef(0)
   const transectReqIdRef = useRef(0)
+  const changeReqIdRef = useRef(0)
 
   useEffect(() => {
     const total = BOOT_STEPS[BOOT_STEPS.length - 1][0]
@@ -127,18 +143,60 @@ export default function App() {
   function handlePolygonDrawn(geometry) {
     setDrawMode(false)
     setZonePolygon(geometry)
-    runZoneStats(geometry)
+    if (drawIntent === 'change') runChangeStats(geometry)
+    else runZoneStats(geometry)
   }
 
   function handleClearZone() {
     zoneReqIdRef.current += 1   // invalidate any in-flight request
+    changeReqIdRef.current += 1
     setZonePolygon(null)
     setZoneStats(null)
     setZoneError(null)
     setZoneLoading(false)
+    setChangeStats(null)
+    setChangeError(null)
+    setChangeLoading(false)
     setDrawMode(false)
     setDrawPointCount(0)
     setClearSignal((n) => n + 1)
+  }
+
+  function toggleZoneDraw() {
+    setDrawMode((d) => {
+      if (!d) setDrawIntent('zone')
+      return !d
+    })
+  }
+
+  function toggleChangeDraw() {
+    setDrawMode((d) => {
+      if (!d) setDrawIntent('change')
+      return !d
+    })
+  }
+
+  function handleLayerSelect(id) {
+    setActiveLayer(id)
+    setChangeIndex(null)   // normal index layers and change detection are mutually exclusive
+  }
+
+  async function runChangeStats(geometry) {
+    setChangeStats(null)
+    setChangeError(null)
+    setChangeLoading(true)
+
+    const reqId = ++changeReqIdRef.current
+    try {
+      const stats = await fetchChangeStats(geometry, CHANGE_PERIOD_BEFORE, CHANGE_PERIOD_AFTER)
+      if (changeReqIdRef.current !== reqId) return
+      setChangeStats(stats)
+    } catch (e) {
+      if (changeReqIdRef.current !== reqId) return
+      setChangeError(e.message || 'Не удалось получить статистику изменений')
+    } finally {
+      if (changeReqIdRef.current === reqId) setChangeLoading(false)
+    }
   }
 
   async function runTransect(geometry, layer) {
@@ -225,11 +283,11 @@ export default function App() {
         <LayerPanel
           layers={layers}
           activeLayer={activeLayer}
-          onSelect={setActiveLayer}
+          onSelect={handleLayerSelect}
           opacity={opacity}
           onOpacityChange={setOpacity}
           drawMode={drawMode}
-          onToggleDraw={() => setDrawMode((d) => !d)}
+          onToggleDraw={toggleZoneDraw}
           onClearZone={handleClearZone}
           onFinishDraw={() => setFinishSignal((n) => n + 1)}
           hasZone={!!zonePolygon}
@@ -240,6 +298,9 @@ export default function App() {
           onFinishLineDraw={() => setLineFinishSignal((n) => n + 1)}
           hasLine={!!transectLine}
           lineDrawPointCount={lineDrawPointCount}
+          changeIndex={changeIndex}
+          onChangeIndexSelect={setChangeIndex}
+          onToggleChangeDraw={toggleChangeDraw}
         />
 
         <MapView
@@ -262,6 +323,7 @@ export default function App() {
           lineClearSignal={lineClearSignal}
           lineFinishSignal={lineFinishSignal}
           onLineDrawPointsChange={setLineDrawPointCount}
+          changeIndex={changeIndex}
         />
 
         <AnalysisPanel
@@ -278,6 +340,10 @@ export default function App() {
           transectData={transectData}
           transectLoading={transectLoading}
           transectError={transectError}
+          changeIndex={changeIndex}
+          changeStats={changeStats}
+          changeLoading={changeLoading}
+          changeError={changeError}
         />
       </main>
     </div>

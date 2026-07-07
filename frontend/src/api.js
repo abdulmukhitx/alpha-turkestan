@@ -63,6 +63,23 @@ export async function fetchTransect(geometry, layer, period) {
   return r.json()
 }
 
+/** Leaflet-compatible XYZ tile URL template for a change-detection layer. */
+export const changeTileUrl = (index, periodBefore, periodAfter) =>
+  `/tiles/change/${index}/{z}/{x}/{y}.png?period_before=${periodBefore}&period_after=${periodAfter}`
+
+export async function fetchChangeStats(geometry, periodBefore, periodAfter) {
+  const r = await fetch('/api/change_stats', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ geometry, period_before: periodBefore, period_after: periodAfter }),
+  })
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Change stats failed: ${r.status}`)
+  }
+  return r.json()
+}
+
 export async function fetchZoneReport({ geometry, zoneStats, activeLayer, mapImageBase64 }) {
   const r = await fetch('/api/zone_report', {
     method:  'POST',

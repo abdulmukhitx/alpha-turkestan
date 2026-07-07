@@ -424,3 +424,52 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .panel::-webkit-scrollbar { width: 4px; }
 .panel::-webkit-scrollbar-track { background: transparent; }
 .panel::-webkit-scrollbar-thumb { background: var(--border-soft); border-radius: 2px; }
+
+/* ── CHANGE DETECTION — dropdown + legend (left panel) ───────────── */
+.change-select {
+  width: 100%; padding: 9px 12px;
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text);
+  font-size: 12px; font-family: var(--font-body); font-weight: 500;
+  cursor: pointer; outline: none; appearance: none;
+}
+.change-select:hover { border-color: var(--border2); }
+.change-select:focus { border-color: var(--signal); }
+
+.change-legend { margin-top: 10px; }
+.change-legend-bar {
+  height: 10px; border-radius: 5px; border: 1px solid var(--border);
+  background: linear-gradient(to right, #67001f, #d6604d, #ffffff, #66bd63, #006837);
+}
+.change-legend-labels {
+  display: flex; justify-content: space-between;
+  font-family: var(--font-mono); font-size: 9px; color: var(--text3); margin-top: 4px;
+}
+
+/* ── CHANGE DETECTION — results panel (right panel) ──────────────── */
+.change-stats { margin-top: 14px; }
+
+.change-index-list { display: flex; flex-direction: column; gap: 10px; }
+.change-index-row { display: flex; flex-direction: column; gap: 3px; }
+.change-index-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.change-index-delta { font-family: var(--font-mono); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.change-index-sub { font-family: var(--font-mono); font-size: 9.5px; color: var(--text3); }
+
+.change-block-subtitle { font-size: 10px; color: var(--text2); margin: 10px 0 6px; }
+
+.change-top-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.change-top-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text2); }
+.change-top-icon { font-size: 11px; white-space: nowrap; }
+.change-top-name { flex: 1; }
+.change-top-area { font-family: var(--font-mono); color: var(--text); }
+
+.change-disclaimer {
+  font-size: 10px; color: var(--warn); line-height: 1.5;
+  background: rgba(217,119,6,0.12); border: 1px solid rgba(217,119,6,0.35);
+  border-radius: var(--radius); padding: 6px 8px; margin: 2px 0 8px;
+}
+
+.change-lulc-bars { display: flex; flex-direction: column; gap: 6px; }
+.change-lulc-bar-row { display: flex; align-items: center; gap: 8px; }
+.change-lulc-bar-label { font-family: var(--font-mono); font-size: 9px; color: var(--text3); width: 32px; }
+.change-lulc-bar-row .zone-lulc-bar { flex: 1; margin-bottom: 0; }

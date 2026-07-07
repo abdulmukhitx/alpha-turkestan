@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import ZoneStatsPanel from './ZoneStatsPanel.jsx'
 import TransectChart from './TransectChart.jsx'
+import ChangeStatsPanel from './ChangeStatsPanel.jsx'
 
 function Typewriter({ text }) {
   const [shown, setShown] = useState('')
@@ -76,6 +77,7 @@ export default function AnalysisPanel({
   point, pixel, aiText, loading, error,
   zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer,
   transectData, transectLoading, transectError,
+  changeIndex, changeStats, changeLoading, changeError,
 }) {
   if (!point) {
     return (
@@ -92,11 +94,17 @@ export default function AnalysisPanel({
           </svg>
           <p className="click-text">Кликните на любую точку карты, чтобы получить AI-анализ этого места</p>
         </div>
-        <ZoneStatsPanel
-          stats={zoneStats} loading={zoneLoading} error={zoneError}
-          geometry={zoneGeometry} activeLayer={activeLayer}
-        />
-        <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+        {changeIndex ? (
+          <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
+        ) : (
+          <>
+            <ZoneStatsPanel
+              stats={zoneStats} loading={zoneLoading} error={zoneError}
+              geometry={zoneGeometry} activeLayer={activeLayer}
+            />
+            <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+          </>
+        )}
       </aside>
     )
   }
@@ -165,11 +173,17 @@ export default function AnalysisPanel({
         </div>
       </div>
 
-      <ZoneStatsPanel
-        stats={zoneStats} loading={zoneLoading} error={zoneError}
-        geometry={zoneGeometry} activeLayer={activeLayer}
-      />
-      <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+      {changeIndex ? (
+        <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
+      ) : (
+        <>
+          <ZoneStatsPanel
+            stats={zoneStats} loading={zoneLoading} error={zoneError}
+            geometry={zoneGeometry} activeLayer={activeLayer}
+          />
+          <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+        </>
+      )}
     </aside>
   )
 }

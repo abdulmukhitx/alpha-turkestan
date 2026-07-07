@@ -9,8 +9,11 @@ Endpoints:
   GET  /health                          service check
   GET  /api/periods                     list of available periods for the UI selector
   GET  /tiles/{layer}/{z}/{x}/{y}.png?period=   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
+  GET  /tiles/change/{index}/{z}/{x}/{y}.png?period_before=&period_after=  change-detection XYZ tiles
   GET  /api/pixel?lat=&lon=&period=     per-pixel spectral values + indices
   POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
+  POST /api/change_stats                change-detection zonal stats (index deltas + ML transition matrix)
+  GET  /api/change_overview             precomputed change-detection stats for the whole oblast boundary
   POST /api/transect                    index profile (line profile) along a drawn line
   POST /api/zone_report                 structured Groq report for a drawn zone (PDF built on frontend)
   POST /api/analyze                     AI interpretation (Groq / DeepSeek / local fallback)
@@ -21,7 +24,7 @@ Run:
   uvicorn backend.main:app --reload --port 8000
 """
 
-import io, os, traceback
+import asyncio, io, json, os, threading, traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from fastapi import FastAPI, Query, Response, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -46,7 +50,7 @@ except ImportError as e:
 
 try:
     import rasterio
-    from rasterio.windows import from_bounds as window_from_bounds
+    from rasterio.windows import from_bounds as window_from_bounds, Window
     from rasterio.features import geometry_mask
     from pyproj import Transformer
     RASTERIO_OK = True
@@ -63,6 +67,7 @@ except ImportError:
 try:
     import pickle
     import sklearn  # noqa: F401  needed so pickle.load can resolve the saved estimator
+    from scipy.ndimage import uniform_filter
     SKLEARN_OK = True
 except ImportError:
     SKLEARN_OK = False
@@ -283,7 +288,18 @@ LAYERS = {
     "ndmi": {"label": "NDMI — влажность почвы","range": (-0.20, 0.16), "cmap": "rdbu"},
     "bsi":  {"label": "BSI — голая почва",     "range": (0.12,  0.29), "cmap": "oranges"},
     "savi": {"label": "SAVI — покрытие раст.", "range": (-0.10, 0.35), "cmap": "rdylgn"},
-    "nbr":  {"label": "NBR — деградация",      "range": (-0.35, 0.15), "cmap": "rdylgn"},
+    "nbr":  {"label": "NBR — деградация",      "range": (-0.22, 0.29), "cmap": "rdylgn"},
+}
+
+# Change-detection sign convention: for every index except BSI, a physical
+# increase already reads as "improvement" (more vegetation/moisture/water).
+# BSI is the one index where an increase (more bare soil) is degradation, so
+# it's flipped here — this keeps "positive signed delta = green = улучшение"
+# consistent for every index, both in the /tiles/change colormap and in
+# /api/change_stats's "direction" field.
+DIRECTION_SIGN = {
+    "ndvi": 1, "ndre": 1, "ndwi": 1, "ndmi": 1, "savi": 1, "nbr": 1,
+    "bsi": -1,
 }
 
 CMAP_CSS = {
@@ -308,6 +324,10 @@ _RAW_CMAPS = {
                (153,(146,197,222)),(204,(33,102,172)),(255,(5,48,97))],
     "oranges":[(0,(255,245,235)),(51,(253,208,162)),(102,(253,141,60)),
                (153,(217,71,1)),(204,(166,54,3)),(255,(127,39,4))],
+    # Diverging red→white→green for change-detection deltas (0 = no change,
+    # rescaled to sit exactly at index 128 by the caller).
+    "red_white_green": [(0,(103,0,31)),(64,(214,96,77)),(128,(255,255,255)),
+                         (192,(102,189,99)),(255,(0,104,55))],
 }
 
 def _make_lut(name: str) -> "np.ndarray":
@@ -522,6 +542,54 @@ async def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_P
         content = render_index(index, mask, cfg["cmap"], vmin, vmax)
     except Exception as e:
         print(f"render error {layer}/{z}/{x}/{y}: {e}")
+        return Response(content=blank_tile(), media_type="image/png")
+
+    return Response(content=content, media_type="image/png",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                              "Pragma": "no-cache"})
+
+
+@app.get("/tiles/change/{index}/{z}/{x}/{y}.png")
+async def change_tile(
+    index: str, z: int, x: int, y: int,
+    period_before: str = Query("2023_summer"),
+    period_after:  str = Query("2025_summer"),
+):
+    """Change-detection tile: delta = index(period_after) - index(period_before),
+    signed so positive always renders green (улучшение) via DIRECTION_SIGN.
+    Rescale is adaptive per-tile (98th percentile of |delta|), so contrast
+    stays readable at every zoom level rather than washing out on tiles with
+    small changes or clipping on tiles with a few extreme ones."""
+    if not TILER_OK or index not in LAYERS:
+        return Response(content=blank_tile(), media_type="image/png")
+
+    before_cfg = resolve_period(period_before)
+    after_cfg  = resolve_period(period_after)
+
+    (data_before, mask_before), (data_after, mask_after) = await asyncio.gather(
+        run_in_threadpool(mosaic_tile, x, y, z, before_cfg),
+        run_in_threadpool(mosaic_tile, x, y, z, after_cfg),
+    )
+
+    if data_before is None or data_after is None:
+        return Response(content=blank_tile(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=60"})
+
+    valid = (mask_before > 0) & (mask_after > 0)
+    if not valid.any():
+        return Response(content=blank_tile(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=60"})
+
+    try:
+        idx_before = compute_index(data_before, index, before_cfg)
+        idx_after  = compute_index(data_after, index, after_cfg)
+        delta = (idx_after - idx_before) * DIRECTION_SIGN.get(index, 1)
+
+        max_abs = max(float(np.percentile(np.abs(delta[valid]), 98)), 1e-6)
+        mask_u8 = valid.astype(np.uint8) * 255
+        content = render_index(delta, mask_u8, "red_white_green", -max_abs, max_abs)
+    except Exception as e:
+        print(f"change render error {index}/{z}/{x}/{y}: {e}")
         return Response(content=blank_tile(), media_type="image/png")
 
     return Response(content=content, media_type="image/png",
@@ -1156,6 +1224,575 @@ async def zone_report(req: ZoneReportReq):
                 print(f"Zone report AI error: {e}")
 
     return {"groq_analysis": _local_zone_report(req.zone_stats)}
+
+
+# ════════════════════════════════════════════════════════════════
+#   CHANGE DETECTION — shared helpers (used by /api/change_stats and
+#   the /api/change_overview background precompute)
+# ════════════════════════════════════════════════════════════════
+
+_CHANGE_INDEX_KEYS = ["ndvi", "ndwi", "ndre", "ndmi", "bsi", "savi", "nbr"]
+_DIRECTION_EPS = 0.005  # noise floor (index units) below which mean delta reads as "стабильно"
+
+
+def _all_indices_from_refl(refl: "np.ndarray") -> dict:
+    """refl: (7, h, w) physical reflectance -> dict of the 7 index arrays,
+    same formulas as compute_index(), vectorized over the whole array at once."""
+    b02, b03, b04, b05, b08, b8a, b11 = refl
+    eps = 1e-10
+    return {
+        "ndvi": (b08 - b04) / (b08 + b04 + eps),
+        "ndwi": (b03 - b08) / (b03 + b08 + eps),
+        "ndre": (b08 - b05) / (b08 + b05 + eps),
+        "ndmi": (b8a - b11) / (b8a + b11 + eps),
+        "bsi":  ((b11 + b04) - (b08 + b02)) / ((b11 + b04) + (b08 + b02) + eps),
+        "savi": (b08 - b04) / (b08 + b04 + 0.5 + eps) * 1.5,
+        "nbr":  (b08 - b11) / (b08 + b11 + eps),
+    }
+
+
+def _finalize_direction(index: str, mean_before: float, mean_after: float,
+                        mean_delta: float, std_delta: float, significant_pct: float) -> dict:
+    signed = mean_delta * DIRECTION_SIGN.get(index, 1)
+    if abs(signed) < _DIRECTION_EPS:
+        direction = "стабильно"
+    elif signed > 0:
+        direction = "улучшение"
+    else:
+        direction = "деградация"
+    return {
+        "mean_before":      round(mean_before, 4),
+        "mean_after":       round(mean_after, 4),
+        "delta":            round(mean_delta, 4),
+        "std_delta":        round(std_delta, 4),
+        "significant_pct":  round(significant_pct, 2),
+        "direction":        direction,
+    }
+
+
+def _change_index_stats_from_arrays(index: str, before_vals: "np.ndarray", after_vals: "np.ndarray") -> dict:
+    """Single-pass version (Task 2) — the whole zone's values already fit in memory."""
+    delta = after_vals - before_vals
+    mean_before = float(np.mean(before_vals))
+    mean_after  = float(np.mean(after_vals))
+    mean_delta  = float(np.mean(delta))
+    std_delta   = float(np.std(delta))
+    significant_pct = float(np.mean(np.abs(delta) > 1.5 * std_delta) * 100) if std_delta > 0 else 0.0
+    return _finalize_direction(index, mean_before, mean_after, mean_delta, std_delta, significant_pct)
+
+
+def _normalize_geometry_polygons(geometry: dict) -> list:
+    """Polygon -> [rings]; MultiPolygon -> [rings_of_poly1, rings_of_poly2, ...].
+    MultiPolygon support exists for the official oblast boundary (Task 3's
+    /api/change_overview); hand-drawn zones from the frontend are always a
+    plain Polygon, handled as the trivial single-polygon case."""
+    gtype = (geometry or {}).get("type")
+    if gtype == "Polygon":
+        return [geometry["coordinates"]]
+    if gtype == "MultiPolygon":
+        return geometry["coordinates"]
+    raise HTTPException(status_code=400, detail="Ожидается GeoJSON Polygon или MultiPolygon")
+
+
+def _project_polygons(polygons: list, transformer: "Transformer") -> list:
+    return [[[transformer.transform(lon, lat) for lon, lat in ring] for ring in poly] for poly in polygons]
+
+
+def _polygons_bounds(polygons_proj: list) -> tuple:
+    xs = [pt[0] for poly in polygons_proj for ring in poly for pt in ring]
+    ys = [pt[1] for poly in polygons_proj for ring in poly for pt in ring]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _polygons_geometry_mask(polygons_proj: list, out_shape: tuple, win_transform) -> "np.ndarray":
+    geoms = [{"type": "Polygon", "coordinates": [[list(pt) for pt in ring] for ring in poly]} for poly in polygons_proj]
+    return geometry_mask(geoms, out_shape=out_shape, transform=win_transform, invert=True)
+
+
+def _read_padded_window(ds, window: "Window", cfg: dict) -> "np.ndarray":
+    """Read `window` padded by 1px on every side via a boundless read, filled
+    with the period's own nodata value wherever the padding falls outside the
+    raster's true extent. This gives the 3x3 texture-std computation real
+    neighbour pixels at a polygon/block edge instead of a fabricated zero —
+    it only degrades to "fewer valid neighbours" (same as classify_ml_v2's
+    per-point window) at the raster's actual boundary."""
+    fill = _REFLECTANCE_NODATA if cfg["storage"] == "reflectance" else 0
+    padded = Window(window.col_off - 1, window.row_off - 1, window.width + 2, window.height + 2)
+    return ds.read(window=padded, boundless=True, fill_value=fill).astype(np.float32)
+
+
+def _windowed_std_valid(band: "np.ndarray", valid: "np.ndarray", size: int = 3) -> "np.ndarray":
+    """Per-pixel std over a size x size neighbourhood, counting only valid
+    pixels — nodata and out-of-array positions are excluded from the
+    mean/variance rather than treated as real zero-valued data. This
+    reproduces extract_samples_v3.py / classify_ml_v2's per-point texture
+    window (edge-clipped, nodata-excluded std) as a vectorized boxcar
+    instead of a Python loop per point: uniform_filter's mode='constant'
+    zero-padding is applied to the *masked* values and to the validity mask,
+    not the raw band — so it only ever contributes 0 to both the sum and the
+    neighbour count, which is mathematically the same as excluding that
+    neighbour entirely.
+    """
+    band = band.astype(np.float64)
+    masked = np.where(valid, band, 0.0)
+    valid_f = valid.astype(np.float64)
+    n = size * size
+    s   = uniform_filter(masked,      size=size, mode="constant", cval=0.0) * n
+    s2  = uniform_filter(masked ** 2, size=size, mode="constant", cval=0.0) * n
+    cnt = np.round(uniform_filter(valid_f, size=size, mode="constant", cval=0.0) * n)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = s / cnt
+        var  = s2 / cnt - mean ** 2
+    std = np.sqrt(np.clip(var, 0, None))
+    std[cnt < 3] = 0.0
+    return std.astype(np.float32)
+
+
+def _v3_texture_stds(dn_padded: "np.ndarray", valid_padded: "np.ndarray") -> list:
+    """dn_padded: (7, h+2, w+2) DN-equivalent bands; valid_padded: (h+2, w+2)
+    bool. Returns 7 std maps cropped back to (h, w), band order B02..B11."""
+    return [_windowed_std_valid(dn_padded[i], valid_padded)[1:-1, 1:-1] for i in range(7)]
+
+
+def _build_v3_features(idx_map: dict, refl: "np.ndarray", stds: list) -> "np.ndarray":
+    """Stacks the 13 features in exactly lulc_classifier_v3.pkl's feature_names
+    order: ndvi, ndre, ndwi, ndmi, bsi, b08, std_b02..std_b11 (verified against
+    the pickle directly, not just the training script's comment)."""
+    b08 = refl[4]
+    return np.stack([idx_map["ndvi"], idx_map["ndre"], idx_map["ndwi"], idx_map["ndmi"],
+                      idx_map["bsi"], b08, *stds], axis=0)
+
+
+def _predict_v3_encoded(idx_map: dict, refl: "np.ndarray", stds: list, valid_mask: "np.ndarray"):
+    """Returns int64 label-encoder-space predictions for valid_mask pixels
+    (flattened in np.nonzero(valid_mask) order), or None if v3 isn't loaded.
+    model.predict() already returns label_encoder-space ints directly
+    (verified empirically) — CLASS_NAMES_V2 is that same encoder's classes_,
+    so no inverse_transform round-trip is needed for the transition matrix."""
+    if CLASSIFIER_V2 is None or LABEL_ENCODER_V2 is None:
+        return None
+    feats = _build_v3_features(idx_map, refl, stds)
+    X = feats[:, valid_mask].T.astype(np.float32)
+    if X.shape[0] == 0:
+        return np.array([], dtype=np.int64)
+    return CLASSIFIER_V2.predict(X).astype(np.int64)
+
+
+def _transitions_from_counts(counts: "np.ndarray", pixel_count: int, px_area_ha: float = 0.01) -> dict:
+    """counts: (n,n) int matrix, counts[i,j] = pixels classified class `i` in
+    the before period and class `j` in the after period, CLASS_NAMES_V2 order
+    on both axes. Shared response shape for /api/change_stats and
+    /api/change_overview."""
+    n = counts.shape[0]
+    names = CLASS_NAMES_V2
+    matrix = {names[i]: {names[j]: int(counts[i, j]) for j in range(n)} for i in range(n)}
+
+    off_diag = [(i, j, int(counts[i, j])) for i in range(n) for j in range(n) if i != j and counts[i, j] > 0]
+    off_diag.sort(key=lambda t: t[2], reverse=True)
+    top_changes = [
+        {
+            "from": names[i], "to": names[j],
+            "pixels": px, "area_ha": round(px * px_area_ha, 2),
+            "pct_of_zone": round(px / pixel_count * 100, 2) if pixel_count else 0.0,
+        }
+        for i, j, px in off_diag[:5]
+    ]
+
+    area_before = counts.sum(axis=1) * px_area_ha
+    area_after  = counts.sum(axis=0) * px_area_ha
+    net_change_ha = {names[i]: round(float(area_after[i] - area_before[i]), 2) for i in range(n)}
+
+    return {"matrix": matrix, "top_changes": top_changes, "net_change_ha": net_change_ha}
+
+
+def build_change_stats_prompt(stats: dict) -> str:
+    idx = stats.get("indices") or {}
+    ml  = stats.get("ml_transitions") or {}
+    top = ml.get("top_changes") or []
+
+    def fmt(key, field):
+        v = (idx.get(key) or {}).get(field)
+        return f"{v:.3f}" if isinstance(v, (int, float)) else "н/д"
+
+    idx_lines = "\n".join(
+        f"- {key.upper()}: было {fmt(key,'mean_before')}, стало {fmt(key,'mean_after')}, "
+        f"Δ={fmt(key,'delta')} ({(idx.get(key) or {}).get('direction','н/д')}, "
+        f"значимо на {(idx.get(key) or {}).get('significant_pct', 0):.1f}% площади)"
+        for key in _CHANGE_INDEX_KEYS
+    )
+
+    top_lines = "\n".join(
+        f"- {t['from']} → {t['to']}: {t['area_ha']:.2f} га ({t['pct_of_zone']:.1f}% зоны)"
+        for t in top
+    ) or "- значимых переходов классов не обнаружено"
+
+    return f"""Ты — эксперт по дистанционному зондированию и землепользованию Туркестанской области Казахстана.
+
+Сравниваются два периода спутниковых снимков Sentinel-2: {stats.get('period_before')} и {stats.get('period_after')}.
+Площадь зоны: {stats.get('area_ha', 0):.2f} га.
+
+ИЗМЕНЕНИЯ ИНДЕКСОВ:
+{idx_lines}
+
+ТОП ПЕРЕХОДОВ ЗЕМЕЛЬНОГО ПОКРОВА (ML-классификация):
+{top_lines}
+
+Напиши 3-4 предложения на русском языке с агрономической/экологической интерпретацией
+произошедших изменений: что реально случилось на территории, какие риски это несёт,
+и какие меры стоит принять. Будь конкретным, не пересказывай цифры — объясняй их смысл."""
+
+
+# ════════════════════════════════════════════════════════════════
+#   CHANGE STATS — zonal change detection for a drawn polygon
+# ════════════════════════════════════════════════════════════════
+
+_CHANGE_STATS_MAX_PIXELS = 20_000_000  # ~2000 ha guard against an unreasonably huge drawn polygon
+
+
+class ChangeStatsReq(BaseModel):
+    geometry:      dict
+    period_before: str = "2023_summer"
+    period_after:  str = "2025_summer"
+
+
+def _compute_change_stats(geometry: dict, period_before: str, period_after: str) -> dict:
+    before_cfg = resolve_period(period_before)
+    after_cfg  = resolve_period(period_after)
+    if not (RASTERIO_OK and cog_available(before_cfg) and cog_available(after_cfg)):
+        raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
+
+    polygons = _normalize_geometry_polygons(geometry)
+
+    try:
+        with rasterio.open(before_cfg["cog_path"]) as ds_before, rasterio.open(after_cfg["cog_path"]) as ds_after:
+            if ds_before.crs != ds_after.crs:
+                raise HTTPException(status_code=500, detail="Периоды используют разные системы координат")
+
+            transformer = Transformer.from_crs("EPSG:4326", ds_before.crs, always_xy=True)
+            polygons_proj = _project_polygons(polygons, transformer)
+            minx, miny, maxx, maxy = _polygons_bounds(polygons_proj)
+
+            ds_l, ds_b, ds_r, ds_t = ds_before.bounds
+            if maxx < ds_l or minx > ds_r or maxy < ds_b or miny > ds_t:
+                raise HTTPException(status_code=400, detail="Полигон находится за пределами области покрытия")
+            minx, maxx = max(minx, ds_l), min(maxx, ds_r)
+            miny, maxy = max(miny, ds_b), min(maxy, ds_t)
+
+            window = window_from_bounds(minx, miny, maxx, maxy, transform=ds_before.transform)
+            window = window.round_offsets().round_lengths()
+            if window.width <= 0 or window.height <= 0:
+                raise HTTPException(status_code=400, detail="Полигон слишком мал или вне покрытия")
+            if window.width * window.height > _CHANGE_STATS_MAX_PIXELS:
+                raise HTTPException(status_code=400,
+                                    detail="Полигон слишком большой для этого анализа — нарисуйте зону меньшего размера")
+
+            window_after = window_from_bounds(minx, miny, maxx, maxy, transform=ds_after.transform)
+            window_after = window_after.round_offsets().round_lengths()
+            if (window.width, window.height) != (window_after.width, window_after.height):
+                raise HTTPException(status_code=500, detail="Мозаики периодов не выровнены по сетке пикселей")
+
+            win_transform = ds_before.window_transform(window)
+            h, w = int(window.height), int(window.width)
+            poly_mask = _polygons_geometry_mask(polygons_proj, (h, w), win_transform)
+
+            data_before_p = _read_padded_window(ds_before, window, before_cfg)
+            data_after_p  = _read_padded_window(ds_after,  window, after_cfg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+
+    nodata_before_p = period_nodata_mask(data_before_p, before_cfg)
+    nodata_after_p  = period_nodata_mask(data_after_p,  after_cfg)
+    valid_mask = poly_mask & ~nodata_before_p[1:-1, 1:-1] & ~nodata_after_p[1:-1, 1:-1]
+    pixel_count = int(np.count_nonzero(valid_mask))
+    if pixel_count == 0:
+        raise HTTPException(status_code=400, detail="Нет валидных пикселей внутри полигона")
+
+    refl_before = period_to_reflectance(data_before_p, before_cfg)[:, 1:-1, 1:-1]
+    refl_after  = period_to_reflectance(data_after_p,  after_cfg)[:, 1:-1, 1:-1]
+    idx_before  = _all_indices_from_refl(refl_before)
+    idx_after   = _all_indices_from_refl(refl_after)
+
+    indices_out = {
+        key: _change_index_stats_from_arrays(key, idx_before[key][valid_mask], idx_after[key][valid_mask])
+        for key in _CHANGE_INDEX_KEYS
+    }
+
+    px_area_ha = 0.01
+    ml_transitions = None
+    if CLASSIFIER_V2 is not None and LABEL_ENCODER_V2 is not None:
+        dn_before_p = period_to_dn_equivalent(data_before_p, before_cfg)
+        dn_after_p  = period_to_dn_equivalent(data_after_p,  after_cfg)
+        stds_before = _v3_texture_stds(dn_before_p, ~nodata_before_p)
+        stds_after  = _v3_texture_stds(dn_after_p,  ~nodata_after_p)
+
+        pred_before = _predict_v3_encoded(idx_before, refl_before, stds_before, valid_mask)
+        pred_after  = _predict_v3_encoded(idx_after,  refl_after,  stds_after,  valid_mask)
+
+        n_classes = len(CLASS_NAMES_V2)
+        pair_idx = pred_before * n_classes + pred_after
+        counts = np.bincount(pair_idx, minlength=n_classes * n_classes).reshape(n_classes, n_classes)
+        ml_transitions = _transitions_from_counts(counts, pixel_count, px_area_ha)
+
+    return {
+        "area_ha":       round(pixel_count * px_area_ha, 2),
+        "pixel_count":   pixel_count,
+        "period_before": period_before,
+        "period_after":  period_after,
+        "indices":       indices_out,
+        "ml_transitions": ml_transitions,
+    }
+
+
+@app.post("/api/change_stats")
+async def change_stats(req: ChangeStatsReq):
+    stats = _compute_change_stats(req.geometry, req.period_before, req.period_after)
+
+    groq_analysis = None
+    if AI_OK:
+        key = os.getenv("GROQ_API_KEY")
+        if key:
+            try:
+                prompt = build_change_stats_prompt(stats)
+                system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
+                          "Анализируешь изменения между двумя периодами Sentinel-2. Отвечай кратко и конкретно на русском.")
+                r = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                    model="llama-3.1-8b-instant", max_tokens=500, temperature=0.4,
+                    messages=[{"role": "system", "content": system},
+                              {"role": "user", "content": prompt}])
+                groq_analysis = r.choices[0].message.content
+            except Exception as e:
+                print(f"Change stats AI error: {e}")
+
+    stats["groq_analysis"] = groq_analysis
+    return stats
+
+
+# ════════════════════════════════════════════════════════════════
+#   CHANGE OVERVIEW — whole-oblast precompute, background thread
+#
+#   The boundary bbox is ~40,700 x 60,200 px at 10m — reading both periods'
+#   7 bands at once there would need ~137GB RAM. So this walks the bbox in
+#   2048x2048 blocks and accumulates running sums/counts/transition tallies
+#   instead of holding the whole area in memory. Two passes over the blocks:
+#   pass 1 gets sum/sum-of-squares per index (-> global mean & std_delta) and
+#   the ML transition matrix; pass 2 (needs the now-known global std_delta)
+#   counts how many pixels clear the 1.5*std_delta significance bar. This
+#   doubles the COG I/O for this one-time startup job, traded deliberately
+#   for a single region-wide significance threshold instead of a per-block
+#   one (a per-block threshold would make "significant_pct" mean a different
+#   thing in a flat block vs. a noisy one).
+# ════════════════════════════════════════════════════════════════
+
+_OVERVIEW_BLOCK_SIZE = 2048
+_OVERVIEW_LOCK = threading.Lock()
+_OVERVIEW_CACHE: dict = {"status": "computing", "progress": 0}
+BOUNDARY_PATH = BASE_DIR / "frontend" / "public" / "turkestan_boundary.geojson"
+
+
+def _load_boundary_geometry() -> dict:
+    with open(BOUNDARY_PATH, encoding="utf-8") as f:
+        gj = json.load(f)
+    return gj["features"][0]["geometry"]
+
+
+def _finalize_index_stats_streaming(index: str, agg: dict) -> dict:
+    count = agg["count"]
+    mean_before = agg["sum_before"] / count
+    mean_after  = agg["sum_after"]  / count
+    mean_delta  = agg["sum_delta"]  / count
+    var_delta   = agg["sum_delta_sq"] / count - mean_delta ** 2
+    std_delta   = float(np.sqrt(max(var_delta, 0)))
+    significant_pct = (agg["sig_count"] / count * 100) if count else 0.0
+    return _finalize_direction(index, mean_before, mean_after, mean_delta, std_delta, significant_pct)
+
+
+def _set_overview_progress(pct: float):
+    with _OVERVIEW_LOCK:
+        _OVERVIEW_CACHE["progress"] = round(pct)
+
+
+def _compute_change_overview(period_before: str = "2023_summer", period_after: str = "2025_summer") -> dict:
+    before_cfg = resolve_period(period_before)
+    after_cfg  = resolve_period(period_after)
+    polygons = _normalize_geometry_polygons(_load_boundary_geometry())
+
+    with rasterio.open(before_cfg["cog_path"]) as ds_before, rasterio.open(after_cfg["cog_path"]) as ds_after:
+        transformer = Transformer.from_crs("EPSG:4326", ds_before.crs, always_xy=True)
+        polygons_proj = _project_polygons(polygons, transformer)
+        minx, miny, maxx, maxy = _polygons_bounds(polygons_proj)
+
+        ds_l, ds_b, ds_r, ds_t = ds_before.bounds
+        minx, maxx = max(minx, ds_l), min(maxx, ds_r)
+        miny, maxy = max(miny, ds_b), min(maxy, ds_t)
+
+        full_window = window_from_bounds(minx, miny, maxx, maxy, transform=ds_before.transform)
+        full_window = full_window.round_offsets().round_lengths()
+        col0, row0 = int(full_window.col_off), int(full_window.row_off)
+        total_w, total_h = int(full_window.width), int(full_window.height)
+
+        bs = _OVERVIEW_BLOCK_SIZE
+        blocks = [
+            Window(col0 + bc, row0 + br, min(bs, total_w - bc), min(bs, total_h - br))
+            for br in range(0, total_h, bs)
+            for bc in range(0, total_w, bs)
+        ]
+        n_blocks = len(blocks)
+
+        n_classes = len(CLASS_NAMES_V2) if CLASS_NAMES_V2 else 0
+        transition_counts = np.zeros((n_classes, n_classes), dtype=np.int64) if n_classes else None
+        agg = {k: {"sum_before": 0.0, "sum_after": 0.0, "sum_delta": 0.0, "sum_delta_sq": 0.0,
+                   "count": 0, "sig_count": 0} for k in _CHANGE_INDEX_KEYS}
+
+        # ── Pass 1: sums/sumsq per index + ML transition matrix ──
+        for n, blk in enumerate(blocks):
+            win_transform = ds_before.window_transform(blk)
+            h, w = int(blk.height), int(blk.width)
+            poly_mask = _polygons_geometry_mask(polygons_proj, (h, w), win_transform)
+            if not poly_mask.any():
+                _set_overview_progress((n + 1) / n_blocks * 50)
+                continue
+
+            data_before_p = _read_padded_window(ds_before, blk, before_cfg)
+            data_after_p  = _read_padded_window(ds_after,  blk, after_cfg)
+            nodata_before_p = period_nodata_mask(data_before_p, before_cfg)
+            nodata_after_p  = period_nodata_mask(data_after_p,  after_cfg)
+            valid_mask = poly_mask & ~nodata_before_p[1:-1, 1:-1] & ~nodata_after_p[1:-1, 1:-1]
+            if not valid_mask.any():
+                _set_overview_progress((n + 1) / n_blocks * 50)
+                continue
+
+            refl_before = period_to_reflectance(data_before_p, before_cfg)[:, 1:-1, 1:-1]
+            refl_after  = period_to_reflectance(data_after_p,  after_cfg)[:, 1:-1, 1:-1]
+            idx_before  = _all_indices_from_refl(refl_before)
+            idx_after   = _all_indices_from_refl(refl_after)
+
+            n_valid = int(valid_mask.sum())
+            for key in _CHANGE_INDEX_KEYS:
+                bv = idx_before[key][valid_mask]
+                av = idx_after[key][valid_mask]
+                d = av - bv
+                a = agg[key]
+                a["sum_before"]   += float(bv.sum())
+                a["sum_after"]    += float(av.sum())
+                a["sum_delta"]    += float(d.sum())
+                a["sum_delta_sq"] += float(np.square(d).sum())
+                a["count"]        += n_valid
+
+            if transition_counts is not None:
+                dn_before_p = period_to_dn_equivalent(data_before_p, before_cfg)
+                dn_after_p  = period_to_dn_equivalent(data_after_p,  after_cfg)
+                stds_before = _v3_texture_stds(dn_before_p, ~nodata_before_p)
+                stds_after  = _v3_texture_stds(dn_after_p,  ~nodata_after_p)
+                pred_before = _predict_v3_encoded(idx_before, refl_before, stds_before, valid_mask)
+                pred_after  = _predict_v3_encoded(idx_after,  refl_after,  stds_after,  valid_mask)
+                pair_idx = pred_before * n_classes + pred_after
+                transition_counts += np.bincount(pair_idx, minlength=n_classes * n_classes).reshape(n_classes, n_classes)
+
+            _set_overview_progress((n + 1) / n_blocks * 50)
+
+        std_delta_global = {}
+        for key in _CHANGE_INDEX_KEYS:
+            a = agg[key]
+            if a["count"]:
+                mean_d = a["sum_delta"] / a["count"]
+                var_d  = a["sum_delta_sq"] / a["count"] - mean_d ** 2
+                std_delta_global[key] = float(np.sqrt(max(var_d, 0)))
+            else:
+                std_delta_global[key] = 0.0
+
+        # ── Pass 2: count pixels significant against the now-known global std_delta ──
+        for n, blk in enumerate(blocks):
+            win_transform = ds_before.window_transform(blk)
+            h, w = int(blk.height), int(blk.width)
+            poly_mask = _polygons_geometry_mask(polygons_proj, (h, w), win_transform)
+            if not poly_mask.any():
+                _set_overview_progress(50 + (n + 1) / n_blocks * 50)
+                continue
+
+            data_before_p = _read_padded_window(ds_before, blk, before_cfg)
+            data_after_p  = _read_padded_window(ds_after,  blk, after_cfg)
+            nodata_before_p = period_nodata_mask(data_before_p, before_cfg)
+            nodata_after_p  = period_nodata_mask(data_after_p,  after_cfg)
+            valid_mask = poly_mask & ~nodata_before_p[1:-1, 1:-1] & ~nodata_after_p[1:-1, 1:-1]
+            if not valid_mask.any():
+                _set_overview_progress(50 + (n + 1) / n_blocks * 50)
+                continue
+
+            refl_before = period_to_reflectance(data_before_p, before_cfg)[:, 1:-1, 1:-1]
+            refl_after  = period_to_reflectance(data_after_p,  after_cfg)[:, 1:-1, 1:-1]
+            idx_before  = _all_indices_from_refl(refl_before)
+            idx_after   = _all_indices_from_refl(refl_after)
+
+            for key in _CHANGE_INDEX_KEYS:
+                d = idx_after[key][valid_mask] - idx_before[key][valid_mask]
+                thresh = 1.5 * std_delta_global[key]
+                if thresh > 0:
+                    agg[key]["sig_count"] += int(np.count_nonzero(np.abs(d) > thresh))
+
+            _set_overview_progress(50 + (n + 1) / n_blocks * 50)
+
+    indices_out = {key: _finalize_index_stats_streaming(key, agg[key]) for key in _CHANGE_INDEX_KEYS}
+    pixel_count = agg[_CHANGE_INDEX_KEYS[0]]["count"]
+    px_area_ha = 0.01
+    ml_transitions = _transitions_from_counts(transition_counts, pixel_count, px_area_ha) if transition_counts is not None else None
+
+    result = {
+        "status":        "ready",
+        "progress":      100,
+        "area_ha":       round(pixel_count * px_area_ha, 2),
+        "pixel_count":   pixel_count,
+        "period_before": period_before,
+        "period_after":  period_after,
+        "indices":       indices_out,
+        "ml_transitions": ml_transitions,
+    }
+
+    groq_analysis = None
+    if AI_OK:
+        key_env = os.getenv("GROQ_API_KEY")
+        if key_env:
+            try:
+                prompt = build_change_stats_prompt(result)
+                system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
+                          "Анализируешь изменения по всей Туркестанской области между двумя периодами Sentinel-2.")
+                r = OpenAI(api_key=key_env, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                    model="llama-3.1-8b-instant", max_tokens=600, temperature=0.4,
+                    messages=[{"role": "system", "content": system},
+                              {"role": "user", "content": prompt}])
+                groq_analysis = r.choices[0].message.content
+            except Exception as e:
+                print(f"Change overview AI error: {e}")
+    result["groq_analysis"] = groq_analysis
+
+    return result
+
+
+def _run_overview_background():
+    try:
+        result = _compute_change_overview()
+        with _OVERVIEW_LOCK:
+            _OVERVIEW_CACHE.clear()
+            _OVERVIEW_CACHE.update(result)
+    except Exception as e:
+        traceback.print_exc()
+        with _OVERVIEW_LOCK:
+            _OVERVIEW_CACHE.clear()
+            _OVERVIEW_CACHE.update({"status": "error", "progress": 0, "detail": str(e)})
+
+
+if RASTERIO_OK and BOUNDARY_PATH.exists():
+    threading.Thread(target=_run_overview_background, daemon=True).start()
+else:
+    _OVERVIEW_CACHE = {"status": "error", "progress": 0, "detail": "COG/граница области недоступны на сервере"}
+
+
+@app.get("/api/change_overview")
+async def change_overview():
+    with _OVERVIEW_LOCK:
+        return dict(_OVERVIEW_CACHE)
 
 
 # ════════════════════════════════════════════════════════════════
