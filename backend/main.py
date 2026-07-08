@@ -24,7 +24,7 @@ Run:
   uvicorn backend.main:app --reload --port 8000
 """
 
-import asyncio, io, json, os, threading, traceback
+import asyncio, io, json, math, os, threading, traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -549,6 +549,68 @@ async def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_P
                               "Pragma": "no-cache"})
 
 
+_CHANGE_RESCALE_CACHE: dict = {}   # (period_before, period_after, index) -> max_abs (float)
+_CHANGE_RESCALE_Z = 6               # coarse overview zoom — whole AOI in a handful of tiles
+
+# The mosaics are built per-MGRS-tile (~110km granules), each composited from
+# whatever cloud-free date was available within the season — and that date
+# differs granule to granule (see D:\data\mosaics\*\compositing_stats.json).
+# So a real, non-negligible chunk of "change" between two seasonal mosaics is
+# just within-season phenology drift from comparing different acquisition
+# dates at each granule boundary, not real land-cover change. Rather than
+# smoothing that away, /tiles/change/ only renders pixels whose |signed
+# delta| clears a high per-index threshold — everything else is fully
+# transparent (alpha=0, not white) so the base map shows through instead of
+# a washed-out haze. /api/change_stats' numeric output is unaffected.
+CHANGE_THRESHOLDS = {
+    "ndvi": 0.12, "ndre": 0.12, "savi": 0.12, "nbr": 0.12,
+    "ndwi": 0.10, "ndmi": 0.10,
+    "bsi":  0.08,
+}
+
+
+def _lonlat_to_tile(lon: float, lat: float, z: int) -> tuple[int, int]:
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    lat_rad = math.radians(lat)
+    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
+
+
+def _compute_global_change_rescale(before_cfg: dict, after_cfg: dict, index: str) -> float:
+    """One global |delta| p98 for this (periods, index) triple, computed once
+    from a coarse z=6 overview of the whole AOI (a handful of tiles) instead
+    of per-tile — per-tile percentiles made neighbouring tiles pick different
+    color scales, producing visible square seams at tile boundaries."""
+    bounds = cog_bounds_wgs84()   # [S, W, N, E]
+    if bounds is None:
+        return 0.1
+    south, west, north, east = bounds
+    x0, y0 = _lonlat_to_tile(west, north, _CHANGE_RESCALE_Z)
+    x1, y1 = _lonlat_to_tile(east, south, _CHANGE_RESCALE_Z)
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+
+    abs_deltas = []
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            data_before, mask_before = mosaic_tile(tx, ty, _CHANGE_RESCALE_Z, before_cfg)
+            data_after,  mask_after  = mosaic_tile(tx, ty, _CHANGE_RESCALE_Z, after_cfg)
+            if data_before is None or data_after is None:
+                continue
+            valid = (mask_before > 0) & (mask_after > 0)
+            if not valid.any():
+                continue
+            idx_before = compute_index(data_before, index, before_cfg)
+            idx_after  = compute_index(data_after, index, after_cfg)
+            delta = (idx_after - idx_before) * DIRECTION_SIGN.get(index, 1)
+            abs_deltas.append(np.abs(delta[valid]))
+
+    if not abs_deltas:
+        return 0.1
+    return max(float(np.percentile(np.concatenate(abs_deltas), 98)), 1e-6)
+
+
 @app.get("/tiles/change/{index}/{z}/{x}/{y}.png")
 async def change_tile(
     index: str, z: int, x: int, y: int,
@@ -557,9 +619,9 @@ async def change_tile(
 ):
     """Change-detection tile: delta = index(period_after) - index(period_before),
     signed so positive always renders green (улучшение) via DIRECTION_SIGN.
-    Rescale is adaptive per-tile (98th percentile of |delta|), so contrast
-    stays readable at every zoom level rather than washing out on tiles with
-    small changes or clipping on tiles with a few extreme ones."""
+    Rescale is one global value per (periods, index) triple — computed once
+    from a coarse overview and cached — so every tile shares the same color
+    scale and tile-boundary seams don't appear."""
     if not TILER_OK or index not in LAYERS:
         return Response(content=blank_tile(), media_type="image/png")
 
@@ -583,11 +645,22 @@ async def change_tile(
     try:
         idx_before = compute_index(data_before, index, before_cfg)
         idx_after  = compute_index(data_after, index, after_cfg)
-        delta = (idx_after - idx_before) * DIRECTION_SIGN.get(index, 1)
+        signed_delta = (idx_after - idx_before) * DIRECTION_SIGN.get(index, 1)
 
-        max_abs = max(float(np.percentile(np.abs(delta[valid]), 98)), 1e-6)
-        mask_u8 = valid.astype(np.uint8) * 255
-        content = render_index(delta, mask_u8, "red_white_green", -max_abs, max_abs)
+        # Only render pixels with a clearly significant change — sub-threshold
+        # pixels go fully transparent (alpha=0) rather than white, so the base
+        # map shows through instead of a washed-out white haze.
+        thresh = CHANGE_THRESHOLDS.get(index, 0.05)
+        valid_change_mask = np.abs(signed_delta) >= thresh
+
+        cache_key = (period_before, period_after, index)
+        if cache_key not in _CHANGE_RESCALE_CACHE:
+            _CHANGE_RESCALE_CACHE[cache_key] = await run_in_threadpool(
+                _compute_global_change_rescale, before_cfg, after_cfg, index)
+        max_abs = _CHANGE_RESCALE_CACHE[cache_key]
+
+        mask_u8 = (valid & valid_change_mask).astype(np.uint8) * 255
+        content = render_index(signed_delta, mask_u8, "red_white_green", -max_abs, max_abs)
     except Exception as e:
         print(f"change render error {index}/{z}/{x}/{y}: {e}")
         return Response(content=blank_tile(), media_type="image/png")

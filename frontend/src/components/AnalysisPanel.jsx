@@ -77,7 +77,7 @@ export default function AnalysisPanel({
   point, pixel, aiText, loading, error,
   zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer,
   transectData, transectLoading, transectError,
-  changeIndex, changeStats, changeLoading, changeError,
+  changeStats, changeLoading, changeError,
 }) {
   if (!point) {
     return (
@@ -94,17 +94,12 @@ export default function AnalysisPanel({
           </svg>
           <p className="click-text">Кликните на любую точку карты, чтобы получить AI-анализ этого места</p>
         </div>
-        {changeIndex ? (
-          <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
-        ) : (
-          <>
-            <ZoneStatsPanel
-              stats={zoneStats} loading={zoneLoading} error={zoneError}
-              geometry={zoneGeometry} activeLayer={activeLayer}
-            />
-            <TransectChart data={transectData} loading={transectLoading} error={transectError} />
-          </>
-        )}
+        <ZoneStatsPanel
+          stats={zoneStats} loading={zoneLoading} error={zoneError}
+          geometry={zoneGeometry} activeLayer={activeLayer}
+        />
+        <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+        <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
       </aside>
     )
   }
@@ -173,17 +168,12 @@ export default function AnalysisPanel({
         </div>
       </div>
 
-      {changeIndex ? (
-        <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
-      ) : (
-        <>
-          <ZoneStatsPanel
-            stats={zoneStats} loading={zoneLoading} error={zoneError}
-            geometry={zoneGeometry} activeLayer={activeLayer}
-          />
-          <TransectChart data={transectData} loading={transectLoading} error={transectError} />
-        </>
-      )}
+      <ZoneStatsPanel
+        stats={zoneStats} loading={zoneLoading} error={zoneError}
+        geometry={zoneGeometry} activeLayer={activeLayer}
+      />
+      <TransectChart data={transectData} loading={transectLoading} error={transectError} />
+      <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
     </aside>
   )
 }

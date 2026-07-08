@@ -4,10 +4,9 @@ import 'leaflet/dist/leaflet.css'
 import 'leaflet-boundary-canvas'   // attaches L.TileLayer.boundaryCanvas
 import { tileUrl, changeTileUrl } from '../api'
 
-// Change detection always compares these two periods — not the period switcher's
-// single "viewed" period, so it's fixed rather than plumbed through as a prop.
-const CHANGE_PERIOD_BEFORE = '2023_summer'
-const CHANGE_PERIOD_AFTER  = '2025_summer'
+// Change-detection overlay sits on top of the normal index layer (not instead
+// of it) at this fixed opacity — see ChangeDetectionBar for period/index pick.
+const CHANGE_OVERLAY_OPACITY = 0.75
 
 const BASEMAPS = {
   satellite: {
@@ -34,7 +33,8 @@ export default function MapView({
   activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
-  changeIndex,
+  changeMode, onToggleChangeMode, changeIndex, changePeriodBefore, changePeriodAfter,
+  splitMode, onToggleSplitMode,
 }) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
@@ -42,6 +42,8 @@ export default function MapView({
   const basemapKind = useRef('satellite')
   const labelsRef   = useRef(null)
   const overlaysRef = useRef({})
+  const changeOverlayRef    = useRef(null)
+  const changeOverlayKeyRef = useRef(null)
   const markerRef   = useRef(null)
   const boundaryRef = useRef(null)
   const ringsRef    = useRef(null)   // oblast rings [[lng,lat],...] for point-in-polygon
@@ -411,30 +413,8 @@ export default function MapView({
   // rectangular AOI never spills past the region (basemap stays visible underneath)
   useEffect(() => {
     const map = mapRef.current
-    if (!map) return
+    if (!map || !activeLayer) return
     if (clipGeo === undefined) return   // wait until boundary load resolves
-
-    // Change-detection mode is mutually exclusive with the normal index layers —
-    // its tile source replaces whatever activeLayer would otherwise show.
-    if (changeIndex) {
-      const key = `change:${changeIndex}`
-      if (!overlaysRef.current[key]) {
-        const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
-        const url = changeTileUrl(changeIndex, CHANGE_PERIOD_BEFORE, CHANGE_PERIOD_AFTER)
-        const layer = (clipGeo && L.TileLayer.boundaryCanvas)
-          ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
-          : L.tileLayer(url, common)
-        layer.addTo(map)
-        overlaysRef.current[key] = layer
-        boundaryRef.current?.bringToFront?.()
-      }
-      Object.entries(overlaysRef.current).forEach(([id, layer]) => {
-        layer.setOpacity(id === key ? opacity : 0)
-      })
-      return
-    }
-
-    if (!activeLayer) return
 
     // "satellite" is a virtual layer — no index tiles, just the basemap/boundary/labels underneath
     if (activeLayer === 'satellite') {
@@ -458,7 +438,39 @@ export default function MapView({
     Object.entries(overlaysRef.current).forEach(([id, layer]) => {
       layer.setOpacity(id === key ? opacity : 0)
     })
-  }, [activeLayer, period, opacity, clipGeo, changeIndex])
+  }, [activeLayer, period, opacity, clipGeo])
+
+  // change-detection overlay — independent of the normal index layer above,
+  // stacked on top of it at a fixed opacity rather than replacing it
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    if (clipGeo === undefined) return
+
+    const periodsValid = changePeriodBefore && changePeriodAfter && changePeriodBefore !== changePeriodAfter
+    if (!changeMode || !changeIndex || !periodsValid) {
+      if (changeOverlayRef.current) {
+        map.removeLayer(changeOverlayRef.current)
+        changeOverlayRef.current = null
+        changeOverlayKeyRef.current = null
+      }
+      return
+    }
+
+    const key = `change:${changeIndex}:${changePeriodBefore}:${changePeriodAfter}`
+    if (changeOverlayKeyRef.current !== key) {
+      if (changeOverlayRef.current) map.removeLayer(changeOverlayRef.current)
+      const common = { opacity: CHANGE_OVERLAY_OPACITY, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
+      const url = changeTileUrl(changeIndex, changePeriodBefore, changePeriodAfter)
+      const layer = (clipGeo && L.TileLayer.boundaryCanvas)
+        ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
+        : L.tileLayer(url, common)
+      layer.addTo(map)
+      boundaryRef.current?.bringToFront?.()
+      changeOverlayRef.current = layer
+      changeOverlayKeyRef.current = key
+    }
+  }, [changeMode, changeIndex, changePeriodBefore, changePeriodAfter, clipGeo])
 
   function zoomIn()  { mapRef.current?.zoomIn() }
   function zoomOut() { mapRef.current?.zoomOut() }
@@ -502,6 +514,29 @@ export default function MapView({
           onClick={toggleLabels}
         >
           {labelsOn ? 'Abc' : 'abc'}
+        </button>
+        <div className="map-tool-sep" />
+        <button
+          className={`map-tool-btn ${changeMode ? 'active' : ''}`}
+          title="Анализ изменений"
+          aria-pressed={changeMode}
+          onClick={onToggleChangeMode}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M2 5h9M11 5 8.5 2.5M11 5 8.5 7.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            <path d="M14 11H5M5 11l2.5 2.5M5 11l2.5-2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <button
+          className={`map-tool-btn ${splitMode ? 'active' : ''}`}
+          title="Сравнить периоды"
+          aria-pressed={splitMode}
+          onClick={onToggleSplitMode}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <rect x="1.5" y="2.5" width="5.5" height="11" rx="1" stroke="currentColor" strokeWidth="1.3" />
+            <rect x="9" y="2.5" width="5.5" height="11" rx="1" stroke="currentColor" strokeWidth="1.3" />
+          </svg>
         </button>
       </div>
 

@@ -31,22 +31,10 @@ const LABELS = {
   nbr:  ['Деградация', '', 'Здоровая'],
 }
 
-// 7 change-detection indices offered in the "Изменения 2023 → 2025" dropdown
-const CHANGE_INDEX_OPTIONS = [
-  { key: 'ndvi', code: 'NDVI', label: 'Растительность' },
-  { key: 'ndwi', code: 'NDWI', label: 'Водные ресурсы' },
-  { key: 'ndre', code: 'NDRE', label: 'Стресс растений' },
-  { key: 'ndmi', code: 'NDMI', label: 'Влажность почвы' },
-  { key: 'bsi',  code: 'BSI',  label: 'Голая почва' },
-  { key: 'savi', code: 'SAVI', label: 'Покрытие раст.' },
-  { key: 'nbr',  code: 'NBR',  label: 'Деградация' },
-]
-
 export default function LayerPanel({
   layers, activeLayer, onSelect, opacity, onOpacityChange,
   drawMode, onToggleDraw, onClearZone, onFinishDraw, hasZone, drawPointCount = 0,
   lineDrawMode, onToggleLineDraw, onClearLine, onFinishLineDraw, hasLine, lineDrawPointCount = 0,
-  changeIndex, onChangeIndexSelect, onToggleChangeDraw,
 }) {
   const indexIds = Object.keys(layers).length ? Object.keys(layers) : Object.keys(NAMES).filter((id) => id !== 'satellite')
   const ids = ['satellite', ...indexIds.filter((id) => id !== 'satellite')]
@@ -80,109 +68,56 @@ export default function LayerPanel({
         })}
       </div>
 
-      {!changeIndex && (
-        <>
-          <div className="section-label" style={{ marginTop: 20 }}>Зональная статистика</div>
-          <div className="zone-tools">
-            <button
-              className={`zone-tool-btn ${drawMode ? 'active' : ''}`}
-              onClick={onToggleDraw}
-            >
-              {drawMode ? 'Отменить рисование' : '✏ Нарисовать зону'}
-            </button>
-            {drawMode && (
-              <>
-                <div className="zone-hint">
-                  Точки: {drawPointCount}. Кликните по первой точке или нажмите «Завершить», либо дважды кликните по карте.
-                </div>
-                <button
-                  className="zone-tool-btn zone-tool-finish"
-                  onClick={onFinishDraw}
-                  disabled={drawPointCount < 3}
-                >
-                  ✓ Завершить ({drawPointCount})
-                </button>
-              </>
-            )}
-            {hasZone && (
-              <button className="zone-tool-btn zone-tool-clear" onClick={onClearZone}>Очистить</button>
-            )}
-
-            <button
-              className={`zone-tool-btn ${lineDrawMode ? 'active' : ''}`}
-              onClick={onToggleLineDraw}
-            >
-              {lineDrawMode ? 'Отменить рисование' : '📈 Профиль по линии'}
-            </button>
-            {lineDrawMode && (
-              <>
-                <div className="zone-hint">
-                  Точки: {lineDrawPointCount}. Дважды кликните по карте, либо нажмите «Завершить» (мин. 2 точки).
-                </div>
-                <button
-                  className="zone-tool-btn zone-tool-finish"
-                  onClick={onFinishLineDraw}
-                  disabled={lineDrawPointCount < 2}
-                >
-                  ✓ Завершить ({lineDrawPointCount})
-                </button>
-              </>
-            )}
-            {hasLine && (
-              <button className="zone-tool-btn zone-tool-clear" onClick={onClearLine}>Очистить</button>
-            )}
-          </div>
-        </>
-      )}
-
-      <div className="section-label" style={{ marginTop: 20 }}>Изменения 2023 → 2025</div>
-      <select
-        className="change-select"
-        value={changeIndex || ''}
-        onChange={(e) => onChangeIndexSelect(e.target.value || null)}
-      >
-        <option value="">Выключено</option>
-        {CHANGE_INDEX_OPTIONS.map((opt) => (
-          <option key={opt.key} value={opt.key}>{opt.code} — {opt.label}</option>
-        ))}
-      </select>
-
-      {changeIndex && (
-        <>
-          <div className="change-legend">
-            <div className="change-legend-bar" />
-            <div className="change-legend-labels">
-              <span>Деградация</span><span>Без изменений</span><span>Улучшение</span>
+      <div className="section-label" style={{ marginTop: 20 }}>Зональная статистика</div>
+      <div className="zone-tools">
+        <button
+          className={`zone-tool-btn ${drawMode ? 'active' : ''}`}
+          onClick={onToggleDraw}
+        >
+          {drawMode ? 'Отменить рисование' : '✏ Нарисовать зону'}
+        </button>
+        {drawMode && (
+          <>
+            <div className="zone-hint">
+              Точки: {drawPointCount}. Кликните по первой точке или нажмите «Завершить», либо дважды кликните по карте.
             </div>
-          </div>
-
-          <div className="zone-tools" style={{ marginTop: 10 }}>
             <button
-              className={`zone-tool-btn ${drawMode ? 'active' : ''}`}
-              onClick={onToggleChangeDraw}
+              className="zone-tool-btn zone-tool-finish"
+              onClick={onFinishDraw}
+              disabled={drawPointCount < 3}
             >
-              {drawMode ? 'Отменить рисование' : '📊 Анализ изменений'}
+              ✓ Завершить ({drawPointCount})
             </button>
-            {drawMode && (
-              <>
-                <div className="zone-hint">
-                  Точки: {drawPointCount}. Кликните по первой точке или нажмите «Завершить», либо дважды кликните по карте.
-                </div>
-                <button
-                  className="zone-tool-btn zone-tool-finish"
-                  onClick={onFinishDraw}
-                  disabled={drawPointCount < 3}
-                >
-                  ✓ Завершить ({drawPointCount})
-                </button>
-              </>
-            )}
-            {hasZone && (
-              <button className="zone-tool-btn zone-tool-clear" onClick={onClearZone}>Очистить</button>
-            )}
-          </div>
-        </>
-      )}
+          </>
+        )}
+        {hasZone && (
+          <button className="zone-tool-btn zone-tool-clear" onClick={onClearZone}>Очистить</button>
+        )}
+
+        <button
+          className={`zone-tool-btn ${lineDrawMode ? 'active' : ''}`}
+          onClick={onToggleLineDraw}
+        >
+          {lineDrawMode ? 'Отменить рисование' : '📈 Профиль по линии'}
+        </button>
+        {lineDrawMode && (
+          <>
+            <div className="zone-hint">
+              Точки: {lineDrawPointCount}. Дважды кликните по карте, либо нажмите «Завершить» (мин. 2 точки).
+            </div>
+            <button
+              className="zone-tool-btn zone-tool-finish"
+              onClick={onFinishLineDraw}
+              disabled={lineDrawPointCount < 2}
+            >
+              ✓ Завершить ({lineDrawPointCount})
+            </button>
+          </>
+        )}
+        {hasLine && (
+          <button className="zone-tool-btn zone-tool-clear" onClick={onClearLine}>Очистить</button>
+        )}
+      </div>
 
       <div className="section-label" style={{ marginTop: 20 }}>Прозрачность</div>
       <div className="opacity-row">

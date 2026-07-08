@@ -3,15 +3,12 @@ import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
+import ChangeDetectionBar from './components/ChangeDetectionBar.jsx'
+import SplitMapView from './components/SplitMapView.jsx'
 import { fetchHealth, fetchMetadata, fetchPeriods, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect, fetchChangeStats } from './api'
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
-
-// Change detection always compares these two fixed periods (see MapView's
-// matching constants) — not the period switcher's single "viewed" period.
-const CHANGE_PERIOD_BEFORE = '2023_summer'
-const CHANGE_PERIOD_AFTER  = '2025_summer'
 
 const BOOT_STEPS = [
   [80,  'Подключение к серверу...'],
@@ -58,15 +55,27 @@ export default function App() {
   const [lineFinishSignal, setLineFinishSignal] = useState(0)
   const [lineDrawPointCount, setLineDrawPointCount] = useState(0)
 
-  // Change detection mode — mutually exclusive with the normal index layers.
-  // Reuses the same polygon-draw plumbing as the regular zone tool (drawMode,
-  // clearSignal, finishSignal, drawPointCount below); drawIntent decides which
-  // endpoint a just-finished polygon feeds.
-  const [changeIndex, setChangeIndex] = useState(null)
+  // Change detection — overlaid on top of the normal index layer (not instead
+  // of it), toggled from a map-toolbar button. Reuses the same polygon-draw
+  // plumbing as the regular zone tool (drawMode, clearSignal, finishSignal,
+  // drawPointCount below); drawIntent decides which endpoint a just-finished
+  // polygon feeds.
+  const [changeMode, setChangeMode] = useState(false)
+  const [changeIndex, setChangeIndex] = useState('ndvi')
+  const [changePeriodBefore, setChangePeriodBefore] = useState(null)
+  const [changePeriodAfter, setChangePeriodAfter] = useState(null)
   const [changeStats, setChangeStats] = useState(null)
   const [changeLoading, setChangeLoading] = useState(false)
   const [changeError, setChangeError] = useState(null)
   const [drawIntent, setDrawIntent] = useState('zone')
+
+  // Split-screen comparison — mutually exclusive with change detection.
+  // Left/right period+index default once periods load: earliest->NDVI, latest->NDVI.
+  const [splitMode, setSplitMode] = useState(false)
+  const [splitLeftPeriod, setSplitLeftPeriod] = useState(null)
+  const [splitRightPeriod, setSplitRightPeriod] = useState(null)
+  const [splitLeftIndex, setSplitLeftIndex] = useState('ndvi')
+  const [splitRightIndex, setSplitRightIndex] = useState('ndvi')
 
   const requestIdRef = useRef(0)
   const zoneReqIdRef = useRef(0)
@@ -89,6 +98,36 @@ export default function App() {
     fetchMetadata().then(setMeta).catch(() => setMeta(null))
     fetchPeriods().then(setPeriods).catch(() => setPeriods([]))
   }, [])
+
+  // default change-detection period pick: earliest -> latest, once periods load
+  useEffect(() => {
+    if (!periods.length || changePeriodBefore || changePeriodAfter) return
+    setChangePeriodBefore(periods[0].period_id)
+    setChangePeriodAfter(periods[periods.length - 1].period_id)
+  }, [periods, changePeriodBefore, changePeriodAfter])
+
+  // default split-screen period pick: earliest -> latest, once periods load
+  useEffect(() => {
+    if (!periods.length || splitLeftPeriod || splitRightPeriod) return
+    setSplitLeftPeriod(periods[0].period_id)
+    setSplitRightPeriod(periods[periods.length - 1].period_id)
+  }, [periods, splitLeftPeriod, splitRightPeriod])
+
+  function toggleSplitMode() {
+    setSplitMode((s) => {
+      const next = !s
+      if (next) setChangeMode(false)
+      return next
+    })
+  }
+
+  function toggleChangeMode() {
+    setChangeMode((m) => {
+      const next = !m
+      if (next) setSplitMode(false)
+      return next
+    })
+  }
 
   function refreshHealth() {
     fetchHealth().then(setHealth).catch(() => setHealth({ status: 'offline' }))
@@ -176,11 +215,6 @@ export default function App() {
     })
   }
 
-  function handleLayerSelect(id) {
-    setActiveLayer(id)
-    setChangeIndex(null)   // normal index layers and change detection are mutually exclusive
-  }
-
   async function runChangeStats(geometry) {
     setChangeStats(null)
     setChangeError(null)
@@ -188,7 +222,7 @@ export default function App() {
 
     const reqId = ++changeReqIdRef.current
     try {
-      const stats = await fetchChangeStats(geometry, CHANGE_PERIOD_BEFORE, CHANGE_PERIOD_AFTER)
+      const stats = await fetchChangeStats(geometry, changePeriodBefore, changePeriodAfter)
       if (changeReqIdRef.current !== reqId) return
       setChangeStats(stats)
     } catch (e) {
@@ -279,52 +313,87 @@ export default function App() {
         onPeriodChange={setPeriod}
       />
 
-      <main className="workspace">
-        <LayerPanel
-          layers={layers}
-          activeLayer={activeLayer}
-          onSelect={handleLayerSelect}
-          opacity={opacity}
-          onOpacityChange={setOpacity}
-          drawMode={drawMode}
-          onToggleDraw={toggleZoneDraw}
-          onClearZone={handleClearZone}
-          onFinishDraw={() => setFinishSignal((n) => n + 1)}
-          hasZone={!!zonePolygon}
-          drawPointCount={drawPointCount}
-          lineDrawMode={lineDrawMode}
-          onToggleLineDraw={() => setLineDrawMode((d) => !d)}
-          onClearLine={handleClearLine}
-          onFinishLineDraw={() => setLineFinishSignal((n) => n + 1)}
-          hasLine={!!transectLine}
-          lineDrawPointCount={lineDrawPointCount}
-          changeIndex={changeIndex}
-          onChangeIndexSelect={setChangeIndex}
-          onToggleChangeDraw={toggleChangeDraw}
-        />
+      <main className={`workspace ${splitMode ? 'workspace-no-left' : ''}`}>
+        {!splitMode && (
+          <LayerPanel
+            layers={layers}
+            activeLayer={activeLayer}
+            onSelect={setActiveLayer}
+            opacity={opacity}
+            onOpacityChange={setOpacity}
+            drawMode={drawMode}
+            onToggleDraw={toggleZoneDraw}
+            onClearZone={handleClearZone}
+            onFinishDraw={() => setFinishSignal((n) => n + 1)}
+            hasZone={!!zonePolygon}
+            drawPointCount={drawPointCount}
+            lineDrawMode={lineDrawMode}
+            onToggleLineDraw={() => setLineDrawMode((d) => !d)}
+            onClearLine={handleClearLine}
+            onFinishLineDraw={() => setLineFinishSignal((n) => n + 1)}
+            hasLine={!!transectLine}
+            lineDrawPointCount={lineDrawPointCount}
+          />
+        )}
 
-        <MapView
-          activeLayer={activeLayer}
-          period={period}
-          opacity={opacity}
-          bounds={meta?.region?.bounds}
-          center={meta?.region?.center || FALLBACK_CENTER}
-          zoom={FALLBACK_ZOOM}
-          onPointClick={handlePointClick}
-          onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
-          onZoomChange={() => {}}
-          drawMode={drawMode}
-          onPolygonDrawn={handlePolygonDrawn}
-          clearSignal={clearSignal}
-          finishSignal={finishSignal}
-          onDrawPointsChange={setDrawPointCount}
-          lineDrawMode={lineDrawMode}
-          onLineDrawn={handleLineDrawn}
-          lineClearSignal={lineClearSignal}
-          lineFinishSignal={lineFinishSignal}
-          onLineDrawPointsChange={setLineDrawPointCount}
-          changeIndex={changeIndex}
-        />
+        {splitMode ? (
+          <SplitMapView
+            periods={periods}
+            bounds={meta?.region?.bounds}
+            center={meta?.region?.center || FALLBACK_CENTER}
+            zoom={FALLBACK_ZOOM}
+            leftPeriod={splitLeftPeriod}
+            leftIndex={splitLeftIndex}
+            onLeftPeriodChange={setSplitLeftPeriod}
+            onLeftIndexChange={setSplitLeftIndex}
+            rightPeriod={splitRightPeriod}
+            rightIndex={splitRightIndex}
+            onRightPeriodChange={setSplitRightPeriod}
+            onRightIndexChange={setSplitRightIndex}
+            drawMode={drawMode}
+            onPolygonDrawn={handlePolygonDrawn}
+            clearSignal={clearSignal}
+            finishSignal={finishSignal}
+            onDrawPointsChange={setDrawPointCount}
+            lineDrawMode={lineDrawMode}
+            onLineDrawn={handleLineDrawn}
+            lineClearSignal={lineClearSignal}
+            lineFinishSignal={lineFinishSignal}
+            onLineDrawPointsChange={setLineDrawPointCount}
+            onPointClick={handlePointClick}
+            onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
+            onExitSplitMode={toggleSplitMode}
+          />
+        ) : (
+          <MapView
+            activeLayer={activeLayer}
+            period={period}
+            opacity={opacity}
+            bounds={meta?.region?.bounds}
+            center={meta?.region?.center || FALLBACK_CENTER}
+            zoom={FALLBACK_ZOOM}
+            onPointClick={handlePointClick}
+            onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
+            onZoomChange={() => {}}
+            drawMode={drawMode}
+            onPolygonDrawn={handlePolygonDrawn}
+            clearSignal={clearSignal}
+            finishSignal={finishSignal}
+            onDrawPointsChange={setDrawPointCount}
+            lineDrawMode={lineDrawMode}
+            onLineDrawn={handleLineDrawn}
+            lineClearSignal={lineClearSignal}
+            lineFinishSignal={lineFinishSignal}
+            onLineDrawPointsChange={setLineDrawPointCount}
+            changeMode={changeMode}
+            onToggleChangeMode={toggleChangeMode}
+            changeIndex={changeIndex}
+            changePeriodBefore={changePeriodBefore}
+            changePeriodAfter={changePeriodAfter}
+            splitMode={splitMode}
+            onToggleSplitMode={toggleSplitMode}
+          />
+        )}
 
         <AnalysisPanel
           point={point}
@@ -340,12 +409,28 @@ export default function App() {
           transectData={transectData}
           transectLoading={transectLoading}
           transectError={transectError}
-          changeIndex={changeIndex}
           changeStats={changeStats}
           changeLoading={changeLoading}
           changeError={changeError}
         />
       </main>
+
+      <ChangeDetectionBar
+        open={changeMode && !splitMode}
+        periods={periods}
+        periodBefore={changePeriodBefore}
+        periodAfter={changePeriodAfter}
+        onPeriodBeforeChange={setChangePeriodBefore}
+        onPeriodAfterChange={setChangePeriodAfter}
+        index={changeIndex}
+        onIndexChange={setChangeIndex}
+        drawMode={drawMode}
+        onToggleDraw={toggleChangeDraw}
+        onFinishDraw={() => setFinishSignal((n) => n + 1)}
+        onClearZone={handleClearZone}
+        hasZone={!!zonePolygon}
+        drawPointCount={drawPointCount}
+      />
     </div>
   )
 }
