@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import L from 'leaflet'
-import 'leaflet-boundary-canvas'
+import maplibregl from 'maplibre-gl'
+import 'maplibre-gl/dist/maplibre-gl.css'
 import { tileUrl } from '../api'
 
 // Same 7 physical indices the single-map view offers — "satellite" isn't a
@@ -17,6 +17,115 @@ const INDEX_OPTIONS = [
 
 const BASEMAP_URL = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
 
+const DRAW_POINT_PAINT = {
+  'circle-radius': ['case', ['==', ['get', 'first'], 1], 6, 4],
+  'circle-color': ['case', ['==', ['get', 'first'], 1], '#FFFFFF', '#3B82F6'],
+  'circle-stroke-color': '#3B82F6',
+  'circle-stroke-width': 2,
+}
+
+function emptyFC() { return { type: 'FeatureCollection', features: [] } }
+
+function baseStyle() {
+  return {
+    version: 8,
+    sources: {
+      basemap: { type: 'raster', tiles: [BASEMAP_URL], tileSize: 256 },
+    },
+    layers: [{ id: 'basemap', type: 'raster', source: 'basemap' }],
+  }
+}
+
+function makeMap(container, center, zoom) {
+  return new maplibregl.Map({
+    container,
+    style: baseStyle(),
+    center,
+    zoom,
+    attributionControl: false,
+    dragRotate: false,
+    pitchWithRotate: false,
+  })
+}
+
+// Adds/refreshes the data (index/period) raster source+layer for one map.
+function setDataLayer(map, index, period) {
+  if (!map.isStyleLoaded()) return
+  const url = tileUrl(index, period)
+  const sourceId = 'data'
+  if (map.getSource(sourceId)) {
+    map.getSource(sourceId).setTiles([url])
+  } else {
+    map.addSource(sourceId, { type: 'raster', tiles: [url], tileSize: 256 })
+    map.addLayer({ id: 'data-layer', type: 'raster', source: sourceId, paint: { 'raster-opacity': 0.9 } })
+  }
+}
+
+// The data COG's own bbox is a rectangle larger than the oblast — same reason
+// MapView.jsx's Leaflet layer needs leaflet-boundary-canvas on top of the
+// per-pixel nodata mask. MapLibre's raster layers have no native "clip to
+// polygon" primitive, so the standard equivalent is an inverted mask: one
+// giant world-covering polygon with the oblast boundary punched out as a
+// hole, painted (nearly) opaque in the app's own background color, stacked
+// directly above the data layer. This hides data-layer *and* basemap outside
+// the boundary — MapLibre can't keep the raw basemap visible there without a
+// custom WebGL layer, so this "spotlight" look is the closest native match.
+const WORLD_RING = [[-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]]
+
+function extractExteriorRings(geo) {
+  const rings = []
+  function walk(obj) {
+    if (!obj) return
+    if (obj.type === 'FeatureCollection') obj.features.forEach(walk)
+    else if (obj.type === 'GeometryCollection') obj.geometries.forEach(walk)
+    else if (obj.type === 'Feature') walk(obj.geometry)
+    else if (obj.type === 'Polygon') rings.push(obj.coordinates[0])
+    else if (obj.type === 'MultiPolygon') obj.coordinates.forEach((poly) => rings.push(poly[0]))
+  }
+  walk(geo)
+  return rings
+}
+
+function invertedMaskGeoJSON(geo) {
+  return {
+    type: 'Feature', properties: {},
+    geometry: { type: 'Polygon', coordinates: [WORLD_RING, ...extractExteriorRings(geo)] },
+  }
+}
+
+function setMaskLayer(map, geo) {
+  if (!map.isStyleLoaded() || !geo) return
+  const data = invertedMaskGeoJSON(geo)
+  if (map.getSource('mask')) {
+    map.getSource('mask').setData(data)
+    return
+  }
+  map.addSource('mask', { type: 'geojson', data })
+  map.addLayer({ id: 'mask-layer', type: 'fill', source: 'mask', paint: { 'fill-color': '#0D1219', 'fill-opacity': 0.92 } })
+}
+
+function setBoundaryLayer(map, geo) {
+  if (!map.isStyleLoaded() || !geo) return
+  if (map.getSource('boundary')) {
+    map.getSource('boundary').setData(geo)
+    return
+  }
+  map.addSource('boundary', { type: 'geojson', data: geo })
+  map.addLayer({
+    id: 'boundary-line', type: 'line', source: 'boundary',
+    paint: { 'line-color': '#ffffff', 'line-width': 2, 'line-opacity': 0.9 },
+  })
+}
+
+function ensureDrawSources(map) {
+  if (map.getSource('draw-points')) return
+  map.addSource('draw-points', { type: 'geojson', data: emptyFC() })
+  map.addSource('draw-line', { type: 'geojson', data: emptyFC() })
+  map.addLayer({ id: 'draw-line-layer', type: 'line', source: 'draw-line',
+    paint: { 'line-color': '#3B82F6', 'line-width': 2 } })
+  map.addLayer({ id: 'draw-points-layer', type: 'circle', source: 'draw-points', paint: DRAW_POINT_PAINT })
+}
+
 export default function SplitMapView({
   periods, bounds, center, zoom,
   leftPeriod, leftIndex, onLeftPeriodChange, onLeftIndexChange,
@@ -30,8 +139,6 @@ export default function SplitMapView({
   const rightElRef = useRef(null)
   const leftMapRef  = useRef(null)
   const rightMapRef = useRef(null)
-  const leftDataRef  = useRef(null)
-  const rightDataRef = useRef(null)
   const syncingRef = useRef(false)
   const [clipGeo, setClipGeo] = useState(undefined)
 
@@ -41,66 +148,54 @@ export default function SplitMapView({
   const drawModeRef = useRef(drawMode); drawModeRef.current = drawMode
   const onPolygonDrawnRef = useRef(onPolygonDrawn); onPolygonDrawnRef.current = onPolygonDrawn
   const onDrawPointsChangeRef = useRef(onDrawPointsChange); onDrawPointsChangeRef.current = onDrawPointsChange
-  const drawPointsRef = useRef([])
-  const drawLayerRef = useRef(null)
-  const drawMarkersRef = useRef([])
-  const resultLayerRef = useRef(null)
-  const previewLineRef = useRef(null)
+  const drawPointsRef = useRef([])   // [{lng,lat}, ...] in progress
 
   const lineDrawModeRef = useRef(lineDrawMode); lineDrawModeRef.current = lineDrawMode
   const onLineDrawnRef = useRef(onLineDrawn); onLineDrawnRef.current = onLineDrawn
   const onLineDrawPointsChangeRef = useRef(onLineDrawPointsChange); onLineDrawPointsChangeRef.current = onLineDrawPointsChange
   const linePointsRef = useRef([])
-  const lineLayerRef = useRef(null)
-  const lineMarkersRef = useRef([])
-  const lineResultRef = useRef(null)
-  const linePreviewRef = useRef(null)
 
   const callbacksRef = useRef({ onPointClick, onMouseMove })
   callbacksRef.current = { onPointClick, onMouseMove }
 
   // ── init both instances once, synced ──────────────────────────
   useEffect(() => {
-    const left  = L.map(leftElRef.current,  { center, zoom, zoomControl: false, attributionControl: false, preferCanvas: true })
-    const right = L.map(rightElRef.current, { center, zoom, zoomControl: false, attributionControl: false, preferCanvas: true })
+    const c = center ? [center[1], center[0]] : [68.36, 43.39]   // App passes [lat,lon] — MapLibre wants [lon,lat]
+    const left  = makeMap(leftElRef.current,  c, zoom || 7)
+    const right = makeMap(rightElRef.current, c, zoom || 7)
     leftMapRef.current = left
     rightMapRef.current = right
-
-    L.tileLayer(BASEMAP_URL, { maxZoom: 18, subdomains: 'abcd', crossOrigin: true }).addTo(left)
-    L.tileLayer(BASEMAP_URL, { maxZoom: 18, subdomains: 'abcd', crossOrigin: true }).addTo(right)
 
     function syncFrom(src, dst) {
       if (syncingRef.current) return
       syncingRef.current = true
-      dst.setView(src.getCenter(), src.getZoom(), { animate: false })
+      dst.jumpTo({ center: src.getCenter(), zoom: src.getZoom(), bearing: src.getBearing(), pitch: src.getPitch() })
       syncingRef.current = false
     }
-    left.on('move zoom', () => syncFrom(left, right))
-    right.on('move zoom', () => syncFrom(right, left))
+    left.on('move', () => syncFrom(left, right))
+    right.on('move', () => syncFrom(right, left))
 
     left.on('click', (e) => {
-      const { lat, lng } = e.latlng
-      if (lineDrawModeRef.current) { addLinePoint(left, lat, lng); return }
-      if (drawModeRef.current) { addDrawPoint(left, lat, lng); return }
+      const { lng, lat } = e.lngLat
+      if (lineDrawModeRef.current) { addLinePoint(left, lng, lat); return }
+      if (drawModeRef.current) { addDrawPoint(left, lng, lat); return }
       callbacksRef.current.onPointClick?.(lat, lng)
     })
     left.on('dblclick', (e) => {
-      if (lineDrawModeRef.current) { if (e.originalEvent) L.DomEvent.stop(e.originalEvent); finishLineDraw(left); return }
+      if (lineDrawModeRef.current) { e.preventDefault(); finishLineDraw(); return }
       if (!drawModeRef.current) return
-      if (e.originalEvent) L.DomEvent.stop(e.originalEvent)
-      finishDraw(left)
+      e.preventDefault()
+      finishDraw()
     })
     left.on('mousemove', (e) => {
-      callbacksRef.current.onMouseMove?.(e.latlng.lat, e.latlng.lng)
-      if (lineDrawModeRef.current && linePointsRef.current.length > 0) updateLinePreview(left, e.latlng)
-      if (drawModeRef.current && drawPointsRef.current.length > 0) updatePreviewLine(left, e.latlng)
+      callbacksRef.current.onMouseMove?.(e.lngLat.lat, e.lngLat.lng)
     })
 
     return () => { left.remove(); right.remove() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // boundary clip (best-effort — falls back to unclipped if it fails to load)
+  // boundary clip outline (best-effort — falls back to unclipped if it fails to load)
   useEffect(() => {
     let cancelled = false
     fetch('/turkestan_boundary.geojson')
@@ -110,162 +205,133 @@ export default function SplitMapView({
     return () => { cancelled = true }
   }, [])
 
+  // Fit BOTH instances directly to the region bbox — don't rely solely on the
+  // move-sync relay for the initial framing, since a fitBounds fired only on
+  // the left map depends on that 'move' event propagating through syncFrom
+  // before the right map has necessarily finished loading its own style.
   useEffect(() => {
-    const map = leftMapRef.current
-    if (!map || !bounds) return
-    map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], { padding: [20, 20] })
+    if (!bounds) return
+    const bbox = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+    const doFit = (map) => map.fitBounds(bbox, { padding: 20, animate: false })
+    for (const map of [leftMapRef.current, rightMapRef.current]) {
+      if (!map) continue
+      if (map.isStyleLoaded()) doFit(map)
+      else map.once('load', () => doFit(map))
+    }
   }, [bounds])
 
-  // ── data layers, one per side ──────────────────────────────────
+  // ── data layers, one per side — (re)attached whenever the style (re)loads ──
   useEffect(() => {
     const map = leftMapRef.current
-    if (!map || clipGeo === undefined) return
-    if (leftDataRef.current) map.removeLayer(leftDataRef.current)
-    const common = { tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
-    const url = tileUrl(leftIndex, leftPeriod)
-    leftDataRef.current = (clipGeo && L.TileLayer.boundaryCanvas)
-      ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo }).addTo(map)
-      : L.tileLayer(url, common).addTo(map)
+    if (!map) return
+    const apply = () => {
+      setDataLayer(map, leftIndex, leftPeriod)
+      if (clipGeo) { setMaskLayer(map, clipGeo); setBoundaryLayer(map, clipGeo) }
+      ensureDrawSources(map)
+    }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
   }, [leftIndex, leftPeriod, clipGeo])
 
   useEffect(() => {
     const map = rightMapRef.current
-    if (!map || clipGeo === undefined) return
-    if (rightDataRef.current) map.removeLayer(rightDataRef.current)
-    const common = { tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
-    const url = tileUrl(rightIndex, rightPeriod)
-    rightDataRef.current = (clipGeo && L.TileLayer.boundaryCanvas)
-      ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo }).addTo(map)
-      : L.tileLayer(url, common).addTo(map)
+    if (!map) return
+    const apply = () => {
+      setDataLayer(map, rightIndex, rightPeriod)
+      if (clipGeo) { setMaskLayer(map, clipGeo); setBoundaryLayer(map, clipGeo) }
+    }
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
   }, [rightIndex, rightPeriod, clipGeo])
 
   // cursor + dblclick-zoom toggling for the interactive (left) map
   useEffect(() => {
     const map = leftMapRef.current
     if (!map) return
-    const container = map.getContainer()
-    if (drawMode) { container.style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
-    else { container.style.cursor = ''; map.doubleClickZoom.enable(); clearDraw(map) }
+    if (drawMode) { map.getCanvas().style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
+    else { map.getCanvas().style.cursor = ''; map.doubleClickZoom.enable(); clearDraw() }
   }, [drawMode])
   useEffect(() => {
     const map = leftMapRef.current
     if (!map) return
-    const container = map.getContainer()
-    if (lineDrawMode) { container.style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
-    else { container.style.cursor = ''; map.doubleClickZoom.enable(); clearLineDraw(map) }
+    if (lineDrawMode) { map.getCanvas().style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
+    else { map.getCanvas().style.cursor = ''; map.doubleClickZoom.enable(); clearLineDraw() }
   }, [lineDrawMode])
 
-  useEffect(() => {
-    const map = leftMapRef.current
-    if (!map || clearSignal == null) return
-    clearDraw(map)
-    if (resultLayerRef.current) { map.removeLayer(resultLayerRef.current); resultLayerRef.current = null }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearSignal])
-  useEffect(() => {
-    const map = leftMapRef.current
-    if (!map || finishSignal == null) return
-    finishDraw(map)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [finishSignal])
-  useEffect(() => {
-    const map = leftMapRef.current
-    if (!map || lineClearSignal == null) return
-    clearLineDraw(map)
-    if (lineResultRef.current) { map.removeLayer(lineResultRef.current); lineResultRef.current = null }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lineClearSignal])
-  useEffect(() => {
-    const map = leftMapRef.current
-    if (!map || lineFinishSignal == null) return
-    finishLineDraw(map)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lineFinishSignal])
+  useEffect(() => { if (clearSignal != null) clearDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [clearSignal])
+  useEffect(() => { if (finishSignal != null) finishDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [finishSignal])
+  useEffect(() => { if (lineClearSignal != null) clearLineDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [lineClearSignal])
+  useEffect(() => { if (lineFinishSignal != null) finishLineDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [lineFinishSignal])
 
-  function addDrawPoint(map, lat, lng) {
+  function drawPointsFC(pts) {
+    return {
+      type: 'FeatureCollection',
+      features: pts.map((p, i) => ({
+        type: 'Feature', properties: { first: i === 0 ? 1 : 0 },
+        geometry: { type: 'Point', coordinates: [p.lng, p.lat] },
+      })),
+    }
+  }
+  function drawLineFC(pts) {
+    return {
+      type: 'FeatureCollection',
+      features: pts.length > 1
+        ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: pts.map((p) => [p.lng, p.lat]) } }]
+        : [],
+    }
+  }
+  function repaintDraw(map) {
+    map.getSource('draw-points')?.setData(drawPointsFC(drawPointsRef.current))
+    map.getSource('draw-line')?.setData(drawLineFC(drawPointsRef.current))
+  }
+  function repaintLine(map) {
+    map.getSource('draw-points')?.setData(drawPointsFC(linePointsRef.current))
+    map.getSource('draw-line')?.setData(drawLineFC(linePointsRef.current))
+  }
+
+  function addDrawPoint(map, lng, lat) {
     const pts = drawPointsRef.current
     if (pts.length >= 3) {
-      const firstPx = map.latLngToContainerPoint(pts[0])
-      const clickPx = map.latLngToContainerPoint([lat, lng])
-      if (firstPx.distanceTo(clickPx) < 14) { finishDraw(map); return }
+      const firstPx = map.project([pts[0].lng, pts[0].lat])
+      const clickPx = map.project([lng, lat])
+      if (Math.hypot(firstPx.x - clickPx.x, firstPx.y - clickPx.y) < 14) { finishDraw(); return }
     }
-    pts.push([lat, lng])
-    const isFirst = pts.length === 1
-    const m = L.circleMarker([lat, lng], { radius: isFirst ? 6 : 4, color: '#3B82F6', weight: 2, fillColor: isFirst ? '#FFFFFF' : '#3B82F6', fillOpacity: 1 }).addTo(map)
-    drawMarkersRef.current.push(m)
-    if (drawLayerRef.current) map.removeLayer(drawLayerRef.current)
-    if (pts.length > 1) drawLayerRef.current = L.polyline(pts, { color: '#3B82F6', weight: 2 }).addTo(map)
+    pts.push({ lng, lat })
+    repaintDraw(map)
     onDrawPointsChangeRef.current?.(pts.length)
   }
-  function updatePreviewLine(map, latlng) {
-    const last = drawPointsRef.current[drawPointsRef.current.length - 1]
-    if (!last) return
-    const path = [last, [latlng.lat, latlng.lng]]
-    if (previewLineRef.current) previewLineRef.current.setLatLngs(path)
-    else previewLineRef.current = L.polyline(path, { color: '#3B82F6', weight: 2, dashArray: '6 6', opacity: 0.85 }).addTo(map)
-  }
-  function clearDraw(map) {
+  function clearDraw() {
     drawPointsRef.current = []
-    if (drawLayerRef.current) { map.removeLayer(drawLayerRef.current); drawLayerRef.current = null }
-    if (previewLineRef.current) { map.removeLayer(previewLineRef.current); previewLineRef.current = null }
-    drawMarkersRef.current.forEach((m) => map.removeLayer(m))
-    drawMarkersRef.current = []
+    const map = leftMapRef.current
+    if (map?.getSource('draw-points')) repaintDraw(map)
     onDrawPointsChangeRef.current?.(0)
   }
-  function finishDraw(map) {
+  function finishDraw() {
     const pts = [...drawPointsRef.current]
-    if (pts.length >= 2) {
-      const [lat1, lng1] = pts[pts.length - 1]
-      const [lat2, lng2] = pts[pts.length - 2]
-      if (Math.abs(lat1 - lat2) < 1e-9 && Math.abs(lng1 - lng2) < 1e-9) pts.pop()
-    }
-    clearDraw(map)
+    clearDraw()
     if (pts.length < 3) return
-    if (resultLayerRef.current) { map.removeLayer(resultLayerRef.current); resultLayerRef.current = null }
-    resultLayerRef.current = L.polygon(pts, { color: '#3B82F6', weight: 2, fillColor: '#3B82F6', fillOpacity: 0.2 }).addTo(map)
-    const ring = pts.map(([lat, lng]) => [lng, lat])
+    const ring = pts.map((p) => [p.lng, p.lat])
     ring.push(ring[0])
     onPolygonDrawnRef.current?.({ type: 'Polygon', coordinates: [ring] })
   }
 
-  function addLinePoint(map, lat, lng) {
+  function addLinePoint(map, lng, lat) {
     const pts = linePointsRef.current
-    pts.push([lat, lng])
-    const isFirst = pts.length === 1
-    const m = L.circleMarker([lat, lng], { radius: isFirst ? 6 : 4, color: '#3B82F6', weight: 2, fillColor: isFirst ? '#FFFFFF' : '#3B82F6', fillOpacity: 1 }).addTo(map)
-    lineMarkersRef.current.push(m)
-    if (lineLayerRef.current) map.removeLayer(lineLayerRef.current)
-    if (pts.length > 1) lineLayerRef.current = L.polyline(pts, { color: '#3B82F6', weight: 3, dashArray: '8 6' }).addTo(map)
+    pts.push({ lng, lat })
+    repaintLine(map)
     onLineDrawPointsChangeRef.current?.(pts.length)
   }
-  function updateLinePreview(map, latlng) {
-    const last = linePointsRef.current[linePointsRef.current.length - 1]
-    if (!last) return
-    const path = [last, [latlng.lat, latlng.lng]]
-    if (linePreviewRef.current) linePreviewRef.current.setLatLngs(path)
-    else linePreviewRef.current = L.polyline(path, { color: '#3B82F6', weight: 2, dashArray: '4 4', opacity: 0.7 }).addTo(map)
-  }
-  function clearLineDraw(map) {
+  function clearLineDraw() {
     linePointsRef.current = []
-    if (lineLayerRef.current) { map.removeLayer(lineLayerRef.current); lineLayerRef.current = null }
-    if (linePreviewRef.current) { map.removeLayer(linePreviewRef.current); linePreviewRef.current = null }
-    lineMarkersRef.current.forEach((m) => map.removeLayer(m))
-    lineMarkersRef.current = []
+    const map = leftMapRef.current
+    if (map?.getSource('draw-points')) repaintLine(map)
     onLineDrawPointsChangeRef.current?.(0)
   }
-  function finishLineDraw(map) {
+  function finishLineDraw() {
     const pts = [...linePointsRef.current]
-    if (pts.length >= 2) {
-      const [lat1, lng1] = pts[pts.length - 1]
-      const [lat2, lng2] = pts[pts.length - 2]
-      if (Math.abs(lat1 - lat2) < 1e-9 && Math.abs(lng1 - lng2) < 1e-9) pts.pop()
-    }
-    clearLineDraw(map)
+    clearLineDraw()
     if (pts.length < 2) return
-    if (lineResultRef.current) { map.removeLayer(lineResultRef.current); lineResultRef.current = null }
-    lineResultRef.current = L.polyline(pts, { color: '#3B82F6', weight: 3, dashArray: '8 6' }).addTo(map)
-    const coordinates = pts.map(([lat, lng]) => [lng, lat])
-    onLineDrawnRef.current?.({ type: 'LineString', coordinates })
+    onLineDrawnRef.current?.({ type: 'LineString', coordinates: pts.map((p) => [p.lng, p.lat]) })
   }
 
   // ── divider drag ────────────────────────────────────────────────
@@ -288,8 +354,8 @@ export default function SplitMapView({
     function onUp() {
       if (!draggingRef.current) return
       draggingRef.current = false
-      leftMapRef.current?.invalidateSize()
-      rightMapRef.current?.invalidateSize()
+      leftMapRef.current?.resize()
+      rightMapRef.current?.resize()
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
@@ -298,6 +364,12 @@ export default function SplitMapView({
       window.removeEventListener('pointerup', onUp)
     }
   }, [])
+
+  // both instances must repaint their viewport whenever their box changes size
+  useEffect(() => {
+    leftMapRef.current?.resize()
+    rightMapRef.current?.resize()
+  }, [sliderPct])
 
   const leftLabel  = periods.find((p) => p.period_id === leftPeriod)?.label  || leftPeriod
   const rightLabel = periods.find((p) => p.period_id === rightPeriod)?.label || rightPeriod
