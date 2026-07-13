@@ -3,6 +3,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet-boundary-canvas'   // attaches L.TileLayer.boundaryCanvas
 import { tileUrl, changeTileUrl, forecastTileUrl } from '../api'
+import { useI18n } from '../i18n.jsx'
 
 // Change-detection overlay sits on top of the normal index layer (not instead
 // of it) at this fixed opacity — see ChangeDetectionBar for period/index pick.
@@ -10,17 +11,17 @@ const CHANGE_OVERLAY_OPACITY = 0.75
 
 const BASEMAPS = {
   satellite: {
-    name: 'Спутник',
+    name: 'map.basemapSatellite',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri',
   },
   terrain: {
-    name: 'Рельеф',
+    name: 'map.basemapTerrain',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}',
     attribution: '© Esri',
   },
   dark: {
-    name: 'Тёмная',
+    name: 'map.basemapDark',
     url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
     attribution: '© CARTO',
   },
@@ -32,10 +33,12 @@ const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_l
 export default function MapView({
   activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
+  zoneGeometry, zoneEditMode, onPolygonEdited, zoneFocusSignal,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
   changeMode, changeIndex, changePeriodBefore, changePeriodAfter,
   forecastMode, forecastYear,
 }) {
+  const { t } = useI18n()
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
   const basemapRef  = useRef(null)
@@ -55,12 +58,15 @@ export default function MapView({
   drawModeRef.current  = drawMode
   const onPolygonDrawnRef = useRef(onPolygonDrawn)
   onPolygonDrawnRef.current = onPolygonDrawn
+  const onPolygonEditedRef = useRef(onPolygonEdited)
+  onPolygonEditedRef.current = onPolygonEdited
   const onDrawPointsChangeRef = useRef(onDrawPointsChange)
   onDrawPointsChangeRef.current = onDrawPointsChange
   const drawPointsRef   = useRef([])   // [[lat,lng],...] in progress
   const drawLayerRef    = useRef(null) // live polyline/polygon while drawing
   const drawMarkersRef  = useRef([])
   const resultLayerRef  = useRef(null) // final drawn polygon overlay
+  const editMarkersRef  = useRef([])   // draggable handles for the active saved/drawn zone
   const previewLineRef  = useRef(null) // rubber-band line: last point → cursor
 
   const lineDrawModeRef    = useRef(lineDrawMode)
@@ -77,7 +83,7 @@ export default function MapView({
 
   const [zoomLevel, setZoomLevel] = useState(zoom)
   const [hover, setHover] = useState(null)
-  const [basemapName, setBasemapName] = useState(BASEMAPS.satellite.name)
+  const [basemapKey, setBasemapKey] = useState('satellite')
   const [labelsOn, setLabelsOn] = useState(true)
   // undefined = boundary still loading, object = clip GeoJSON, null = no clip (fallback)
   const [clipGeo, setClipGeo] = useState(undefined)
@@ -176,7 +182,7 @@ export default function MapView({
     const map = mapRef.current
     if (!map || clearSignal == null) return
     clearDraw(map)
-    if (resultLayerRef.current) { map.removeLayer(resultLayerRef.current); resultLayerRef.current = null }
+    clearResultPolygon(map)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clearSignal])
 
@@ -187,6 +193,23 @@ export default function MapView({
     finishDraw(map)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishSignal])
+
+  // Keep the map overlay in sync when a saved zone is reopened or its
+  // geometry changes. Vertex handles are ordinary draggable Leaflet markers,
+  // so editing works without an additional drawing plugin.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    renderResultPolygon(map, zoneGeometry, zoneEditMode)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoneGeometry, zoneEditMode])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !zoneFocusSignal || !resultLayerRef.current?.getBounds) return
+    const zoneBounds = resultLayerRef.current.getBounds()
+    if (zoneBounds.isValid()) map.fitBounds(zoneBounds, { padding: [32, 32], maxZoom: 14 })
+  }, [zoneFocusSignal])
 
   useEffect(() => {
     const map = mapRef.current
@@ -272,6 +295,72 @@ export default function MapView({
     const ring = pts.map(([lat, lng]) => [lng, lat])
     ring.push(ring[0])
     onPolygonDrawnRef.current?.({ type: 'Polygon', coordinates: [ring] })
+  }
+
+  function clearResultPolygon(map) {
+    if (resultLayerRef.current) {
+      map.removeLayer(resultLayerRef.current)
+      resultLayerRef.current = null
+    }
+    editMarkersRef.current.forEach((marker) => map.removeLayer(marker))
+    editMarkersRef.current = []
+  }
+
+  function renderResultPolygon(map, geometry, editable) {
+    clearResultPolygon(map)
+    if (geometry?.type !== 'Polygon' || !Array.isArray(geometry.coordinates?.[0])) return
+
+    const rings = geometry.coordinates.map((ring) => {
+      const coordinates = ring.length > 1
+        && ring[0][0] === ring[ring.length - 1][0]
+        && ring[0][1] === ring[ring.length - 1][1]
+        ? ring.slice(0, -1)
+        : ring
+      return coordinates.map(([lng, lat]) => [lat, lng])
+    })
+    if (rings[0].length < 3) return
+
+    resultLayerRef.current = L.polygon(rings, {
+      color: editable ? '#F97316' : '#3B82F6',
+      weight: editable ? 3 : 2,
+      dashArray: editable ? '7 5' : null,
+      fillColor: '#3B82F6',
+      fillOpacity: 0.2,
+    }).addTo(map)
+
+    if (!editable) return
+    rings[0].forEach((latLng, index) => {
+      const marker = L.marker(latLng, {
+        draggable: true,
+        autoPan: true,
+        keyboard: true,
+        title: t('map.vertex', { number: index + 1 }),
+        icon: L.divIcon({
+          className: 'zone-edit-handle-wrap',
+          html: '<span class="zone-edit-handle"></span>',
+          iconSize: [18, 18],
+          iconAnchor: [9, 9],
+        }),
+        zIndexOffset: 1200,
+      }).addTo(map)
+      marker.on('drag', (event) => {
+        const { lat, lng } = event.target.getLatLng()
+        rings[0][index] = [lat, lng]
+        resultLayerRef.current?.setLatLngs(rings)
+      })
+      marker.on('dragend', () => {
+        const editedRings = rings.map((ring, ringIndex) => {
+          const points = ringIndex === 0
+            ? editMarkersRef.current.map((handle) => handle.getLatLng())
+            : ring.map(([lat, lng]) => ({ lat, lng }))
+          const coordinates = points.map(({ lat, lng }) => [lng, lat])
+          coordinates.push([...coordinates[0]])
+          return coordinates
+        })
+        onPolygonEditedRef.current?.({ type: 'Polygon', coordinates: editedRings })
+      })
+      editMarkersRef.current.push(marker)
+    })
   }
 
   function addLinePoint(map, lat, lng) {
@@ -484,25 +573,27 @@ export default function MapView({
     const next = BASEMAP_ORDER[(idx + 1) % BASEMAP_ORDER.length]
     basemapKind.current = next
     basemapRef.current.setUrl(BASEMAPS[next].url)
-    setBasemapName(BASEMAPS[next].name)
+    setBasemapKey(next)
   }
 
+  const basemapName = t(BASEMAPS[basemapKey].name)
+
   return (
-    <section className="map-section" id="map-workspace" tabIndex={-1} aria-label="Интерактивная карта Туркестанской области">
+    <section className="map-section" id="map-workspace" tabIndex={-1} aria-label={t('map.aria')}>
       <div ref={elRef} id="map" />
 
-      <div className="map-toolbar" role="toolbar" aria-label="Управление картой">
-        <button type="button" className="map-tool-btn" title="Приближение" aria-label="Приблизить карту" onClick={zoomIn}>+</button>
-        <button type="button" className="map-tool-btn" title="Отдаление" aria-label="Отдалить карту" onClick={zoomOut}>−</button>
+      <div className="map-toolbar" role="toolbar" aria-label={t('map.toolbar')}>
+        <button type="button" className="map-tool-btn" title={t('map.zoomIn')} aria-label={t('map.zoomIn')} onClick={zoomIn}>+</button>
+        <button type="button" className="map-tool-btn" title={t('map.zoomOut')} aria-label={t('map.zoomOut')} onClick={zoomOut}>−</button>
         <div className="map-tool-sep" />
-        <button type="button" className="map-tool-btn" title="По всей области" aria-label="Показать всю область" onClick={fit}>⊕</button>
-        <button type="button" className="map-tool-btn" title={`Базовая карта: ${basemapName} (нажмите для переключения)`} aria-label={`Переключить базовую карту. Сейчас: ${basemapName}`} onClick={toggleBasemap}>⊞</button>
+        <button type="button" className="map-tool-btn" title={t('map.fit')} aria-label={t('map.fit')} onClick={fit}>⊕</button>
+        <button type="button" className="map-tool-btn" title={t('map.basemapTitle', { name: basemapName })} aria-label={t('map.basemapAria', { name: basemapName })} onClick={toggleBasemap}>⊞</button>
         <div className="map-tool-sep" />
         <button
           type="button"
           className="map-tool-btn"
-          title={labelsOn ? 'Скрыть подписи (города, дороги)' : 'Показать подписи'}
-          aria-label={labelsOn ? 'Скрыть подписи городов и дорог' : 'Показать подписи городов и дорог'}
+          title={labelsOn ? t('map.hideLabels') : t('map.showLabels')}
+          aria-label={labelsOn ? t('map.hideLabels') : t('map.showLabels')}
           aria-pressed={labelsOn}
           onClick={toggleLabels}
         >
@@ -517,11 +608,11 @@ export default function MapView({
         <span className="map-footer-sep">·</span>
         {forecastMode && (
           <>
-            <span>Прогноз {forecastYear}</span>
+            <span>{t('map.forecast', { year: forecastYear })}</span>
             <span className="map-footer-sep">·</span>
           </>
         )}
-        <span>{hover ? `${hover.lat.toFixed(5)}°N · ${hover.lng.toFixed(5)}°E` : 'Наведите курсор на карту'}</span>
+        <span>{hover ? `${hover.lat.toFixed(5)}°N · ${hover.lng.toFixed(5)}°E` : t('map.hover')}</span>
       </div>
     </section>
   )

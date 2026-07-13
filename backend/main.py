@@ -14,6 +14,7 @@ Endpoints:
   GET  /api/pixel?lat=&lon=&period=     per-pixel spectral values + indices
   GET  /api/forecast/point?lat=&lon=&index=&target_year=  point trend forecast
   POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
+  POST /api/zone_timeseries             multi-year zonal index history
   POST /api/change_stats                change-detection zonal stats (index deltas + ML transition matrix)
   GET  /api/change_overview             precomputed change-detection stats for the whole oblast boundary
   POST /api/transect                    index profile (line profile) along a drawn line
@@ -39,6 +40,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+try:
+    from .account_api import create_account_router
+    from .account_mailer import AccountMailer
+    from .account_store import AccountStore
+except ImportError:  # supports `python backend/main.py`
+    from account_api import create_account_router
+    from account_mailer import AccountMailer
+    from account_store import AccountStore
 
 # ── Optional geo libs ─────────────────────────────────────────────
 try:
@@ -88,6 +98,7 @@ except ImportError:
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
+APP_DB_PATH = Path(os.getenv("APP_DB_PATH", str(BASE_DIR / "data" / "geoai_tko.sqlite3")))
 MOSAICS_DIR  = Path(os.getenv("MOSAICS_DIR", r"D:\data\mosaics"))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
 LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v3.pkl"))
@@ -705,8 +716,9 @@ CORS_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins  = CORS_ORIGINS,
-    allow_methods  = ["GET", "POST", "OPTIONS"],
-    allow_headers  = ["Content-Type"],
+    allow_credentials = True,
+    allow_methods  = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers  = ["Content-Type", "X-Requested-With"],
 )
 
 
@@ -1221,9 +1233,27 @@ def _validate_linestring_geometry(geometry: dict) -> list[tuple[float, float]]:
     return [_validate_position(position) for position in coordinates]
 
 
+# Personal accounts stay independent from the raster-analysis implementation.
+# The validator callback keeps saved polygons subject to the same geometry and
+# request-size rules as immediate zonal analyses.
+ACCOUNT_STORE = AccountStore(APP_DB_PATH)
+ACCOUNT_MAILER = AccountMailer.from_environment(BASE_DIR)
+app.include_router(create_account_router(
+    ACCOUNT_STORE,
+    allowed_origins=CORS_ORIGINS,
+    validate_geometry=lambda geometry: _validate_polygon_geometry(geometry, allow_multi=False),
+    secure_cookie=os.getenv("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"},
+    mailer=ACCOUNT_MAILER,
+))
+
+
 class ZoneStatsReq(BaseModel):
     geometry: dict
     period:   str = DEFAULT_PERIOD
+
+
+class ZoneTimeSeriesReq(BaseModel):
+    geometry: dict
 
 
 _ZONE_INDEX_KEYS = ["ndvi", "ndwi", "ndre", "ndmi", "bsi"]
@@ -1242,14 +1272,17 @@ def _zone_index_stats(arr: "np.ndarray") -> dict:
     }
 
 
-@app.post("/api/zone_stats")
-@limit_analysis
-def zone_stats(req: ZoneStatsReq):
-    period_cfg = resolve_period(req.period)
+def _calculate_zone_stats(geometry: dict, period_id: str, include_lulc: bool = True) -> dict:
+    """Calculate one period without acquiring the analysis semaphore.
+
+    Keeping the raster work in a helper lets the time-series endpoint process
+    every available annual mosaic under one bounded analysis request.
+    """
+    period_cfg = resolve_period(period_id)
     if not (RASTERIO_OK and cog_available(period_cfg)):
         raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
 
-    geom = req.geometry
+    geom = geometry
     _validate_polygon_geometry(geom, allow_multi=False)
 
     try:
@@ -1335,8 +1368,9 @@ def zone_stats(req: ZoneStatsReq):
 
     px_area_ha = 0.01  # 10m x 10m pixel
     lulc = {}
-    load_classifier()
-    if CLASSIFIER is not None:
+    if include_lulc:
+        load_classifier()
+    if include_lulc and CLASSIFIER is not None:
         feats = np.stack([ndvi, ndre, ndwi, ndmi, bsi, b08], axis=1).astype(np.float32)
         preds = CLASSIFIER.predict(feats)
         for i, cls in enumerate(CLASS_NAMES):
@@ -1352,6 +1386,43 @@ def zone_stats(req: ZoneStatsReq):
         "pixel_count": pixel_count,
         "indices":     indices,
         "lulc":        lulc,
+    }
+
+
+@app.post("/api/zone_stats")
+@limit_analysis
+def zone_stats(req: ZoneStatsReq):
+    return _calculate_zone_stats(req.geometry, req.period)
+
+
+@app.post("/api/zone_timeseries")
+@limit_analysis
+def zone_timeseries(req: ZoneTimeSeriesReq):
+    """Return comparable annual summaries for every available COG period."""
+    _validate_polygon_geometry(req.geometry, allow_multi=False)
+    observations = []
+    for period_id, period_cfg in PERIODS.items():
+        year = _period_year(period_id)
+        if year is None or not cog_available(period_cfg):
+            continue
+        stats = _calculate_zone_stats(req.geometry, period_id, include_lulc=False)
+        observations.append({
+            "year": year,
+            "period_id": period_id,
+            "label": period_cfg["label"],
+            "date_range": period_cfg["date_range"],
+            "area_ha": stats["area_ha"],
+            "pixel_count": stats["pixel_count"],
+            "indices": stats["indices"],
+        })
+
+    observations.sort(key=lambda item: item["year"])
+    if not observations:
+        raise HTTPException(status_code=503, detail="Нет доступных периодов для временного ряда")
+    return {
+        "observations": observations,
+        "years": [item["year"] for item in observations],
+        "source": "Sentinel-2 L2A / Copernicus Data Space Ecosystem",
     }
 
 
@@ -1504,6 +1575,10 @@ class AnalyzeReq(BaseModel):
     ml_class:       str   | None = None
     ml_class_ru:    str   | None = None
     ml_confidence:  float | None = None
+    locale:          str = Field(default="ru", pattern=r"^(ru|kk|en)$")
+
+
+AI_LANGUAGE_NAMES = {"ru": "русском", "kk": "казахском", "en": "английском"}
 
 
 # Expected index ranges per ML land-cover class for this region — lets the
@@ -1519,7 +1594,7 @@ REGIONAL_NORMS = {
 }
 
 
-def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confidence):
+def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confidence, locale="ru"):
     """Builds the analysis prompt around deviations from this region's normal
     index ranges for the ML-predicted class, rather than just restating it."""
     ndvi, ndwi, ndmi, bsi, ndre, savi, nbr = (
@@ -1565,8 +1640,9 @@ def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confi
     def fmt(v):
         return f"{v:.3f}" if v is not None else "н/д"
 
-    class_label = ml_class_ru or ml_class or "неизвестен"
+    class_label = (ml_class_ru if locale == "ru" else ml_class) or "неизвестен"
     confidence_pct = round((ml_confidence or 0) * 100)
+    response_language = AI_LANGUAGE_NAMES.get(locale, AI_LANGUAGE_NAMES["ru"])
 
     return f"""Ты агроэколог и эксперт по землепользованию Туркестанской области Казахстана.
 
@@ -1575,7 +1651,7 @@ def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confi
 - NDVI={fmt(ndvi)}, NDRE={fmt(ndre)}, NDWI={fmt(ndwi)}, NDMI={fmt(ndmi)}, BSI={fmt(bsi)}, SAVI={fmt(savi)}, NBR={fmt(nbr)}
 - Выявленные отклонения: {warnings_text}
 
-Напиши 2-3 предложения на русском языке:
+Напиши 2-3 предложения на {response_language} языке:
 1. Конкретная проблема или состояние (не описывай то что уже известно из класса)
 2. Практическая рекомендация для землепользователя или агронома
 3. Риск если не принять меры (только если есть реальная проблема)
@@ -1593,10 +1669,11 @@ def analyze(req: AnalyzeReq):
     }
     prompt = build_groq_prompt(
         req.lat, req.lon, req.period, indices,
-        req.ml_class, req.ml_class_ru, req.ml_confidence,
+        req.ml_class, req.ml_class_ru, req.ml_confidence, req.locale,
     )
+    response_language = AI_LANGUAGE_NAMES.get(req.locale, AI_LANGUAGE_NAMES["ru"])
     system = ("Эксперт по дистанционному зондированию Центральной Азии. "
-              "Анализируешь Sentinel-2. Отвечай кратко и конкретно на русском.")
+              f"Анализируешь Sentinel-2. Отвечай кратко и конкретно на {response_language} языке.")
 
     if AI_OK:
         for env, url, model in [
@@ -1618,10 +1695,33 @@ def analyze(req: AnalyzeReq):
     # Local fallback
     ndvi = req.ndvi
     if ndvi is None:
-        return {"analysis":"Данные недоступны — выберите другую точку.", "source":"local", "model":"local"}
-    if   ndvi > 0.5:  txt = f"NDVI={ndvi:.2f} — активная густая растительность. Вероятно ирригированные поля или пойма Сырдарьи. Состояние хорошее."
-    elif ndvi > 0.25: txt = f"NDVI={ndvi:.2f} — умеренная растительность. Характерно для пастбищ или полей в начале вегетационного сезона."
-    else:             txt = f"NDVI={ndvi:.2f} — слабая растительность. Пустынные или деградированные земли. Возможны засоление и опустынивание."
+        unavailable = {
+            "ru": "Данные недоступны — выберите другую точку.",
+            "kk": "Деректер қолжетімсіз — басқа нүктені таңдаңыз.",
+            "en": "Data is unavailable — select another point.",
+        }
+        return {"analysis": unavailable[req.locale], "source":"local", "model":"local"}
+    local_copy = {
+        "ru": (
+            f"NDVI={ndvi:.2f} — активная густая растительность. Вероятно ирригированные поля или пойма Сырдарьи. Состояние хорошее.",
+            f"NDVI={ndvi:.2f} — умеренная растительность. Характерно для пастбищ или полей в начале вегетационного сезона.",
+            f"NDVI={ndvi:.2f} — слабая растительность. Пустынные или деградированные земли. Возможны засоление и опустынивание.",
+        ),
+        "kk": (
+            f"NDVI={ndvi:.2f} — белсенді қалың өсімдік. Бұл суармалы егістік немесе Сырдария жайылмасы болуы мүмкін. Жағдайы жақсы.",
+            f"NDVI={ndvi:.2f} — өсімдік деңгейі орташа. Жайылымдарға немесе вегетация басындағы егістіктерге тән.",
+            f"NDVI={ndvi:.2f} — өсімдік сирек. Шөлді немесе тозған жерлер. Тұздану мен шөлейттену қаупі бар.",
+        ),
+        "en": (
+            f"NDVI={ndvi:.2f} indicates active, dense vegetation, likely irrigated fields or the Syr Darya floodplain. Conditions appear good.",
+            f"NDVI={ndvi:.2f} indicates moderate vegetation, typical of pasture or fields early in the growing season.",
+            f"NDVI={ndvi:.2f} indicates sparse vegetation and potentially desertified or degraded land. Salinization and desertification are possible risks.",
+        ),
+    }
+    high, medium, low = local_copy[req.locale]
+    if   ndvi > 0.5:  txt = high
+    elif ndvi > 0.25: txt = medium
+    else:             txt = low
     return {"analysis": txt, "source": "local", "model": "local"}
 
 
@@ -1634,6 +1734,7 @@ class ZoneReportReq(BaseModel):
     zone_stats:       dict
     active_layer:     str | None = None
     period:           str = DEFAULT_PERIOD
+    locale:           str = Field(default="ru", pattern=r"^(ru|kk|en)$")
 
 
 _LULC_LABELS_RU = {
@@ -1647,7 +1748,7 @@ _LULC_LABELS_RU = {
 _LULC_ORDER = ["agriculture", "urban", "dense_vegetation", "sparse_vegetation", "bare_soil", "water"]
 
 
-def build_zone_report_prompt(stats: dict, active_layer: str | None, period: str) -> str:
+def build_zone_report_prompt(stats: dict, active_layer: str | None, period: str, locale: str = "ru") -> str:
     """Detailed Russian prompt for a 4-section structured zone report (vs. the
     short 2-3 sentence pixel-level prompt in build_groq_prompt above)."""
     area_ha = stats.get("area_ha") or 0
@@ -1665,6 +1766,7 @@ def build_zone_report_prompt(stats: dict, active_layer: str | None, period: str)
         for k in _LULC_ORDER if k in lulc
     ) or "- данные классификации отсутствуют"
 
+    response_language = AI_LANGUAGE_NAMES.get(locale, AI_LANGUAGE_NAMES["ru"])
     return f"""Ты — эксперт по дистанционному зондированию и агрономии Казахстана. Проанализируй спутниковые данные Sentinel-2 для зоны в Туркестанской области.
 
 ДАННЫЕ ЗОНЫ:
@@ -1688,11 +1790,11 @@ def build_zone_report_prompt(stats: dict, active_layer: str | None, period: str)
 3. ЗЕМЛЕПОЛЬЗОВАНИЕ — проанализируй соотношение классов, есть ли аномалии
 4. РЕКОМЕНДАЦИИ — конкретные агрономические и управленческие меры
 
-Пиши профессионально но понятно. Каждый раздел 3-4 предложения.
+Пиши профессионально, но понятно, на {response_language} языке. Каждый раздел 3-4 предложения.
 Заголовок каждого раздела пиши ровно в формате "N. НАЗВАНИЕ" заглавными буквами на отдельной строке, без markdown-разметки (без звёздочек, решёток и слова "Раздел")."""
 
 
-def _local_zone_report(stats: dict) -> str:
+def _local_zone_report(stats: dict, locale: str = "ru") -> str:
     """Template fallback used only if Groq is unreachable/unconfigured."""
     area_ha = stats.get("area_ha") or 0
     idx     = stats.get("indices") or {}
@@ -1702,6 +1804,22 @@ def _local_zone_report(stats: dict) -> str:
     top_label = _LULC_LABELS_RU.get(top_class, top_class or "неизвестно")
     ndvi_text = f"{ndvi:.3f}" if ndvi is not None else "н/д"
 
+    if locale == "en":
+        return (
+            f"1. GENERAL ZONE CHARACTERISTICS\nThe {area_ha:.2f} ha zone is predominantly classified as “{top_class or 'unknown'}”. "
+            f"Mean NDVI is {ndvi_text}.\n\n2. VEGETATION AND SOIL CONDITION\n"
+            "AI analysis is temporarily unavailable; this section uses a local template. Configure GROQ_API_KEY for a full assessment.\n\n"
+            "3. LAND USE\nThe land-cover classification is shown in the table above.\n\n"
+            "4. RECOMMENDATIONS\nGenerate the report again when the AI service is available."
+        )
+    if locale == "kk":
+        return (
+            f"1. АЙМАҚТЫҢ ЖАЛПЫ СИПАТТАМАСЫ\nАуданы {area_ha:.2f} га аймақта «{top_class or 'белгісіз'}» санаты басым. "
+            f"Орташа NDVI мәні {ndvi_text}.\n\n2. ӨСІМДІК ПЕН ТОПЫРАҚ ЖАҒДАЙЫ\n"
+            "AI талдауы уақытша қолжетімсіз; бұл бөлім жергілікті үлгімен жасалды. Толық қорытынды үшін GROQ_API_KEY баптаңыз.\n\n"
+            "3. ЖЕР ПАЙДАЛАНУ\nЖер жамылғысының жіктеуі жоғарыдағы кестеде берілген.\n\n"
+            "4. ҰСЫНЫСТАР\nAI қызметі қолжетімді болғанда есепті қайта жасаңыз."
+        )
     return (
         f"1. ОБЩАЯ ХАРАКТЕРИСТИКА ЗОНЫ\n"
         f"Зона площадью {area_ha:.2f} га преимущественно представлена классом «{top_label}». "
@@ -1726,9 +1844,10 @@ def zone_report(req: ZoneReportReq):
         raise HTTPException(status_code=400, detail="zone_stats.area_ha должен быть конечным числом")
     if not isinstance(req.zone_stats.get("indices"), dict) or not isinstance(req.zone_stats.get("lulc"), dict):
         raise HTTPException(status_code=400, detail="zone_stats должен содержать объекты indices и lulc")
-    prompt = build_zone_report_prompt(req.zone_stats, req.active_layer, req.period)
+    prompt = build_zone_report_prompt(req.zone_stats, req.active_layer, req.period, req.locale)
+    response_language = AI_LANGUAGE_NAMES.get(req.locale, AI_LANGUAGE_NAMES["ru"])
     system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
-              "Пишешь развёрнутые структурированные аналитические отчёты на русском языке.")
+              f"Пишешь развёрнутые структурированные аналитические отчёты на {response_language} языке.")
 
     if AI_OK:
         key = os.getenv("GROQ_API_KEY")
@@ -1744,7 +1863,7 @@ def zone_report(req: ZoneReportReq):
             except Exception as e:
                 print(f"Zone report AI error: {e}")
 
-    return {"groq_analysis": _local_zone_report(req.zone_stats), "model": "local"}
+    return {"groq_analysis": _local_zone_report(req.zone_stats, req.locale), "model": "local"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1921,7 +2040,7 @@ def _transitions_from_counts(counts: "np.ndarray", pixel_count: int, px_area_ha:
     return {"matrix": matrix, "top_changes": top_changes, "net_change_ha": net_change_ha}
 
 
-def build_change_stats_prompt(stats: dict) -> str:
+def build_change_stats_prompt(stats: dict, locale: str = "ru") -> str:
     idx = stats.get("indices") or {}
     ml  = stats.get("ml_transitions") or {}
     top = ml.get("top_changes") or []
@@ -1942,6 +2061,7 @@ def build_change_stats_prompt(stats: dict) -> str:
         for t in top
     ) or "- значимых переходов классов не обнаружено"
 
+    response_language = AI_LANGUAGE_NAMES.get(locale, AI_LANGUAGE_NAMES["ru"])
     return f"""Ты — эксперт по дистанционному зондированию и землепользованию Туркестанской области Казахстана.
 
 Сравниваются два периода спутниковых снимков Sentinel-2: {stats.get('period_before')} и {stats.get('period_after')}.
@@ -1953,7 +2073,7 @@ def build_change_stats_prompt(stats: dict) -> str:
 ТОП ПЕРЕХОДОВ ЗЕМЕЛЬНОГО ПОКРОВА (ML-классификация):
 {top_lines}
 
-Напиши 3-4 предложения на русском языке с агрономической/экологической интерпретацией
+Напиши 3-4 предложения на {response_language} языке с агрономической/экологической интерпретацией
 произошедших изменений: что реально случилось на территории, какие риски это несёт,
 и какие меры стоит принять. Будь конкретным, не пересказывай цифры — объясняй их смысл."""
 
@@ -1969,6 +2089,7 @@ class ChangeStatsReq(BaseModel):
     geometry:      dict
     period_before: str = "2023_summer"
     period_after:  str = "2025_summer"
+    locale:        str = Field(default="ru", pattern=r"^(ru|kk|en)$")
 
 
 def _compute_change_stats(geometry: dict, period_before: str, period_after: str) -> dict:
@@ -2075,9 +2196,10 @@ def change_stats(req: ChangeStatsReq):
         key = os.getenv("GROQ_API_KEY")
         if key:
             try:
-                prompt = build_change_stats_prompt(stats)
+                prompt = build_change_stats_prompt(stats, req.locale)
+                response_language = AI_LANGUAGE_NAMES.get(req.locale, AI_LANGUAGE_NAMES["ru"])
                 system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
-                          "Анализируешь изменения между двумя периодами Sentinel-2. Отвечай кратко и конкретно на русском.")
+                          f"Анализируешь изменения между двумя периодами Sentinel-2. Отвечай кратко и конкретно на {response_language} языке.")
                 r = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1").chat.completions.create(
                     model="llama-3.1-8b-instant", max_tokens=500, temperature=0.4,
                     messages=[{"role": "system", "content": system},

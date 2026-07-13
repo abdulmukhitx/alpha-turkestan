@@ -20,6 +20,9 @@ env/
 # Python
 __pycache__/
 *.pyc
+*.db
+*.sqlite
+*.sqlite3
 .venv/
 venv/
 *.pyd
@@ -53,3 +56,5 @@ tmp_*/
 build/
 dist/
 *.log
+data/account_mailbox/
+backups/

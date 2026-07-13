@@ -1,8 +1,10 @@
+import { useI18n } from '../i18n.jsx'
+
 const MODES = [
-  { id: 'overview', label: 'Обзор', hint: 'Точки и зоны', icon: 'map' },
-  { id: 'compare', label: 'Сравнение', hint: 'Два периода', icon: 'compare' },
-  { id: 'change', label: 'Изменения', hint: 'Динамика', icon: 'change' },
-  { id: 'forecast', label: 'Прогноз', hint: 'Сценарий тренда', icon: 'forecast' },
+  { id: 'overview', label: 'nav.overview', hint: 'nav.overviewHint', icon: 'map' },
+  { id: 'compare', label: 'nav.compare', hint: 'nav.compareHint', icon: 'compare' },
+  { id: 'change', label: 'nav.change', hint: 'nav.changeHint', icon: 'change' },
+  { id: 'forecast', label: 'nav.forecast', hint: 'nav.forecastHint', icon: 'forecast' },
 ]
 
 function ModeIcon({ name }) {
@@ -65,10 +67,11 @@ export default function WorkspaceNav({
   onToggleRightPanel,
   hasResults,
 }) {
+  const { t } = useI18n()
   return (
-    <nav className="workspace-nav" aria-label="Режим работы и панели">
-      <div className="mode-group" aria-label="Режим работы">
-        <span className="mode-group-label">Режим</span>
+    <nav className="workspace-nav" aria-label={t('nav.aria')}>
+      <div className="mode-group" aria-label={t('nav.mode')}>
+        <span className="mode-group-label">{t('nav.mode')}</span>
         <div className="mode-list">
           {MODES.map((mode) => {
             const disabled = mode.id === 'forecast' && !forecastAvailable
@@ -79,13 +82,13 @@ export default function WorkspaceNav({
                 className={`mode-button ${activeMode === mode.id ? 'active' : ''}`}
                 aria-pressed={activeMode === mode.id}
                 disabled={disabled}
-                title={disabled ? 'Для прогноза нужны минимум три годовых периода' : mode.hint}
+                title={disabled ? t('nav.forecastUnavailable') : t(mode.hint)}
                 onClick={() => onModeChange(mode.id)}
               >
                 <span className="mode-icon"><ModeIcon name={mode.icon} /></span>
                 <span className="mode-copy">
-                  <strong>{mode.label}</strong>
-                  <small>{mode.hint}</small>
+                  <strong>{t(mode.label)}</strong>
+                  <small>{t(mode.hint)}</small>
                 </span>
               </button>
             )
@@ -93,18 +96,18 @@ export default function WorkspaceNav({
         </div>
       </div>
 
-      <div className="panel-toggle-group" aria-label="Панели рабочего пространства">
+      <div className="panel-toggle-group" aria-label={t('nav.panels')}>
         <button
           type="button"
           className={`panel-toggle ${leftPanelOpen ? 'active' : ''}`}
           aria-expanded={leftPanelOpen}
           aria-controls="layer-panel"
           disabled={!leftPanelAvailable}
-          title={!leftPanelAvailable ? 'Слои настраиваются отдельно для каждой стороны сравнения' : undefined}
+          title={!leftPanelAvailable ? t('nav.compareLayers') : undefined}
           onClick={onToggleLeftPanel}
         >
           <PanelIcon name="layers" />
-          <span>Слои</span>
+          <span>{t('nav.layers')}</span>
         </button>
         <button
           type="button"
@@ -114,8 +117,8 @@ export default function WorkspaceNav({
           onClick={onToggleRightPanel}
         >
           <PanelIcon name="results" />
-          <span>Результаты</span>
-          {hasResults && <span className="result-indicator" aria-label="Есть новые результаты" />}
+          <span>{t('nav.results')}</span>
+          {hasResults && <span className="result-indicator" aria-label={t('nav.newResults')} />}
         </button>
       </div>
     </nav>

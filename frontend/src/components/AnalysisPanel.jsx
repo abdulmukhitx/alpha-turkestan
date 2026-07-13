@@ -2,28 +2,26 @@ import ZoneStatsPanel from './ZoneStatsPanel.jsx'
 import TransectChart from './TransectChart.jsx'
 import ChangeStatsPanel from './ChangeStatsPanel.jsx'
 import ForecastPanel from './ForecastPanel.jsx'
+import { useI18n } from '../i18n.jsx'
 
 function PanelHeader({ hasPoint, onClose }) {
+  const { t } = useI18n()
   return (
     <div className="panel-header panel-header-row">
       <div>
-        <span className="panel-eyebrow">{hasPoint ? 'Выбранная точка' : 'Данные и выводы'}</span>
-        <h2 className="panel-title">Результаты анализа</h2>
+        <span className="panel-eyebrow">{hasPoint ? t('analysis.selectedPoint') : t('analysis.dataInsights')}</span>
+        <h2 className="panel-title">{t('analysis.title')}</h2>
       </div>
-      <button className="panel-close" type="button" onClick={onClose} aria-label="Скрыть панель результатов">×</button>
+      <button className="panel-close" type="button" onClick={onClose} aria-label={t('analysis.hide')}>×</button>
     </div>
   )
 }
 
 // order + Russian labels for the spectral indices panel
 const INDICES = [
-  { key: 'ndvi', code: 'NDVI', label: 'Растительность' },
-  { key: 'ndre', code: 'NDRE', label: 'Стресс растений' },
-  { key: 'ndwi', code: 'NDWI', label: 'Водные ресурсы' },
-  { key: 'ndmi', code: 'NDMI', label: 'Влажность почвы' },
-  { key: 'bsi',  code: 'BSI',  label: 'Голая почва' },
-  { key: 'savi', code: 'SAVI', label: 'Покрытие раст.' },
-  { key: 'nbr',  code: 'NBR',  label: 'Деградация' },
+  { key: 'ndvi', code: 'NDVI' }, { key: 'ndre', code: 'NDRE' },
+  { key: 'ndwi', code: 'NDWI' }, { key: 'ndmi', code: 'NDMI' },
+  { key: 'bsi', code: 'BSI' }, { key: 'savi', code: 'SAVI' }, { key: 'nbr', code: 'NBR' },
 ]
 
 // semantic colour per index value (green=good veg, blue=water, red/orange=dry/bare)
@@ -69,12 +67,14 @@ function indexColor(key, v) {
 
 export default function AnalysisPanel({
   point, pixel, aiText, loading, error,
-  zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer, zonePeriod,
+  zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer, zonePeriod, zoneName,
+  zoneTimeSeries, zoneTimeSeriesLoading, zoneTimeSeriesError,
   transectData, transectLoading, transectError,
   changeStats, changeLoading, changeError,
   forecastMode, forecastResult, forecastLoading, forecastError, forecastYear, forecastIndex,
   onClose,
 }) {
+  const { t } = useI18n()
   if (forecastMode) {
     return (
       <ForecastPanel
@@ -91,7 +91,7 @@ export default function AnalysisPanel({
 
   if (!point) {
     return (
-      <aside className="panel panel-right" id="analysis-panel" aria-label="Результаты анализа">
+      <aside className="panel panel-right" id="analysis-panel" aria-label={t('analysis.title')}>
         <PanelHeader hasPoint={false} onClose={onClose} />
         <div className="click-prompt">
           <svg className="click-icon" width="30" height="30" viewBox="0 0 32 32" fill="none">
@@ -99,12 +99,14 @@ export default function AnalysisPanel({
             <circle cx="16" cy="16" r="6" stroke="currentColor" strokeWidth="1.5" />
             <circle cx="16" cy="16" r="2" fill="currentColor" />
           </svg>
-          <strong>Выберите объект на карте</strong>
-          <p className="click-text">Кликните по точке или используйте инструменты зоны и профиля. Результаты появятся здесь.</p>
+          <strong>{t('analysis.selectObject')}</strong>
+          <p className="click-text">{t('analysis.selectObjectHelp')}</p>
         </div>
         <ZoneStatsPanel
           stats={zoneStats} loading={zoneLoading} error={zoneError}
           geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
+          zoneName={zoneName} timeSeries={zoneTimeSeries}
+          timeSeriesLoading={zoneTimeSeriesLoading} timeSeriesError={zoneTimeSeriesError}
         />
         <TransectChart data={transectData} loading={transectLoading} error={transectError} />
         <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
@@ -113,7 +115,7 @@ export default function AnalysisPanel({
   }
 
   return (
-    <aside className="panel panel-right" id="analysis-panel" aria-label="Результаты анализа">
+    <aside className="panel panel-right" id="analysis-panel" aria-label={t('analysis.title')}>
       <PanelHeader hasPoint onClose={onClose} />
 
       <div className="result-location">
@@ -124,30 +126,30 @@ export default function AnalysisPanel({
         <span>{point.lat.toFixed(4)}°N · {point.lng.toFixed(4)}°E</span>
       </div>
 
-      {pixel?.ml_class_ru && (
+      {(pixel?.ml_class || pixel?.ml_class_ru) && (
         <div className="ml-block">
           <div className="ml-header">
-            <span>ML-классификация</span>
+            <span>{t('analysis.ml')}</span>
             <span className="ml-confidence">{Math.round((pixel.ml_confidence ?? 0) * 100)}%</span>
           </div>
-          <div className="ml-class-name">{pixel.ml_class_ru}</div>
+          <div className="ml-class-name">{pixel.ml_class ? t(`lulc.${pixel.ml_class}`) : pixel.ml_class_ru}</div>
           <div className="ml-bar">
             <div className="ml-bar-fill" style={{ width: `${Math.round((pixel.ml_confidence ?? 0) * 100)}%` }} />
           </div>
         </div>
       )}
 
-      <div className="section-label">Спектральные индексы</div>
-      {pixel?.demo && <div className="zone-error">Демонстрационные данные — не спутниковое измерение.</div>}
+      <div className="section-label">{t('analysis.indices')}</div>
+      {pixel?.demo && <div className="zone-error">{t('analysis.demo')}</div>}
       <div className="indices-list">
-        {INDICES.map(({ key, code, label }) => {
+        {INDICES.map(({ key, code }) => {
           const v = pixel ? (pixel[key] ?? null) : null
           const pct = v != null ? Math.max(2, Math.min(100, ((v + 1) / 2) * 100)) : 0
           const color = indexColor(key, v)
           return (
             <div className="index-row" key={key}>
               <div className="index-head">
-                <span className="index-name">{label} <span className="index-code">{code}</span></span>
+                <span className="index-name">{t(`index.${key}`)} <span className="index-code">{code}</span></span>
                 <span className="index-val" style={{ color }}>{v != null ? v.toFixed(4) : '…'}</span>
               </div>
               <div className="index-track">
@@ -161,7 +163,7 @@ export default function AnalysisPanel({
       <div className="ai-block">
         <div className="ai-header">
           <div className="ai-pulse" />
-          <span>AI — интерпретация</span>
+          <span>{t('analysis.ai')}</span>
         </div>
         <div className="ai-text" aria-live="polite">
           {loading ? (
@@ -177,6 +179,8 @@ export default function AnalysisPanel({
       <ZoneStatsPanel
         stats={zoneStats} loading={zoneLoading} error={zoneError}
         geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
+        zoneName={zoneName} timeSeries={zoneTimeSeries}
+        timeSeriesLoading={zoneTimeSeriesLoading} timeSeriesError={zoneTimeSeriesError}
       />
       <TransectChart data={transectData} loading={transectLoading} error={transectError} />
       <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />

@@ -1,22 +1,10 @@
+import { useI18n } from '../i18n.jsx'
+
 const INDEX_LABELS = {
-  ndvi: ['NDVI', 'Растительность'],
-  ndre: ['NDRE', 'Стресс растений'],
-  ndwi: ['NDWI', 'Водные ресурсы'],
-  ndmi: ['NDMI', 'Влажность почвы'],
-  bsi:  ['BSI',  'Голая почва'],
-  savi: ['SAVI', 'Покрытие раст.'],
-  nbr:  ['NBR',  'Деградация'],
+  ndvi: 'NDVI', ndre: 'NDRE', ndwi: 'NDWI', ndmi: 'NDMI', bsi: 'BSI', savi: 'SAVI', nbr: 'NBR',
 }
 const INDEX_ORDER = ['ndvi', 'ndre', 'ndwi', 'ndmi', 'bsi', 'savi', 'nbr']
 
-const LULC_LABELS_RU = {
-  agriculture:       'Сельхоз угодья',
-  bare_soil:         'Голая почва',
-  dense_vegetation:  'Густая раст.',
-  sparse_vegetation: 'Разреж. раст.',
-  urban:             'Застройка',
-  water:             'Вода',
-}
 const LULC_ICONS = {
   agriculture:       '🟢',
   bare_soil:         '🟡',
@@ -59,6 +47,7 @@ function periodYear(period, fallback) {
 }
 
 function ChangeLulcBars({ matrix, netChange, periodBefore, periodAfter }) {
+  const { t, formatNumber } = useI18n()
   if (!matrix) return null
 
   const beforeByClass = {}
@@ -75,25 +64,25 @@ function ChangeLulcBars({ matrix, netChange, periodBefore, periodAfter }) {
   return (
     <div className="change-lulc-bars">
       <div className="change-lulc-bar-row">
-        <span className="change-lulc-bar-label">{periodYear(periodBefore, 'До')}</span>
+        <span className="change-lulc-bar-label">{periodYear(periodBefore, t('change.before'))}</span>
         <div className="zone-lulc-bar">
           {LULC_ORDER.filter((k) => beforeByClass[k] > 0).map((k) => (
             <div
               key={k} className="zone-lulc-seg"
               style={{ width: `${(beforeByClass[k] / total) * 100}%`, background: LULC_COLORS[k] }}
-              title={LULC_LABELS_RU[k]}
+              title={t(`lulc.${k}`)}
             />
           ))}
         </div>
       </div>
       <div className="change-lulc-bar-row">
-        <span className="change-lulc-bar-label">{periodYear(periodAfter, 'После')}</span>
+        <span className="change-lulc-bar-label">{periodYear(periodAfter, t('change.after'))}</span>
         <div className="zone-lulc-bar">
           {LULC_ORDER.filter((k) => afterByClass[k] > 0).map((k) => (
             <div
               key={k} className="zone-lulc-seg"
               style={{ width: `${(afterByClass[k] / total) * 100}%`, background: LULC_COLORS[k] }}
-              title={LULC_LABELS_RU[k]}
+              title={t(`lulc.${k}`)}
             />
           ))}
         </div>
@@ -104,12 +93,12 @@ function ChangeLulcBars({ matrix, netChange, periodBefore, periodAfter }) {
           {LULC_ORDER.filter((k) => netChange[k] !== undefined).map((k) => (
             <div className="zone-lulc-row" key={k}>
               <span className="zone-lulc-icon">{LULC_ICONS[k]}</span>
-              <span className="zone-lulc-name">{LULC_LABELS_RU[k]}</span>
+              <span className="zone-lulc-name">{t(`lulc.${k}`)}</span>
               <span
                 className="zone-lulc-area"
                 style={{ color: netChange[k] > 0 ? '#16a34a' : netChange[k] < 0 ? '#ef4444' : 'var(--text3)' }}
               >
-                {netChange[k] > 0 ? '+' : ''}{netChange[k].toLocaleString('ru-RU')} га
+                {netChange[k] > 0 ? '+' : ''}{formatNumber(netChange[k])} {t('unit.ha')}
               </span>
             </div>
           ))}
@@ -120,22 +109,23 @@ function ChangeLulcBars({ matrix, netChange, periodBefore, periodAfter }) {
 }
 
 export default function ChangeStatsPanel({ stats, loading, error }) {
+  const { t, formatNumber } = useI18n()
   if (!loading && !error && !stats) return null
 
   const hasNoisyTop = stats?.ml_transitions?.top_changes?.some((t) => isNoisyPair(t.from, t.to))
-  const beforeLabel = periodYear(stats?.period_before, 'До')
-  const afterLabel = periodYear(stats?.period_after, 'После')
+  const beforeLabel = periodYear(stats?.period_before, t('change.before'))
+  const afterLabel = periodYear(stats?.period_after, t('change.after'))
 
   return (
     <div className="change-stats">
-      <div className="section-label" style={{ marginTop: 20 }}>📊 Изменения {beforeLabel} → {afterLabel}</div>
+      <div className="section-label" style={{ marginTop: 20 }}>📊 {t('change.section', { before: beforeLabel, after: afterLabel })}</div>
 
       {loading && (
         <div className="zone-loading">
           <span className="ai-loading">
             <span className="dot-1">.</span><span className="dot-2">.</span><span className="dot-3">.</span>
           </span>
-          <span>Анализируем изменения...</span>
+          <span>{t('change.loading')}</span>
         </div>
       )}
 
@@ -144,29 +134,29 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
       {!loading && !error && stats && (
         <>
           <div className="zone-area">
-            Площадь: <strong>{stats.area_ha.toLocaleString('ru-RU')} га</strong>
-            <span className="zone-area-px"> ({stats.pixel_count.toLocaleString('ru-RU')} пикс)</span>
+            {t('zone.area')} <strong>{formatNumber(stats.area_ha)} {t('unit.ha')}</strong>
+            <span className="zone-area-px"> ({formatNumber(stats.pixel_count)} {t('unit.pixels')})</span>
           </div>
 
           <div className="zone-block">
-            <div className="zone-block-title">Индексы</div>
+            <div className="zone-block-title">{t('zone.indices')}</div>
             <div className="change-index-list">
               {INDEX_ORDER.filter((k) => stats.indices?.[k]).map((key) => {
                 const s = stats.indices[key]
-                const [code, label] = INDEX_LABELS[key]
+                const code = INDEX_LABELS[key]
                 const pctChange = s.mean_before ? (s.delta / Math.abs(s.mean_before)) * 100 : null
                 return (
                   <div className="change-index-row" key={key}>
                     <div className="change-index-head">
-                      <span className="index-name">{label} <span className="index-code">{code}</span></span>
+                      <span className="index-name">{t(`index.${key}`)} <span className="index-code">{code}</span></span>
                       <span className="change-index-delta" style={{ color: directionColor(s.direction) }}>
                         {directionArrow(s.direction)} {s.delta > 0 ? '+' : ''}{s.delta.toFixed(3)}
                         {pctChange != null && ` (${pctChange > 0 ? '+' : ''}${pctChange.toFixed(0)}%)`}
                       </span>
                     </div>
                     <div className="change-index-sub">
-                      было: {s.mean_before.toFixed(3)} &nbsp; стало: {s.mean_after.toFixed(3)}
-                      &nbsp;·&nbsp; значимо на {s.significant_pct.toFixed(1)}% площади
+                      {t('change.before')}: {s.mean_before.toFixed(3)} &nbsp; {t('change.after')}: {s.mean_after.toFixed(3)}
+                      &nbsp;·&nbsp; {t('change.areaSignificant', { percent: s.significant_pct.toFixed(1) })}
                     </div>
                   </div>
                 )
@@ -176,22 +166,22 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
 
           {stats.ml_transitions && (
             <div className="zone-block">
-              <div className="zone-block-title">Классификация земель</div>
+              <div className="zone-block-title">{t('change.landTransitions')}</div>
 
               {stats.ml_transitions.top_changes?.length > 0 && (
                 <div className="change-top-list">
-                  {stats.ml_transitions.top_changes.map((t, i) => (
+                  {stats.ml_transitions.top_changes.map((transition, i) => (
                     <div key={i}>
                       <div className="change-top-row">
-                        <span className="change-top-icon">{LULC_ICONS[t.from] || ''}→{LULC_ICONS[t.to] || ''}</span>
+                        <span className="change-top-icon">{LULC_ICONS[transition.from] || ''}→{LULC_ICONS[transition.to] || ''}</span>
                         <span className="change-top-name">
-                          {LULC_LABELS_RU[t.from] || t.from} → {LULC_LABELS_RU[t.to] || t.to}
+                          {t(`lulc.${transition.from}`)} → {t(`lulc.${transition.to}`)}
                         </span>
-                        <span className="change-top-area">{t.area_ha.toLocaleString('ru-RU')} га</span>
+                        <span className="change-top-area">{formatNumber(transition.area_ha)} {t('unit.ha')}</span>
                       </div>
-                      {isNoisyPair(t.from, t.to) && (
+                      {isNoisyPair(transition.from, transition.to) && (
                         <div className="change-disclaimer">
-                          ⚠️ Переходы между застройкой и голой почвой могут содержать шум классификатора — рекомендуется перекрёстная проверка
+                          ⚠️ {t('change.noiseWarning')}
                         </div>
                       )}
                     </div>
@@ -201,11 +191,11 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
 
               {!hasNoisyTop && (stats.ml_transitions.matrix?.urban?.bare_soil > 0 || stats.ml_transitions.matrix?.bare_soil?.urban > 0) && (
                 <div className="change-disclaimer">
-                  ⚠️ Переходы между застройкой и голой почвой могут содержать шум классификатора — рекомендуется перекрёстная проверка
+                  ⚠️ {t('change.noiseWarning')}
                 </div>
               )}
 
-              <div className="change-block-subtitle">Площадь по классам: было vs стало</div>
+              <div className="change-block-subtitle">{t('change.classArea')}</div>
               <ChangeLulcBars
                 matrix={stats.ml_transitions.matrix}
                 netChange={stats.ml_transitions.net_change_ha}
@@ -217,7 +207,7 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
 
           {stats.groq_analysis && (
             <div className="ai-block">
-              <div className="ai-header"><div className="ai-pulse" /><span>AI — анализ изменений</span></div>
+              <div className="ai-header"><div className="ai-pulse" /><span>{t('change.ai')}</span></div>
               <div className="ai-text">{stats.groq_analysis}</div>
             </div>
           )}

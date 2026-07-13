@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { tileUrl } from '../api'
+import { useI18n } from '../i18n.jsx'
 
 // Same 7 physical indices the single-map view offers — "satellite" isn't a
 // period-tied tile layer (it's the basemap), so it doesn't apply here.
@@ -150,6 +151,7 @@ export default function SplitMapView({
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
   onPointClick, onMouseMove, onExitSplitMode,
 }) {
+  const { t, periodLabel } = useI18n()
   const containerRef = useRef(null)
   const leftElRef  = useRef(null)
   const rightElRef = useRef(null)
@@ -441,11 +443,11 @@ export default function SplitMapView({
     rightMapRef.current?.resize()
   }, [sliderPct])
 
-  const leftLabel  = periods.find((p) => p.period_id === leftPeriod)?.label  || leftPeriod
-  const rightLabel = periods.find((p) => p.period_id === rightPeriod)?.label || rightPeriod
+  const leftLabel  = periodLabel(periods.find((p) => p.period_id === leftPeriod) || leftPeriod)
+  const rightLabel = periodLabel(periods.find((p) => p.period_id === rightPeriod) || rightPeriod)
 
   return (
-    <section className="map-section split-view" id="map-workspace" tabIndex={-1} aria-label="Сравнение двух периодов" ref={containerRef}>
+    <section className="map-section split-view" id="map-workspace" tabIndex={-1} aria-label={t('compare.aria')} ref={containerRef}>
       <div className="split-pane split-pane-left" ref={leftElRef} />
       <div className="split-pane split-pane-right" style={{ clipPath: `inset(0 0 0 ${sliderPct}%)` }} ref={rightElRef} />
 
@@ -456,7 +458,7 @@ export default function SplitMapView({
         onKeyDown={handleDividerKeyDown}
         role="slider"
         tabIndex={0}
-        aria-label="Положение разделителя периодов"
+        aria-label={t('compare.divider')}
         aria-valuemin={6}
         aria-valuemax={94}
         aria-valuenow={Math.round(sliderPct)}
@@ -469,17 +471,17 @@ export default function SplitMapView({
       </div>
 
       <div className="split-topbar">
-        <select aria-label="Период слева" value={leftPeriod || ''} onChange={(e) => onLeftPeriodChange(e.target.value)}>
-          {periods.map((p) => <option key={p.period_id} value={p.period_id}>{p.label}</option>)}
+        <select aria-label={t('compare.leftPeriod')} value={leftPeriod || ''} onChange={(e) => onLeftPeriodChange(e.target.value)}>
+          {periods.map((p) => <option key={p.period_id} value={p.period_id}>{periodLabel(p)}</option>)}
         </select>
-        <select aria-label="Индекс слева" value={leftIndex} onChange={(e) => onLeftIndexChange(e.target.value)}>
+        <select aria-label={t('compare.leftIndex')} value={leftIndex} onChange={(e) => onLeftIndexChange(e.target.value)}>
           {INDEX_OPTIONS.map((opt) => <option key={opt.key} value={opt.key}>{opt.code}</option>)}
         </select>
         <span className="split-topbar-arrow">◄──►</span>
-        <select aria-label="Период справа" value={rightPeriod || ''} onChange={(e) => onRightPeriodChange(e.target.value)}>
-          {periods.map((p) => <option key={p.period_id} value={p.period_id}>{p.label}</option>)}
+        <select aria-label={t('compare.rightPeriod')} value={rightPeriod || ''} onChange={(e) => onRightPeriodChange(e.target.value)}>
+          {periods.map((p) => <option key={p.period_id} value={p.period_id}>{periodLabel(p)}</option>)}
         </select>
-        <select aria-label="Индекс справа" value={rightIndex} onChange={(e) => onRightIndexChange(e.target.value)}>
+        <select aria-label={t('compare.rightIndex')} value={rightIndex} onChange={(e) => onRightIndexChange(e.target.value)}>
           {INDEX_OPTIONS.map((opt) => <option key={opt.key} value={opt.key}>{opt.code}</option>)}
         </select>
       </div>
@@ -487,15 +489,15 @@ export default function SplitMapView({
       <div className="split-label split-label-left">{leftLabel} · {leftIndex.toUpperCase()}</div>
       <div className="split-label split-label-right">{rightLabel} · {rightIndex.toUpperCase()}</div>
 
-      <div className="map-toolbar" role="toolbar" aria-label="Управление картами сравнения">
-        <button type="button" className="map-tool-btn" title="Приближение" aria-label="Приблизить обе карты" onClick={() => leftMapRef.current?.zoomIn()}>+</button>
-        <button type="button" className="map-tool-btn" title="Отдаление" aria-label="Отдалить обе карты" onClick={() => leftMapRef.current?.zoomOut()}>−</button>
+      <div className="map-toolbar" role="toolbar" aria-label={t('compare.toolbar')}>
+        <button type="button" className="map-tool-btn" title={t('compare.zoomIn')} aria-label={t('compare.zoomIn')} onClick={() => leftMapRef.current?.zoomIn()}>+</button>
+        <button type="button" className="map-tool-btn" title={t('compare.zoomOut')} aria-label={t('compare.zoomOut')} onClick={() => leftMapRef.current?.zoomOut()}>−</button>
         <div className="map-tool-sep" />
         <button
           type="button"
           className="map-tool-btn active"
-          title="Выйти из режима сравнения"
-          aria-label="Выйти из режима сравнения"
+          title={t('compare.exit')}
+          aria-label={t('compare.exit')}
           aria-pressed="true"
           onClick={onExitSplitMode}
         >

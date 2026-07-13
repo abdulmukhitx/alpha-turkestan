@@ -1,25 +1,37 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
 import AnalysisPanel from './components/AnalysisPanel.jsx'
 import ChangeDetectionBar from './components/ChangeDetectionBar.jsx'
 import ForecastBar from './components/ForecastBar.jsx'
-import SplitMapView from './components/SplitMapView.jsx'
 import WorkspaceNav from './components/WorkspaceNav.jsx'
-import { fetchHealth, fetchMetadata, fetchPeriods, fetchPixel, fetchAnalysis, fetchZoneStats, fetchTransect, fetchChangeStats, fetchPointForecast } from './api'
+import AccountDialog from './components/AccountDialog.jsx'
+import ZoneMigrationDialog from './components/ZoneMigrationDialog.jsx'
+import {
+  createAccountZone, deleteAccount, deleteAccountZone, fetchAccountExport, fetchAccountZones,
+  confirmEmailVerification, fetchAnalysis, fetchChangeStats, fetchCurrentAccount, fetchHealth, fetchMetadata, fetchPeriods,
+  fetchPixel, fetchPointForecast, fetchTransect, fetchZoneStats, fetchZoneTimeSeries, importAccountZones,
+  loginAccount, logoutAccount, registerAccount, requestPasswordReset, resendEmailVerification, resetAccountPassword,
+  updateAccountPreferences, updateAccountProfile, updateAccountZone,
+} from './api'
+import { clearSavedZones, cloneGeometry, newZoneId, readSavedZones, writeSavedZones } from './zoneStorage.js'
+import { useI18n } from './i18n.jsx'
+
+const SplitMapView = lazy(() => import('./components/SplitMapView.jsx'))
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
 
 const BOOT_STEPS = [
-  [80,  'Подключение к серверу...'],
-  [260, 'Загрузка геоданных...'],
-  [460, 'Инициализация карты...'],
-  [640, 'Система готова'],
+  [80,  'boot.connect'],
+  [260, 'boot.geodata'],
+  [460, 'boot.map'],
+  [640, 'boot.ready'],
 ]
 
 export default function App() {
+  const { locale, setLocale, t } = useI18n()
   const [booting, setBooting] = useState(true)
   const [bootFadeOut, setBootFadeOut] = useState(false)
   const [bootMsg, setBootMsg] = useState(BOOT_STEPS[0][1])
@@ -35,6 +47,17 @@ export default function App() {
   const [leftPanelOpen, setLeftPanelOpen] = useState(true)
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
 
+  const [account, setAccount] = useState(null)
+  const [accountLoading, setAccountLoading] = useState(true)
+  const [accountDialogOpen, setAccountDialogOpen] = useState(false)
+  const [accountDialogView, setAccountDialogView] = useState('login')
+  const [accountDialogNotice, setAccountDialogNotice] = useState('')
+  const [accountDialogError, setAccountDialogError] = useState('')
+  const [passwordResetToken, setPasswordResetToken] = useState('')
+  const [pendingLocalZones, setPendingLocalZones] = useState(null)
+  const [migrationLoading, setMigrationLoading] = useState(false)
+  const [migrationError, setMigrationError] = useState(null)
+
   const [point, setPixelPoint] = useState(null)
   const [pixel, setPixel] = useState(null)
   const [aiText, setAiText] = useState('')
@@ -46,10 +69,19 @@ export default function App() {
   const [zoneStats, setZoneStats] = useState(null)
   const [zoneLoading, setZoneLoading] = useState(false)
   const [zoneError, setZoneError] = useState(null)
+  const [zoneTimeSeries, setZoneTimeSeries] = useState(null)
+  const [zoneTimeSeriesLoading, setZoneTimeSeriesLoading] = useState(false)
+  const [zoneTimeSeriesError, setZoneTimeSeriesError] = useState(null)
   const [zoneContext, setZoneContext] = useState({ period: '2025_summer', layer: 'ndvi', pane: 'main' })
   const [clearSignal, setClearSignal] = useState(0)
   const [finishSignal, setFinishSignal] = useState(0)
   const [drawPointCount, setDrawPointCount] = useState(0)
+  const [savedZones, setSavedZones] = useState(readSavedZones)
+  const [activeZoneId, setActiveZoneId] = useState(null)
+  const [zoneDirty, setZoneDirty] = useState(false)
+  const [zoneEditMode, setZoneEditMode] = useState(false)
+  const [zoneStorageError, setZoneStorageError] = useState(null)
+  const [zoneFocusSignal, setZoneFocusSignal] = useState(0)
 
   const [lineDrawMode, setLineDrawMode] = useState(false)
   const [transectLine, setTransectLine] = useState(null)
@@ -95,6 +127,7 @@ export default function App() {
 
   const requestIdRef = useRef(0)
   const zoneReqIdRef = useRef(0)
+  const zoneTimeSeriesReqIdRef = useRef(0)
   const transectReqIdRef = useRef(0)
   const changeReqIdRef = useRef(0)
   const forecastReqIdRef = useRef(0)
@@ -112,6 +145,8 @@ export default function App() {
 
   useEffect(() => {
     refreshData()
+    initializeAccount()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // default change-detection period pick: earliest -> latest, once periods load
@@ -205,6 +240,174 @@ export default function App() {
       .catch(() => setPeriods([]))
   }
 
+  function applyAccountPreferences(preferences = {}) {
+    if (preferences.locale) setLocale(preferences.locale)
+    if (preferences.default_layer) setActiveLayer(preferences.default_layer)
+    if (preferences.default_period) setPeriod(preferences.default_period)
+    if (typeof preferences.default_opacity === 'number') setOpacity(preferences.default_opacity)
+    if (typeof preferences.left_panel_open === 'boolean') setLeftPanelOpen(preferences.left_panel_open)
+    if (typeof preferences.right_panel_open === 'boolean') setRightPanelOpen(preferences.right_panel_open)
+  }
+
+  async function activateAccountSession(session, { offerMigration = true } = {}) {
+    const localZones = readSavedZones()
+    const result = await fetchAccountZones()
+    setAccount(session)
+    setSavedZones(result.zones || [])
+    setActiveZoneId(null)
+    setZoneDirty(false)
+    setZoneStorageError(null)
+    applyAccountPreferences(session.preferences)
+    if (offerMigration && localZones.length) {
+      setPendingLocalZones(localZones)
+      setMigrationError(null)
+    }
+    return session
+  }
+
+  async function restoreAccount() {
+    try {
+      const session = await fetchCurrentAccount()
+      if (session) await activateAccountSession(session)
+    } catch (error) {
+      setZoneStorageError(`${t('error.accountLoad')}: ${error.message || t('common.error.server')}`)
+    } finally {
+      setAccountLoading(false)
+    }
+  }
+
+  function clearAccountLinkQuery() {
+    const url = new URL(window.location.href)
+    url.searchParams.delete('verify_email')
+    url.searchParams.delete('reset_password')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  }
+
+  async function initializeAccount() {
+    const params = new URLSearchParams(window.location.search)
+    const verificationToken = params.get('verify_email')
+    const resetToken = params.get('reset_password')
+    if (verificationToken) {
+      try {
+        const session = await confirmEmailVerification(verificationToken)
+        await activateAccountSession(session, { offerMigration: false })
+        setAccountDialogView('profile')
+        setAccountDialogNotice(t('account.verifySuccess'))
+        setAccountDialogError('')
+        setAccountDialogOpen(true)
+      } catch (error) {
+        setAccountDialogView('login')
+        setAccountDialogNotice('')
+        setAccountDialogError(error.code ? t(error.code) : (error.message || t('error.verification')))
+        setAccountDialogOpen(true)
+      } finally {
+        clearAccountLinkQuery()
+        setAccountLoading(false)
+      }
+      return
+    }
+    if (resetToken) {
+      setPasswordResetToken(resetToken)
+      setAccountDialogView('reset')
+      setAccountDialogOpen(true)
+      clearAccountLinkQuery()
+      setAccountLoading(false)
+      return
+    }
+    await restoreAccount()
+  }
+
+  async function handleLogin(credentials) {
+    const session = await loginAccount(credentials)
+    await activateAccountSession(session)
+    setAccountDialogOpen(false)
+    return session
+  }
+
+  async function handleRegister(details) {
+    const session = await registerAccount(details)
+    await activateAccountSession(session)
+    return session
+  }
+
+  async function handleSaveProfile(displayName, preferences) {
+    await updateAccountProfile(displayName)
+    const session = await updateAccountPreferences(preferences)
+    setAccount(session)
+    applyAccountPreferences(session.preferences)
+    return session
+  }
+
+  async function handleLocaleChange(nextLocale) {
+    if (!account) return
+    try {
+      const session = await updateAccountPreferences({ ...account.preferences, locale: nextLocale })
+      setAccount(session)
+    } catch (error) {
+      setZoneStorageError(error.message || t('error.profileSave'))
+    }
+  }
+
+  async function handleForgotPassword(details) {
+    return requestPasswordReset(details)
+  }
+
+  async function handleResetPassword(details) {
+    const session = await resetAccountPassword(details)
+    setPasswordResetToken('')
+    setAccountDialogNotice(t('account.passwordReset'))
+    await activateAccountSession(session, { offerMigration: false })
+    return session
+  }
+
+  async function handleResendVerification() {
+    return resendEmailVerification()
+  }
+
+  async function handleLogout() {
+    await logoutAccount()
+    setAccount(null)
+    setSavedZones(readSavedZones())
+    setActiveZoneId(null)
+    setZoneDirty(false)
+    setPendingLocalZones(null)
+    setMigrationError(null)
+    setAccountDialogOpen(false)
+  }
+
+  async function handleDeleteAccount(password) {
+    await deleteAccount(password)
+    setAccount(null)
+    setSavedZones(readSavedZones())
+    setActiveZoneId(null)
+    setZoneDirty(false)
+    setPendingLocalZones(null)
+    setAccountDialogOpen(false)
+  }
+
+  async function handleImportLocalZones() {
+    if (!pendingLocalZones?.length) return
+    setMigrationLoading(true)
+    setMigrationError(null)
+    try {
+      const result = await importAccountZones(pendingLocalZones)
+      setSavedZones(result.zones || [])
+      clearSavedZones()
+      setPendingLocalZones(null)
+    } catch (error) {
+      setMigrationError(error.message || t('error.migration'))
+    } finally {
+      setMigrationLoading(false)
+    }
+  }
+
+  function openAccountDialog() {
+    setAccountDialogView(account ? 'profile' : 'login')
+    setAccountDialogNotice('')
+    setAccountDialogError('')
+    setAccountDialogOpen(true)
+  }
+
   async function runForecastPoint(lat, lng, index = activeLayer, targetYear = forecastYear) {
     const forecastIndex = index === 'satellite' ? 'ndvi' : index
     setPixelPoint({ lat, lng, period: `forecast_${targetYear}`, layer: forecastIndex, pane: 'main' })
@@ -219,7 +422,7 @@ export default function App() {
       setForecastResult(result)
     } catch (e) {
       if (forecastReqIdRef.current !== reqId) return
-      setForecastError(e.message || 'Не удалось рассчитать линейный прогноз')
+      setForecastError(e.message || t('error.forecast'))
     } finally {
       if (forecastReqIdRef.current === reqId) setForecastLoading(false)
     }
@@ -250,13 +453,13 @@ export default function App() {
       setPixel(px)
     } catch (e) {
       if (requestIdRef.current !== reqId) return
-      setAiError(e.message || 'Не удалось получить спутниковые данные для этой точки')
+      setAiError(e.message || t('error.pixel'))
       setAiLoading(false)
       return
     }
 
     if (px.demo) {
-      setAiError('Показаны демонстрационные данные — они не являются спутниковыми измерениями.')
+      setAiError(t('analysis.demo'))
       setAiLoading(false)
       return
     }
@@ -265,15 +468,32 @@ export default function App() {
       const analysis = await fetchAnalysis({
         lat, lon: lng, period: target.period,
         ndvi: px.ndvi, ndwi: px.ndwi, ndre: px.ndre, ndmi: px.ndmi, bsi: px.bsi, savi: px.savi, nbr: px.nbr,
-        ml_class: px.ml_class, ml_class_ru: px.ml_class_ru, ml_confidence: px.ml_confidence,
+        ml_class: px.ml_class, ml_class_ru: px.ml_class_ru, ml_confidence: px.ml_confidence, locale,
       })
       if (requestIdRef.current !== reqId) return
-      setAiText(analysis.analysis || 'Анализ недоступен')
+      setAiText(analysis.analysis || t('error.analysisUnavailable'))
     } catch (e) {
       if (requestIdRef.current !== reqId) return
-      setAiError(`Спутниковые индексы получены, но AI-анализ недоступен: ${e.message || 'ошибка сервиса'}`)
+      setAiError(t('error.aiUnavailable', { message: e.message || t('common.error.server') }))
     } finally {
       if (requestIdRef.current === reqId) setAiLoading(false)
+    }
+  }
+
+  async function runZoneTimeSeries(geometry) {
+    setZoneTimeSeries(null)
+    setZoneTimeSeriesError(null)
+    setZoneTimeSeriesLoading(true)
+    const reqId = ++zoneTimeSeriesReqIdRef.current
+    try {
+      const result = await fetchZoneTimeSeries(geometry)
+      if (zoneTimeSeriesReqIdRef.current !== reqId) return
+      setZoneTimeSeries(result)
+    } catch (e) {
+      if (zoneTimeSeriesReqIdRef.current !== reqId) return
+      setZoneTimeSeriesError(e.message || t('error.timeseries'))
+    } finally {
+      if (zoneTimeSeriesReqIdRef.current === reqId) setZoneTimeSeriesLoading(false)
     }
   }
 
@@ -283,6 +503,7 @@ export default function App() {
       layer: context.layer || activeLayer,
       pane: context.pane || 'main',
     }
+    if (context.refreshTimeSeries !== false) runZoneTimeSeries(geometry)
     setRightPanelOpen(true)
     setZoneContext(target)
     setZoneStats(null)
@@ -296,7 +517,7 @@ export default function App() {
       setZoneStats(stats)
     } catch (e) {
       if (zoneReqIdRef.current !== reqId) return
-      setZoneError(e.message || 'Не удалось получить статистику зоны')
+      setZoneError(e.message || t('error.zoneStats'))
     } finally {
       if (zoneReqIdRef.current === reqId) setZoneLoading(false)
     }
@@ -306,9 +527,16 @@ export default function App() {
     setDrawMode(false)
     if (drawIntent === 'change') {
       zoneReqIdRef.current += 1
+      zoneTimeSeriesReqIdRef.current += 1
       setZonePolygon(null)
       setZoneStats(null)
       setZoneError(null)
+      setZoneTimeSeries(null)
+      setZoneTimeSeriesError(null)
+      setZoneTimeSeriesLoading(false)
+      setActiveZoneId(null)
+      setZoneDirty(false)
+      setZoneEditMode(false)
       setChangePolygon(geometry)
       runChangeStats(geometry, changePeriodBefore, changePeriodAfter)
     } else {
@@ -317,19 +545,165 @@ export default function App() {
       setChangeStats(null)
       setChangeError(null)
       setZonePolygon(geometry)
+      setActiveZoneId(null)
+      setZoneDirty(true)
+      setZoneEditMode(false)
       runZoneStats(geometry, context)
     }
   }
 
   function handleClearZone() {
     zoneReqIdRef.current += 1   // invalidate any in-flight request
+    zoneTimeSeriesReqIdRef.current += 1
     setZonePolygon(null)
     setZoneStats(null)
     setZoneError(null)
     setZoneLoading(false)
+    setZoneTimeSeries(null)
+    setZoneTimeSeriesError(null)
+    setZoneTimeSeriesLoading(false)
+    setActiveZoneId(null)
+    setZoneDirty(false)
+    setZoneEditMode(false)
     setDrawMode(false)
     setDrawPointCount(0)
     setClearSignal((n) => n + 1)
+  }
+
+  function commitSavedZones(next) {
+    try {
+      writeSavedZones(next)
+      setSavedZones(next)
+      setZoneStorageError(null)
+      return true
+    } catch {
+      setZoneStorageError(t('error.localStorage'))
+      return false
+    }
+  }
+
+  async function handleSaveZone(name) {
+    if (!zonePolygon) return false
+    const now = new Date().toISOString()
+    const zone = {
+      id: newZoneId(),
+      name,
+      geometry: cloneGeometry(zonePolygon),
+      createdAt: now,
+      updatedAt: now,
+    }
+    if (account) {
+      try {
+        const saved = await createAccountZone(zone)
+        setSavedZones((current) => [saved, ...current])
+        setActiveZoneId(saved.id)
+        setZoneDirty(false)
+        setZoneStorageError(null)
+        return true
+      } catch (error) {
+        setZoneStorageError(t('error.saveZone', { message: error.message || t('common.error.server') }))
+        return false
+      }
+    }
+    if (!commitSavedZones([...savedZones, zone])) return false
+    setActiveZoneId(zone.id)
+    setZoneDirty(false)
+    return true
+  }
+
+  async function handleUpdateZone() {
+    if (!zonePolygon || !activeZoneId) return false
+    if (account) {
+      try {
+        const updated = await updateAccountZone(activeZoneId, { geometry: cloneGeometry(zonePolygon) })
+        setSavedZones((current) => current.map((zone) => zone.id === activeZoneId ? updated : zone))
+        setZoneDirty(false)
+        setZoneStorageError(null)
+        return true
+      } catch (error) {
+        setZoneStorageError(t('error.updateZone', { message: error.message || t('common.error.server') }))
+        return false
+      }
+    }
+    const next = savedZones.map((zone) => zone.id === activeZoneId
+      ? { ...zone, geometry: cloneGeometry(zonePolygon), updatedAt: new Date().toISOString() }
+      : zone)
+    if (!commitSavedZones(next)) return false
+    setZoneDirty(false)
+    return true
+  }
+
+  function handleOpenZone(id) {
+    const zone = savedZones.find((item) => item.id === id)
+    if (!zone) return
+    const geometry = cloneGeometry(zone.geometry)
+    setSplitMode(false)
+    setChangeMode(false)
+    setForecastMode(false)
+    setDrawMode(false)
+    setLineDrawMode(false)
+    setDrawIntent('zone')
+    setChangePolygon(null)
+    setChangeStats(null)
+    setChangeError(null)
+    setZonePolygon(geometry)
+    setActiveZoneId(id)
+    setZoneDirty(false)
+    setZoneEditMode(false)
+    setZoneFocusSignal((value) => value + 1)
+    runZoneStats(geometry, { period, layer: activeLayer, pane: 'main' })
+  }
+
+  async function handleRenameZone(id, name) {
+    if (account) {
+      try {
+        const updated = await updateAccountZone(id, { name })
+        setSavedZones((current) => current.map((zone) => zone.id === id ? updated : zone))
+        setZoneStorageError(null)
+        return true
+      } catch (error) {
+        setZoneStorageError(t('error.renameZone', { message: error.message || t('common.error.server') }))
+        return false
+      }
+    }
+    const next = savedZones.map((zone) => zone.id === id
+      ? { ...zone, name, updatedAt: new Date().toISOString() }
+      : zone)
+    return commitSavedZones(next)
+  }
+
+  async function handleDeleteZone(id) {
+    const zone = savedZones.find((item) => item.id === id)
+    if (!zone || !window.confirm(t('saved.deleteConfirm', { name: zone.name }))) return false
+    if (account) {
+      try {
+        await deleteAccountZone(id)
+        setSavedZones((current) => current.filter((item) => item.id !== id))
+        setZoneStorageError(null)
+        if (id === activeZoneId) handleClearZone()
+        return true
+      } catch (error) {
+        setZoneStorageError(t('error.deleteZone', { message: error.message || t('common.error.server') }))
+        return false
+      }
+    }
+    const next = savedZones.filter((item) => item.id !== id)
+    if (!commitSavedZones(next)) return false
+    if (id === activeZoneId) handleClearZone()
+    return true
+  }
+
+  function handleZoneEdited(geometry) {
+    setZonePolygon(geometry)
+    setZoneDirty(true)
+    runZoneStats(geometry, { period, layer: activeLayer, pane: 'main' })
+  }
+
+  function toggleZoneEdit() {
+    if (!zonePolygon) return
+    setDrawMode(false)
+    setLineDrawMode(false)
+    setZoneEditMode((editing) => !editing)
   }
 
   function handleClearChange() {
@@ -348,6 +722,7 @@ export default function App() {
       if (!d) {
         setDrawIntent('zone')
         setLineDrawMode(false)
+        setZoneEditMode(false)
       }
       return !d
     })
@@ -367,7 +742,7 @@ export default function App() {
     setRightPanelOpen(true)
     if (!periodBefore || !periodAfter || periodBefore === periodAfter) {
       setChangeStats(null)
-      setChangeError(periodBefore === periodAfter ? 'Выберите разные периоды' : null)
+      setChangeError(periodBefore === periodAfter ? t('change.chooseDifferent') : null)
       setChangeLoading(false)
       return
     }
@@ -377,12 +752,12 @@ export default function App() {
 
     const reqId = ++changeReqIdRef.current
     try {
-      const stats = await fetchChangeStats(geometry, periodBefore, periodAfter)
+      const stats = await fetchChangeStats(geometry, periodBefore, periodAfter, locale)
       if (changeReqIdRef.current !== reqId) return
       setChangeStats(stats)
     } catch (e) {
       if (changeReqIdRef.current !== reqId) return
-      setChangeError(e.message || 'Не удалось получить статистику изменений')
+      setChangeError(e.message || t('error.changeStats'))
     } finally {
       if (changeReqIdRef.current === reqId) setChangeLoading(false)
     }
@@ -399,7 +774,7 @@ export default function App() {
     setTransectData(null)
     setTransectError(null)
     if (target.layer === 'satellite') {
-      setTransectError('Для профиля выберите спектральный индекс, а не спутниковый снимок.')
+      setTransectError(t('error.profileSatellite'))
       setTransectLoading(false)
       return
     }
@@ -412,7 +787,7 @@ export default function App() {
       setTransectData(data)
     } catch (e) {
       if (transectReqIdRef.current !== reqId) return
-      setTransectError(e.message || 'Не удалось получить профиль по линии')
+      setTransectError(e.message || t('error.transect'))
     } finally {
       if (transectReqIdRef.current === reqId) setTransectLoading(false)
     }
@@ -426,7 +801,7 @@ export default function App() {
 
   function toggleLineDraw() {
     if (activeLayer === 'satellite') {
-      setTransectError('Для профиля выберите спектральный индекс.')
+      setTransectError(t('error.profileIndex'))
       return
     }
     setLineDrawMode((drawing) => {
@@ -459,7 +834,7 @@ export default function App() {
     if (splitMode || forecastMode) return
     if (point?.pane === 'main') handlePointClick(point.lat, point.lng, { period, layer: activeLayer, pane: 'main' })
     if (transectLine) runTransect(transectLine, { period, layer: activeLayer, pane: 'main' })
-    if (zonePolygon) runZoneStats(zonePolygon, { period, layer: activeLayer, pane: 'main' })
+    if (zonePolygon) runZoneStats(zonePolygon, { period, layer: activeLayer, pane: 'main', refreshTimeSeries: false })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [period])
 
@@ -477,7 +852,7 @@ export default function App() {
 
   useEffect(() => {
     if (!splitMode || !splitLeftPeriod) return
-    const context = { period: splitLeftPeriod, layer: splitLeftIndex, pane: 'left' }
+    const context = { period: splitLeftPeriod, layer: splitLeftIndex, pane: 'left', refreshTimeSeries: false }
     if (point?.pane === 'left') handlePointClick(point.lat, point.lng, context)
     if (zonePolygon && zoneContext.pane === 'left') runZoneStats(zonePolygon, context)
     if (transectLine && transectContext.pane === 'left') runTransect(transectLine, context)
@@ -498,7 +873,7 @@ export default function App() {
 
   useEffect(() => {
     if (splitMode) return
-    const context = { period, layer: activeLayer, pane: 'main' }
+    const context = { period, layer: activeLayer, pane: 'main', refreshTimeSeries: false }
     if (point && point.pane !== 'main') handlePointClick(point.lat, point.lng, context)
     if (zonePolygon && zoneContext.pane !== 'main') runZoneStats(zonePolygon, context)
     if (transectLine && transectContext.pane !== 'main') runTransect(transectLine, context)
@@ -512,10 +887,12 @@ export default function App() {
     }
   }
 
+  const activeSavedZone = savedZones.find((zone) => zone.id === activeZoneId) || null
+
   const workspaceMode = splitMode ? 'compare' : changeMode ? 'change' : forecastMode ? 'forecast' : 'overview'
   const hasResults = !!(
     point || pixel || aiText || aiError || aiLoading ||
-    zoneStats || zoneLoading || zoneError ||
+    zoneStats || zoneLoading || zoneError || zoneTimeSeries || zoneTimeSeriesLoading || zoneTimeSeriesError ||
     transectData || transectLoading || transectError ||
     changeStats || changeLoading || changeError ||
     forecastResult || forecastLoading || forecastError
@@ -535,14 +912,14 @@ export default function App() {
 
   return (
     <div className="app-shell" style={shellInsets}>
-      <a className="skip-link" href="#map-workspace">Перейти к карте</a>
+      <a className="skip-link" href="#map-workspace">{t('app.skipMap')}</a>
       {booting && (
         <div id="boot-screen" className={bootFadeOut ? 'fade-out' : ''}>
           <div className="boot-inner">
             <div className="boot-title">GeoAI Platform</div>
-            <div className="boot-sub">Туркестанская область · Казахстан</div>
+            <div className="boot-sub">{t('brand.region')}</div>
             <div className="boot-bar"><div className="boot-fill" style={{ width: `${bootPct}%` }} /></div>
-            <div className="boot-status">{bootMsg}</div>
+            <div className="boot-status">{t(bootMsg)}</div>
           </div>
         </div>
       )}
@@ -556,6 +933,10 @@ export default function App() {
         period={period}
         onPeriodChange={setPeriod}
         periodDisabled={forecastMode}
+        account={account}
+        accountLoading={accountLoading}
+        onAccountOpen={openAccountDialog}
+        onLocaleChange={handleLocaleChange}
       />
 
       <WorkspaceNav
@@ -584,6 +965,18 @@ export default function App() {
             onFinishDraw={() => setFinishSignal((n) => n + 1)}
             hasZone={!!zonePolygon}
             drawPointCount={drawPointCount}
+            savedZones={savedZones}
+            activeZoneId={activeZoneId}
+            zoneDirty={zoneDirty}
+            zoneEditMode={zoneEditMode}
+            zoneStorageError={zoneStorageError}
+            savedZonesCloudMode={!!account}
+            onSaveZone={handleSaveZone}
+            onUpdateZone={handleUpdateZone}
+            onOpenZone={handleOpenZone}
+            onRenameZone={handleRenameZone}
+            onDeleteZone={handleDeleteZone}
+            onToggleZoneEdit={toggleZoneEdit}
             lineDrawMode={lineDrawMode}
             onToggleLineDraw={toggleLineDraw}
             lineDisabled={activeLayer === 'satellite'}
@@ -597,6 +990,7 @@ export default function App() {
         )}
 
         {splitMode ? (
+          <Suspense fallback={<div className="map-lazy-loading">{t('boot.map')}</div>}>
           <SplitMapView
             periods={periods}
             bounds={meta?.region?.bounds}
@@ -624,6 +1018,7 @@ export default function App() {
             onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
             onExitSplitMode={toggleSplitMode}
           />
+          </Suspense>
         ) : (
           <MapView
             activeLayer={activeLayer}
@@ -640,6 +1035,10 @@ export default function App() {
             clearSignal={clearSignal}
             finishSignal={finishSignal}
             onDrawPointsChange={setDrawPointCount}
+            zoneGeometry={zonePolygon}
+            zoneEditMode={zoneEditMode}
+            onPolygonEdited={handleZoneEdited}
+            zoneFocusSignal={zoneFocusSignal}
             lineDrawMode={lineDrawMode}
             onLineDrawn={handleLineDrawn}
             lineClearSignal={lineClearSignal}
@@ -667,6 +1066,10 @@ export default function App() {
             zoneGeometry={zonePolygon}
             activeLayer={zoneContext.layer}
             zonePeriod={zoneContext.period}
+            zoneName={activeSavedZone?.name || t('common.unnamed')}
+            zoneTimeSeries={zoneTimeSeries}
+            zoneTimeSeriesLoading={zoneTimeSeriesLoading}
+            zoneTimeSeriesError={zoneTimeSeriesError}
             transectData={transectData}
             transectLoading={transectLoading}
             transectError={transectError}
@@ -707,6 +1110,34 @@ export default function App() {
         targetYear={forecastYear}
         onTargetYearChange={setForecastYear}
         activeIndex={activeLayer}
+      />
+
+      <AccountDialog
+        open={accountDialogOpen}
+        initialView={accountDialogView}
+        initialNotice={accountDialogNotice}
+        initialError={accountDialogError}
+        resetToken={passwordResetToken}
+        account={account}
+        periods={periods}
+        onClose={() => { setAccountDialogOpen(false); setAccountDialogNotice(''); setAccountDialogError('') }}
+        onLogin={handleLogin}
+        onRegister={handleRegister}
+        onSaveProfile={handleSaveProfile}
+        onLogout={handleLogout}
+        onExport={fetchAccountExport}
+        onDeleteAccount={handleDeleteAccount}
+        onForgotPassword={handleForgotPassword}
+        onResetPassword={handleResetPassword}
+        onResendVerification={handleResendVerification}
+      />
+
+      <ZoneMigrationDialog
+        zones={pendingLocalZones}
+        loading={migrationLoading}
+        error={migrationError}
+        onImport={handleImportLocalZones}
+        onSkip={() => { setPendingLocalZones(null); setMigrationError(null) }}
       />
     </div>
   )

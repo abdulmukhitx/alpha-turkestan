@@ -1,14 +1,7 @@
 import { useState } from 'react'
 import { fetchZoneReport } from '../api'
+import { useI18n } from '../i18n.jsx'
 
-const LULC_LABELS = {
-  agriculture:       'Сельхоз угодья',
-  bare_soil:         'Голая почва',
-  dense_vegetation:  'Густая растительность',
-  sparse_vegetation: 'Разреженная растительность',
-  urban:             'Застройка',
-  water:             'Водные объекты',
-}
 const LULC_COLORS = {
   agriculture:       '#4ade80',
   bare_soil:         '#fbbf24',
@@ -20,15 +13,11 @@ const LULC_COLORS = {
 const LULC_ORDER = ['agriculture', 'urban', 'dense_vegetation', 'sparse_vegetation', 'bare_soil', 'water']
 
 const INDEX_LABELS = {
-  ndvi: ['NDVI', 'Растительность'],
-  ndre: ['NDRE', 'Стресс растений'],
-  ndwi: ['NDWI', 'Водные ресурсы'],
-  ndmi: ['NDMI', 'Влажность почвы'],
-  bsi:  ['BSI',  'Голая почва'],
+  ndvi: 'NDVI', ndre: 'NDRE', ndwi: 'NDWI', ndmi: 'NDMI', bsi: 'BSI',
 }
 const INDEX_ORDER = ['ndvi', 'ndre', 'ndwi', 'ndmi', 'bsi']
 
-const LAYER_NAMES = { ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI', bsi: 'BSI', satellite: 'Спутниковый снимок' }
+const LAYER_NAMES = { ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI', bsi: 'BSI' }
 
 const DARK   = [15, 23, 42]     // #0f172a
 const ACCENT = [59, 130, 246]   // #3B82F6
@@ -65,13 +54,13 @@ function sectionTitle(doc, title, pageW) {
   doc.setFont(FONT_NAME, 'normal')
 }
 
-function addFooter(doc, pageLabel) {
+function addFooter(doc, pageLabel, footerText) {
   const w = doc.internal.pageSize.getWidth()
   const h = doc.internal.pageSize.getHeight()
   doc.setFont(FONT_NAME, 'normal')
   doc.setFontSize(8)
   doc.setTextColor(...GRAY)
-  doc.text('GeoAI TKO | Мониторинг земель Туркестанской области', 14, h - 8)
+  doc.text(footerText, 14, h - 8)
   doc.text(pageLabel, w - 14, h - 8, { align: 'right' })
 }
 
@@ -79,10 +68,10 @@ function addFooter(doc, pageLabel) {
 // LLM output doesn't always follow the requested format exactly (markdown **bold**,
 // "Раздел N." instead of bare "N.", mixed case) — tolerate those variants rather than
 // silently falling back to one untitled blob.
-function splitAnalysisSections(text) {
-  if (!text) return [{ title: null, body: 'Анализ недоступен.' }]
+function splitAnalysisSections(text, fallback) {
+  if (!text) return [{ title: null, body: fallback }]
   const clean = text.replace(/\r\n/g, '\n')
-  const re = /(?:^|\n)[ \t]*\*{0,2}[ \t]*(?:Раздел[ \t]+)?(\d)\.[ \t]*([^\n*]+?)[ \t]*\*{0,2}[ \t]*\n/gi
+  const re = /(?:^|\n)[ \t]*\*{0,2}[ \t]*(?:(?:Раздел|Section|Бөлім)[ \t]+)?(\d)\.[ \t]*([^\n*]+?)[ \t]*\*{0,2}[ \t]*\n/gi
   const matches = [...clean.matchAll(re)]
   if (matches.length === 0) return [{ title: null, body: sanitizeBody(clean) }]
   const sections = []
@@ -104,18 +93,72 @@ function sanitizeBody(s) {
     .trim()
 }
 
-function periodText(period) {
-  const year = period?.match(/\d{4}/)?.[0]
-  return year ? `лето ${year}` : (period || 'период не указан')
+function safeFilePart(value) {
+  return (value || 'zone')
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 80) || 'zone'
 }
 
-function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, groqAnalysis, aiModel }) {
+function downloadBlob(content, type, filename) {
+  const blob = new Blob([content], { type })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+function csvCell(value, protectText = false) {
+  if (value == null) return ''
+  let text = String(value)
+  if (protectText && /^[=+\-@]/.test(text)) text = `'${text}`
+  if (/[",\r\n]/.test(text)) text = `"${text.replace(/"/g, '""')}"`
+  return text
+}
+
+function buildCsv({ zoneName, stats, period, timeSeries, unnamed }) {
+  const header = [
+    'zone_name', 'period_id', 'year', 'index', 'mean', 'min', 'max',
+    'std', 'p10', 'p90', 'area_ha', 'pixel_count',
+  ]
+  const observations = timeSeries?.observations?.length
+    ? timeSeries.observations
+    : [{
+        period_id: period,
+        year: period?.match(/\d{4}/)?.[0] || '',
+        area_ha: stats.area_ha,
+        pixel_count: stats.pixel_count,
+        indices: stats.indices,
+      }]
+  const rows = [header.join(',')]
+  observations.forEach((observation) => {
+    Object.entries(observation.indices || {}).forEach(([index, values]) => {
+      rows.push([
+        csvCell(zoneName || unnamed, true),
+        csvCell(observation.period_id),
+        csvCell(observation.year),
+        csvCell(index),
+        csvCell(values.mean), csvCell(values.min), csvCell(values.max),
+        csvCell(values.std), csvCell(values.p10), csvCell(values.p90),
+        csvCell(observation.area_ha), csvCell(observation.pixel_count),
+      ].join(','))
+    })
+  })
+  return `\uFEFF${rows.join('\r\n')}\r\n`
+}
+
+function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, groqAnalysis, aiModel, t, localeTag, formatNumber, periodLabel }) {
   const doc = new jsPDF({ unit: 'mm', format: 'a4' })
   registerFont(doc, fonts.VERDANA_BASE64, fonts.VERDANA_BOLD_BASE64)
 
   const pageW = doc.internal.pageSize.getWidth()
   const pageH = doc.internal.pageSize.getHeight()
-  const dateStr = new Date().toLocaleDateString('ru-RU', { year: 'numeric', month: 'long', day: 'numeric' })
+  const dateStr = new Date().toLocaleDateString(localeTag, { year: 'numeric', month: 'long', day: 'numeric' })
   const fileDateStr = new Date().toISOString().slice(0, 10)
 
   // ── Page 1 — Cover ──────────────────────────────────────────
@@ -130,21 +173,21 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
   doc.setFont(FONT_NAME, 'normal')
   doc.setFontSize(11)
   doc.setTextColor(...GRAY)
-  doc.text('Платформа мониторинга земель', pageW / 2, 80, { align: 'center' })
+  doc.text(t('report.platform'), pageW / 2, 80, { align: 'center' })
 
   doc.setFont(FONT_NAME, 'bold')
   doc.setFontSize(20)
   doc.setTextColor(...WHITE)
-  doc.text('ОТЧЁТ ПО ЗОНАЛЬНОМУ АНАЛИЗУ', pageW / 2, 120, { align: 'center' })
+  doc.text(t('report.title'), pageW / 2, 120, { align: 'center' })
 
   doc.setFont(FONT_NAME, 'normal')
   doc.setFontSize(11)
   doc.setTextColor(...GRAY)
   const coverLines = [
-    'Туркестанская область, Казахстан',
-    `Дата: ${dateStr}`,
-    `Площадь зоны: ${(stats.area_ha ?? 0).toLocaleString('ru-RU')} га`,
-    `Источник данных: Sentinel-2 L2A, ${periodText(period)}`,
+    t('report.region'),
+    `${t('report.date')}: ${dateStr}`,
+    `${t('report.zoneArea')}: ${formatNumber(stats.area_ha ?? 0)} ${t('unit.ha')}`,
+    `${t('report.dataSource')}: Sentinel-2 L2A, ${periodLabel(period)}`,
   ]
   coverLines.forEach((line, i) => doc.text(line, pageW / 2, 145 + i * 7, { align: 'center' }))
 
@@ -155,7 +198,7 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
 
   // ── Page 2 — Map ────────────────────────────────────────────
   doc.addPage()
-  sectionTitle(doc, 'КАРТА ЗОНЫ АНАЛИЗА', pageW)
+  sectionTitle(doc, t('report.mapTitle'), pageW)
 
   if (mapImageBase64) {
     const imgW = pageW - 28
@@ -164,25 +207,27 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
     let y = 32 + imgH + 12
     doc.setFontSize(10)
     doc.setTextColor(...TEXT)
-    doc.text(`Активный слой: ${LAYER_NAMES[activeLayer] || (activeLayer || 'NDVI').toUpperCase()}`, 14, y)
+    const activeLayerName = LAYER_NAMES[activeLayer] || (activeLayer === 'satellite' ? t('layer.satellite') : (activeLayer || 'NDVI').toUpperCase())
+    doc.text(`${t('report.activeLayer')}: ${activeLayerName}`, 14, y)
     y += 6
     doc.setTextColor(...GRAY)
-    doc.text('CRS: EPSG:32641 • Разрешение: 10м/пикс', 14, y)
+    doc.text(`CRS: EPSG:32641 • ${t('report.resolution')}`, 14, y)
     y += 6
-    doc.text(`Источник: Sentinel-2 L2A, ${periodText(period)}`, 14, y)
+    doc.text(`${t('report.source')}: Sentinel-2 L2A, ${periodLabel(period)}`, 14, y)
   } else {
     doc.setFontSize(10)
     doc.setTextColor(...GRAY)
-    doc.text('Скриншот карты недоступен.', 14, 40)
+    doc.text(t('report.mapUnavailable'), 14, 40)
   }
 
   // ── Page 3 — Indices + LULC ─────────────────────────────────
   doc.addPage()
-  sectionTitle(doc, 'СПЕКТРАЛЬНЫЕ ИНДЕКСЫ', pageW)
+  sectionTitle(doc, t('report.indicesTitle'), pageW)
   let y = 34
   INDEX_ORDER.filter((k) => stats.indices?.[k]).forEach((key) => {
     const s = stats.indices[key]
-    const [code, label] = INDEX_LABELS[key]
+    const code = INDEX_LABELS[key]
+    const label = t(`index.${key}`)
 
     doc.setFontSize(11)
     doc.setTextColor(...TEXT)
@@ -203,7 +248,7 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
     y += 7
     doc.setFontSize(8.5)
     doc.setTextColor(...GRAY)
-    doc.text(`Мин: ${s.min.toFixed(2)}   Среднее: ${s.mean.toFixed(3)}   Макс: ${s.max.toFixed(2)}`, 14, y)
+    doc.text(`${t('zone.min')}: ${s.min.toFixed(2)}   ${t('zone.average')}: ${s.mean.toFixed(3)}   ${t('zone.max')}: ${s.max.toFixed(2)}`, 14, y)
     y += 10
   })
 
@@ -215,7 +260,7 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
   doc.setFont(FONT_NAME, 'bold')
   doc.setFontSize(13)
   doc.setTextColor(...DARK)
-  doc.text('КЛАССИФИКАЦИЯ ЗЕМЕЛЬ', 14, y)
+  doc.text(t('zone.landClass').toLocaleUpperCase(localeTag), 14, y)
   doc.setFont(FONT_NAME, 'normal')
   y += 8
 
@@ -236,22 +281,22 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
     doc.setFillColor(...hexToRgb(LULC_COLORS[key]))
     doc.circle(16, y - 1.3, 1.6, 'F')
     doc.setTextColor(...TEXT)
-    doc.text(LULC_LABELS[key] || key, 22, y)
-    doc.text(`${v.area_ha.toLocaleString('ru-RU')} га`, pageW - 50, y, { align: 'right' })
+    doc.text(t(`lulc.${key}`), 22, y)
+    doc.text(`${formatNumber(v.area_ha)} ${t('unit.ha')}`, pageW - 50, y, { align: 'right' })
     doc.text(`${v.percent}%`, pageW - 14, y, { align: 'right' })
     y += 7
   })
 
   // ── Page 4+ — AI analysis ───────────────────────────────────
   doc.addPage()
-  sectionTitle(doc, 'АНАЛИТИЧЕСКОЕ ЗАКЛЮЧЕНИЕ', pageW)
+  sectionTitle(doc, t('report.analysisTitle'), pageW)
   doc.setFontSize(9)
   doc.setTextColor(...GRAY)
-  doc.text(`Сформировано AI (${aiModel || 'локальный анализ'})`, 14, 30)
+  doc.text(`${t('report.generatedBy')} (${aiModel || t('report.localAnalysis')})`, 14, 30)
 
   let yy = 40
   const maxWidth = pageW - 28
-  splitAnalysisSections(groqAnalysis).forEach(({ title, body }) => {
+  splitAnalysisSections(groqAnalysis, t('error.analysisUnavailable')).forEach(({ title, body }) => {
     if (title) {
       if (yy > pageH - 35) { doc.addPage(); yy = 20 }
       doc.setFont(FONT_NAME, 'bold')
@@ -282,24 +327,25 @@ function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, gr
   doc.setFont(FONT_NAME, 'normal')
   doc.setFontSize(8)
   doc.setTextColor(...GRAY)
-  doc.text(`GeoAI TKO • ${dateStr} • Автоматически сгенерировано на основе Sentinel-2`, pageW / 2, pageH - 14, { align: 'center' })
+  doc.text(`GeoAI TKO • ${dateStr} • ${t('report.autoGenerated')}`, pageW / 2, pageH - 14, { align: 'center' })
 
   const total = doc.internal.getNumberOfPages()
   for (let p = 2; p <= total; p++) {
     doc.setPage(p)
-    addFooter(doc, `Стр. ${p}`)
+    addFooter(doc, t('report.page', { page: p }), t('report.footer'))
   }
 
   doc.save(`GeoAI_TKO_Report_${fileDateStr}.pdf`)
 }
 
-export default function ZoneReport({ geometry, stats, activeLayer, period }) {
+export default function ZoneReport({ geometry, stats, activeLayer, period, zoneName, timeSeries }) {
+  const { locale, localeTag, t, formatNumber, periodLabel } = useI18n()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
   if (!stats) return null
 
-  async function handleDownload() {
+  async function handlePdfDownload() {
     setLoading(true)
     setError(null)
     try {
@@ -320,25 +366,65 @@ export default function ZoneReport({ geometry, stats, activeLayer, period }) {
       }
 
       const { groq_analysis, model } = await fetchZoneReport({
-        geometry, zoneStats: stats, activeLayer, period,
+        geometry, zoneStats: stats, activeLayer, period, locale,
       })
 
       buildPdf({
         jsPDF, fonts, stats, activeLayer, period, mapImageBase64,
-        groqAnalysis: groq_analysis, aiModel: model,
+        groqAnalysis: groq_analysis, aiModel: model, t, localeTag, formatNumber, periodLabel,
       })
     } catch (e) {
-      setError(e.message || 'Не удалось сформировать отчёт')
+      setError(e.message || t('report.errorPdf'))
     } finally {
       setLoading(false)
     }
   }
 
+  function handleCsvDownload() {
+    setError(null)
+    try {
+      const csv = buildCsv({ zoneName, stats, period, timeSeries, unnamed: t('common.unnamed') })
+      downloadBlob(csv, 'text/csv;charset=utf-8', `${safeFilePart(zoneName)}_analysis.csv`)
+    } catch (e) {
+      setError(e.message || t('report.errorCsv'))
+    }
+  }
+
+  function handleGeoJsonDownload() {
+    setError(null)
+    try {
+      const feature = {
+        type: 'Feature',
+        properties: {
+          name: zoneName || t('common.unnamed'),
+          exported_at: new Date().toISOString(),
+          period,
+          active_layer: activeLayer,
+          statistics: stats,
+          time_series: timeSeries?.observations || [],
+        },
+        geometry,
+      }
+      downloadBlob(
+        JSON.stringify(feature, null, 2),
+        'application/geo+json;charset=utf-8',
+        `${safeFilePart(zoneName)}_analysis.geojson`,
+      )
+    } catch (e) {
+      setError(e.message || t('report.errorGeojson'))
+    }
+  }
+
   return (
     <div className="zone-report">
-      <button className="zone-tool-btn zone-report-btn" onClick={handleDownload} disabled={loading}>
-        {loading ? 'Генерируем отчёт...' : '📄 Скачать отчёт'}
-      </button>
+      <div className="zone-block-title">{t('report.export')}</div>
+      <div className="zone-export-grid">
+        <button className="zone-tool-btn zone-report-btn" onClick={handlePdfDownload} disabled={loading}>
+          {loading ? t('report.preparing') : 'PDF'}
+        </button>
+        <button className="zone-tool-btn zone-export-btn" onClick={handleCsvDownload}>CSV</button>
+        <button className="zone-tool-btn zone-export-btn" onClick={handleGeoJsonDownload}>GeoJSON</button>
+      </div>
       {error && <div className="zone-error" style={{ marginTop: 8 }}>{error}</div>}
     </div>
   )

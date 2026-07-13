@@ -1,23 +1,15 @@
 import ZoneReport from './ZoneReport.jsx'
+import ZoneTimeSeries from './ZoneTimeSeries.jsx'
+import { useI18n } from '../i18n.jsx'
 
 const INDEX_LABELS = {
-  ndvi: ['NDVI', 'Растительность'],
-  ndwi: ['NDWI', 'Водные ресурсы'],
-  ndre: ['NDRE', 'Стресс растений'],
-  ndmi: ['NDMI', 'Влажность почвы'],
-  bsi:  ['BSI',  'Голая почва'],
-  savi: ['SAVI', 'Покрытие раст.'],
-  nbr:  ['NBR',  'Деградация'],
+  ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI', bsi: 'BSI', savi: 'SAVI', nbr: 'NBR',
 }
 const INDEX_ORDER = ['ndvi', 'ndre', 'ndwi', 'ndmi', 'bsi', 'savi', 'nbr']
 
 const LULC_LABELS = {
-  agriculture:       ['🟢', 'Сельхоз угодья'],
-  bare_soil:         ['🟡', 'Голая почва'],
-  dense_vegetation:  ['🌿', 'Густая раст.'],
-  sparse_vegetation: ['🌾', 'Разреж. раст.'],
-  urban:             ['🏙️', 'Застройка'],
-  water:             ['💧', 'Вода'],
+  agriculture: '🟢', bare_soil: '🟡', dense_vegetation: '🌿',
+  sparse_vegetation: '🌾', urban: '🏙️', water: '💧',
 }
 const LULC_COLORS = {
   agriculture:       '#4ade80',
@@ -51,19 +43,23 @@ function indexBarColor(mean, key) {
   return '#ef4444'
 }
 
-export default function ZoneStatsPanel({ stats, loading, error, geometry, activeLayer, period }) {
+export default function ZoneStatsPanel({
+  stats, loading, error, geometry, activeLayer, period, zoneName,
+  timeSeries, timeSeriesLoading, timeSeriesError,
+}) {
+  const { t, formatNumber } = useI18n()
   if (!loading && !error && !stats) return null
 
   return (
     <div className="zone-stats">
-      <div className="section-label" style={{ marginTop: 20 }}>Зональная статистика</div>
+      <div className="section-label" style={{ marginTop: 20 }}>{t('zone.stats')}</div>
 
       {loading && (
         <div className="zone-loading">
           <span className="ai-loading">
             <span className="dot-1">.</span><span className="dot-2">.</span><span className="dot-3">.</span>
           </span>
-          <span>Анализируем зону...</span>
+          <span>{t('zone.loading')}</span>
         </div>
       )}
 
@@ -74,29 +70,29 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
       {!loading && !error && stats && (
         <>
           <div className="zone-area">
-            Площадь: <strong>{stats.area_ha.toLocaleString('ru-RU')} га</strong>
-            <span className="zone-area-px"> ({stats.pixel_count.toLocaleString('ru-RU')} пикс)</span>
+            {t('zone.area')} <strong>{formatNumber(stats.area_ha)} {t('unit.ha')}</strong>
+            <span className="zone-area-px"> ({formatNumber(stats.pixel_count)} {t('unit.pixels')})</span>
           </div>
 
           <div className="zone-block">
-            <div className="zone-block-title">Индексы</div>
+            <div className="zone-block-title">{t('zone.indices')}</div>
             <div className="indices-list">
               {INDEX_ORDER.filter((k) => stats.indices[k]).map((key) => {
                 const s = stats.indices[key]
-                const [code, label] = INDEX_LABELS[key]
+                const code = INDEX_LABELS[key]
                 const pct = Math.max(2, Math.min(100, ((s.mean + 1) / 2) * 100))
                 const color = indexBarColor(s.mean, key)
                 return (
                   <div className="index-row" key={key}>
                     <div className="index-head">
-                      <span className="index-name">{label} <span className="index-code">{code}</span></span>
+                      <span className="index-name">{t(`index.${key}`)} <span className="index-code">{code}</span></span>
                       <span className="index-val" style={{ color }}>{s.mean.toFixed(3)}</span>
                     </div>
                     <div className="index-track">
                       <div className="index-fill" style={{ width: `${pct}%`, background: color }} />
                     </div>
                     <div className="zone-index-range">
-                      min: {s.min.toFixed(2)} &nbsp; max: {s.max.toFixed(2)} &nbsp; σ: {s.std.toFixed(2)}
+                      {t('zone.min')}: {s.min.toFixed(2)} &nbsp; {t('zone.max')}: {s.max.toFixed(2)} &nbsp; σ: {s.std.toFixed(2)}
                     </div>
                   </div>
                 )
@@ -104,9 +100,16 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
             </div>
           </div>
 
+          <ZoneTimeSeries
+            data={timeSeries}
+            loading={timeSeriesLoading}
+            error={timeSeriesError}
+            activeLayer={activeLayer}
+          />
+
           {stats.lulc && Object.keys(stats.lulc).length > 0 && (
             <div className="zone-block">
-              <div className="zone-block-title">Классификация земель</div>
+              <div className="zone-block-title">{t('zone.landClass')}</div>
 
               <div className="zone-lulc-bar">
                 {LULC_ORDER.filter((k) => stats.lulc[k]).map((key) => (
@@ -114,7 +117,7 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
                     key={key}
                     className="zone-lulc-seg"
                     style={{ width: `${stats.lulc[key].percent}%`, background: LULC_COLORS[key] }}
-                    title={`${LULC_LABELS[key]?.[1] || key}: ${stats.lulc[key].percent}%`}
+                    title={`${t(`lulc.${key}`)}: ${stats.lulc[key].percent}%`}
                   />
                 ))}
               </div>
@@ -122,12 +125,12 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
               <div className="zone-lulc-list">
                 {LULC_ORDER.filter((k) => stats.lulc[k] && stats.lulc[k].pixels > 0).map((key) => {
                   const v = stats.lulc[key]
-                  const [icon, label] = LULC_LABELS[key] || ['', key]
+                  const icon = LULC_LABELS[key] || ''
                   return (
                     <div className="zone-lulc-row" key={key}>
                       <span className="zone-lulc-icon">{icon}</span>
-                      <span className="zone-lulc-name">{label}</span>
-                      <span className="zone-lulc-area">{v.area_ha.toLocaleString('ru-RU')} га</span>
+                      <span className="zone-lulc-name">{t(`lulc.${key}`)}</span>
+                      <span className="zone-lulc-area">{formatNumber(v.area_ha)} {t('unit.ha')}</span>
                       <span className="zone-lulc-pct">{v.percent}%</span>
                     </div>
                   )
@@ -136,7 +139,14 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
             </div>
           )}
 
-          <ZoneReport geometry={geometry} stats={stats} activeLayer={activeLayer} period={period} />
+          <ZoneReport
+            geometry={geometry}
+            stats={stats}
+            activeLayer={activeLayer}
+            period={period}
+            zoneName={zoneName}
+            timeSeries={timeSeries}
+          />
         </>
       )}
     </div>

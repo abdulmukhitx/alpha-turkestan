@@ -1,4 +1,5 @@
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts'
+import { useI18n } from '../i18n.jsx'
 
 const LAYER_LABELS = {
   ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI', bsi: 'BSI', savi: 'SAVI', nbr: 'NBR',
@@ -15,29 +16,31 @@ const LAYER_COLORS = {
 }
 
 function CustomTooltip({ active, payload, label }) {
+  const { t, formatNumber } = useI18n()
   if (!active || !payload || !payload.length) return null
   const v = payload[0].value
   return (
     <div className="transect-tooltip">
-      <div>{Math.round(label).toLocaleString('ru-RU')} м</div>
-      <div>{v != null ? v.toFixed(3) : 'нет данных'}</div>
+      <div>{formatNumber(Math.round(label))} {t('unit.meters')}</div>
+      <div>{v != null ? v.toFixed(3) : t('transect.noData')}</div>
     </div>
   )
 }
 
 export default function TransectChart({ data, loading, error }) {
+  const { t, formatNumber } = useI18n()
   if (!loading && !error && !data) return null
 
   return (
     <div className="zone-stats">
-      <div className="section-label" style={{ marginTop: 20 }}>Профиль по линии</div>
+      <div className="section-label" style={{ marginTop: 20 }}>{t('transect.title')}</div>
 
       {loading && (
         <div className="zone-loading">
           <span className="ai-loading">
             <span className="dot-1">.</span><span className="dot-2">.</span><span className="dot-3">.</span>
           </span>
-          <span>Строим профиль...</span>
+          <span>{t('transect.loading')}</span>
         </div>
       )}
 
@@ -49,7 +52,7 @@ export default function TransectChart({ data, loading, error }) {
         <div className="zone-block transect-block">
           <div className="transect-header">
             <span className="zone-block-title">{LAYER_LABELS[data.layer] || data.layer.toUpperCase()}</span>
-            <span className="transect-length">Длина: {data.total_length_m.toLocaleString('ru-RU')} м</span>
+            <span className="transect-length">{t('transect.length')}: {formatNumber(data.total_length_m)} {t('unit.meters')}</span>
           </div>
 
           <div className="transect-chart-wrap">
@@ -85,9 +88,9 @@ export default function TransectChart({ data, loading, error }) {
           </div>
 
           <div className="transect-stats">
-            <span>Мин: <strong>{data.stats.min.toFixed(3)}</strong></span>
-            <span>Среднее: <strong>{data.stats.mean.toFixed(3)}</strong></span>
-            <span>Макс: <strong>{data.stats.max.toFixed(3)}</strong></span>
+            <span>{t('zone.min')}: <strong>{data.stats.min.toFixed(3)}</strong></span>
+            <span>{t('zone.average')}: <strong>{data.stats.mean.toFixed(3)}</strong></span>
+            <span>{t('zone.max')}: <strong>{data.stats.max.toFixed(3)}</strong></span>
           </div>
         </div>
       )}
