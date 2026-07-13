@@ -1,8 +1,5 @@
 import { useState } from 'react'
-import jsPDF from 'jspdf'
-import html2canvas from 'html2canvas'
 import { fetchZoneReport } from '../api'
-import { VERDANA_BASE64, VERDANA_BOLD_BASE64 } from '../assets/fonts/verdanaBase64.js'
 
 const LULC_LABELS = {
   agriculture:       'Сельхоз угодья',
@@ -45,10 +42,10 @@ const TEXT   = [30, 41, 59]
 // (that only sets PDF metadata, it has no effect on glyph rendering).
 const FONT_NAME = 'Verdana'
 
-function registerFont(doc) {
-  doc.addFileToVFS('Verdana-Regular.ttf', VERDANA_BASE64)
+function registerFont(doc, regularBase64, boldBase64) {
+  doc.addFileToVFS('Verdana-Regular.ttf', regularBase64)
   doc.addFont('Verdana-Regular.ttf', FONT_NAME, 'normal')
-  doc.addFileToVFS('Verdana-Bold.ttf', VERDANA_BOLD_BASE64)
+  doc.addFileToVFS('Verdana-Bold.ttf', boldBase64)
   doc.addFont('Verdana-Bold.ttf', FONT_NAME, 'bold')
   doc.setFont(FONT_NAME, 'normal')
 }
@@ -107,9 +104,14 @@ function sanitizeBody(s) {
     .trim()
 }
 
-function buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis }) {
+function periodText(period) {
+  const year = period?.match(/\d{4}/)?.[0]
+  return year ? `лето ${year}` : (period || 'период не указан')
+}
+
+function buildPdf({ jsPDF, fonts, stats, activeLayer, period, mapImageBase64, groqAnalysis, aiModel }) {
   const doc = new jsPDF({ unit: 'mm', format: 'a4' })
-  registerFont(doc)
+  registerFont(doc, fonts.VERDANA_BASE64, fonts.VERDANA_BOLD_BASE64)
 
   const pageW = doc.internal.pageSize.getWidth()
   const pageH = doc.internal.pageSize.getHeight()
@@ -142,14 +144,14 @@ function buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis }) {
     'Туркестанская область, Казахстан',
     `Дата: ${dateStr}`,
     `Площадь зоны: ${(stats.area_ha ?? 0).toLocaleString('ru-RU')} га`,
-    'Источник данных: Sentinel-2 L2A, 2023',
+    `Источник данных: Sentinel-2 L2A, ${periodText(period)}`,
   ]
   coverLines.forEach((line, i) => doc.text(line, pageW / 2, 145 + i * 7, { align: 'center' }))
 
   doc.setDrawColor(...GRAY)
   doc.line(pageW / 2 - 40, pageH - 30, pageW / 2 + 40, pageH - 30)
   doc.setFontSize(9)
-  doc.text('Powered by Sentinel-2 • Groq AI', pageW / 2, pageH - 22, { align: 'center' })
+  doc.text('Powered by Sentinel-2 • GeoAI', pageW / 2, pageH - 22, { align: 'center' })
 
   // ── Page 2 — Map ────────────────────────────────────────────
   doc.addPage()
@@ -167,7 +169,7 @@ function buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis }) {
     doc.setTextColor(...GRAY)
     doc.text('CRS: EPSG:32641 • Разрешение: 10м/пикс', 14, y)
     y += 6
-    doc.text('Источник: Sentinel-2 L2A, лето 2023', 14, y)
+    doc.text(`Источник: Sentinel-2 L2A, ${periodText(period)}`, 14, y)
   } else {
     doc.setFontSize(10)
     doc.setTextColor(...GRAY)
@@ -245,7 +247,7 @@ function buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis }) {
   sectionTitle(doc, 'АНАЛИТИЧЕСКОЕ ЗАКЛЮЧЕНИЕ', pageW)
   doc.setFontSize(9)
   doc.setTextColor(...GRAY)
-  doc.text('Сформировано Groq AI (llama3-8b-8192)', 14, 30)
+  doc.text(`Сформировано AI (${aiModel || 'локальный анализ'})`, 14, 30)
 
   let yy = 40
   const maxWidth = pageW - 28
@@ -291,7 +293,7 @@ function buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis }) {
   doc.save(`GeoAI_TKO_Report_${fileDateStr}.pdf`)
 }
 
-export default function ZoneReport({ geometry, stats, activeLayer }) {
+export default function ZoneReport({ geometry, stats, activeLayer, period }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -301,6 +303,13 @@ export default function ZoneReport({ geometry, stats, activeLayer }) {
     setLoading(true)
     setError(null)
     try {
+      const [pdfModule, canvasModule, fonts] = await Promise.all([
+        import('jspdf'),
+        import('html2canvas'),
+        import('../assets/fonts/verdanaBase64.js'),
+      ])
+      const jsPDF = pdfModule.default
+      const html2canvas = canvasModule.default
       const mapEl = document.getElementById('map')
       let mapImageBase64 = null
       if (mapEl) {
@@ -310,11 +319,14 @@ export default function ZoneReport({ geometry, stats, activeLayer }) {
         mapImageBase64 = canvas.toDataURL('image/png')
       }
 
-      const { groq_analysis } = await fetchZoneReport({
-        geometry, zoneStats: stats, activeLayer, mapImageBase64,
+      const { groq_analysis, model } = await fetchZoneReport({
+        geometry, zoneStats: stats, activeLayer, period,
       })
 
-      buildPdf({ stats, activeLayer, mapImageBase64, groqAnalysis: groq_analysis })
+      buildPdf({
+        jsPDF, fonts, stats, activeLayer, period, mapImageBase64,
+        groqAnalysis: groq_analysis, aiModel: model,
+      })
     } catch (e) {
       setError(e.message || 'Не удалось сформировать отчёт')
     } finally {

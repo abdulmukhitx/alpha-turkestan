@@ -30,6 +30,12 @@ const LULC_COLORS = {
 const LULC_ORDER = ['agriculture', 'dense_vegetation', 'sparse_vegetation', 'bare_soil', 'urban', 'water']
 
 function indexBarColor(mean, key) {
+  if (key === 'bsi') {
+    if (mean > 0.2) return '#dc2626'
+    if (mean > 0.1) return '#f97316'
+    if (mean > 0) return '#fbbf24'
+    return '#22c55e'
+  }
   if (key === 'savi') {
     if (mean > 0.15) return '#16a34a'
     if (mean >= 0) return '#eab308'
@@ -45,7 +51,7 @@ function indexBarColor(mean, key) {
   return '#ef4444'
 }
 
-export default function ZoneStatsPanel({ stats, loading, error, geometry, activeLayer }) {
+export default function ZoneStatsPanel({ stats, loading, error, geometry, activeLayer, period }) {
   if (!loading && !error && !stats) return null
 
   return (
@@ -130,7 +136,7 @@ export default function ZoneStatsPanel({ stats, loading, error, geometry, active
             </div>
           )}
 
-          <ZoneReport geometry={geometry} stats={stats} activeLayer={activeLayer} />
+          <ZoneReport geometry={geometry} stats={stats} activeLayer={activeLayer} period={period} />
         </>
       )}
     </div>

@@ -54,7 +54,11 @@ function isNoisyPair(from, to) {
   return (from === 'urban' && to === 'bare_soil') || (from === 'bare_soil' && to === 'urban')
 }
 
-function ChangeLulcBars({ matrix, netChange }) {
+function periodYear(period, fallback) {
+  return period?.match(/\d{4}/)?.[0] || period || fallback
+}
+
+function ChangeLulcBars({ matrix, netChange, periodBefore, periodAfter }) {
   if (!matrix) return null
 
   const beforeByClass = {}
@@ -71,7 +75,7 @@ function ChangeLulcBars({ matrix, netChange }) {
   return (
     <div className="change-lulc-bars">
       <div className="change-lulc-bar-row">
-        <span className="change-lulc-bar-label">2023</span>
+        <span className="change-lulc-bar-label">{periodYear(periodBefore, 'До')}</span>
         <div className="zone-lulc-bar">
           {LULC_ORDER.filter((k) => beforeByClass[k] > 0).map((k) => (
             <div
@@ -83,7 +87,7 @@ function ChangeLulcBars({ matrix, netChange }) {
         </div>
       </div>
       <div className="change-lulc-bar-row">
-        <span className="change-lulc-bar-label">2025</span>
+        <span className="change-lulc-bar-label">{periodYear(periodAfter, 'После')}</span>
         <div className="zone-lulc-bar">
           {LULC_ORDER.filter((k) => afterByClass[k] > 0).map((k) => (
             <div
@@ -119,10 +123,12 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
   if (!loading && !error && !stats) return null
 
   const hasNoisyTop = stats?.ml_transitions?.top_changes?.some((t) => isNoisyPair(t.from, t.to))
+  const beforeLabel = periodYear(stats?.period_before, 'До')
+  const afterLabel = periodYear(stats?.period_after, 'После')
 
   return (
     <div className="change-stats">
-      <div className="section-label" style={{ marginTop: 20 }}>📊 Изменения 2023 → 2025</div>
+      <div className="section-label" style={{ marginTop: 20 }}>📊 Изменения {beforeLabel} → {afterLabel}</div>
 
       {loading && (
         <div className="zone-loading">
@@ -200,7 +206,12 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
               )}
 
               <div className="change-block-subtitle">Площадь по классам: было vs стало</div>
-              <ChangeLulcBars matrix={stats.ml_transitions.matrix} netChange={stats.ml_transitions.net_change_ha} />
+              <ChangeLulcBars
+                matrix={stats.ml_transitions.matrix}
+                netChange={stats.ml_transitions.net_change_ha}
+                periodBefore={stats.period_before}
+                periodAfter={stats.period_after}
+              />
             </div>
           )}
 

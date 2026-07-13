@@ -1,24 +1,18 @@
-import { useEffect, useState } from 'react'
 import ZoneStatsPanel from './ZoneStatsPanel.jsx'
 import TransectChart from './TransectChart.jsx'
 import ChangeStatsPanel from './ChangeStatsPanel.jsx'
+import ForecastPanel from './ForecastPanel.jsx'
 
-function Typewriter({ text }) {
-  const [shown, setShown] = useState('')
-
-  useEffect(() => {
-    setShown('')
-    if (!text) return
-    let i = 0
-    const id = setInterval(() => {
-      i += 1
-      setShown(text.slice(0, i))
-      if (i >= text.length) clearInterval(id)
-    }, 18)
-    return () => clearInterval(id)
-  }, [text])
-
-  return <>{shown}</>
+function PanelHeader({ hasPoint, onClose }) {
+  return (
+    <div className="panel-header panel-header-row">
+      <div>
+        <span className="panel-eyebrow">{hasPoint ? 'Выбранная точка' : 'Данные и выводы'}</span>
+        <h2 className="panel-title">Результаты анализа</h2>
+      </div>
+      <button className="panel-close" type="button" onClick={onClose} aria-label="Скрыть панель результатов">×</button>
+    </div>
+  )
 }
 
 // order + Russian labels for the spectral indices panel
@@ -75,28 +69,42 @@ function indexColor(key, v) {
 
 export default function AnalysisPanel({
   point, pixel, aiText, loading, error,
-  zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer,
+  zoneStats, zoneLoading, zoneError, zoneGeometry, activeLayer, zonePeriod,
   transectData, transectLoading, transectError,
   changeStats, changeLoading, changeError,
+  forecastMode, forecastResult, forecastLoading, forecastError, forecastYear, forecastIndex,
+  onClose,
 }) {
+  if (forecastMode) {
+    return (
+      <ForecastPanel
+        point={point}
+        result={forecastResult}
+        loading={forecastLoading}
+        error={forecastError}
+        targetYear={forecastYear}
+        index={forecastIndex}
+        onClose={onClose}
+      />
+    )
+  }
+
   if (!point) {
     return (
-      <aside className="panel panel-right">
-        <div className="panel-header">
-          <span className="panel-eyebrow">AI-интерпретация</span>
-          <h2 className="panel-title">Анализ точки</h2>
-        </div>
+      <aside className="panel panel-right" id="analysis-panel" aria-label="Результаты анализа">
+        <PanelHeader hasPoint={false} onClose={onClose} />
         <div className="click-prompt">
           <svg className="click-icon" width="30" height="30" viewBox="0 0 32 32" fill="none">
             <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="1" strokeDasharray="3 2" opacity="0.5" />
             <circle cx="16" cy="16" r="6" stroke="currentColor" strokeWidth="1.5" />
             <circle cx="16" cy="16" r="2" fill="currentColor" />
           </svg>
-          <p className="click-text">Кликните на любую точку карты, чтобы получить AI-анализ этого места</p>
+          <strong>Выберите объект на карте</strong>
+          <p className="click-text">Кликните по точке или используйте инструменты зоны и профиля. Результаты появятся здесь.</p>
         </div>
         <ZoneStatsPanel
           stats={zoneStats} loading={zoneLoading} error={zoneError}
-          geometry={zoneGeometry} activeLayer={activeLayer}
+          geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
         />
         <TransectChart data={transectData} loading={transectLoading} error={transectError} />
         <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
@@ -105,11 +113,8 @@ export default function AnalysisPanel({
   }
 
   return (
-    <aside className="panel panel-right">
-      <div className="panel-header">
-        <span className="panel-eyebrow">AI-интерпретация</span>
-        <h2 className="panel-title">Анализ точки</h2>
-      </div>
+    <aside className="panel panel-right" id="analysis-panel" aria-label="Результаты анализа">
+      <PanelHeader hasPoint onClose={onClose} />
 
       <div className="result-location">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
@@ -133,6 +138,7 @@ export default function AnalysisPanel({
       )}
 
       <div className="section-label">Спектральные индексы</div>
+      {pixel?.demo && <div className="zone-error">Демонстрационные данные — не спутниковое измерение.</div>}
       <div className="indices-list">
         {INDICES.map(({ key, code, label }) => {
           const v = pixel ? (pixel[key] ?? null) : null
@@ -157,20 +163,20 @@ export default function AnalysisPanel({
           <div className="ai-pulse" />
           <span>AI — интерпретация</span>
         </div>
-        <div className="ai-text">
+        <div className="ai-text" aria-live="polite">
           {loading ? (
             <span className="ai-loading">
               <span className="dot-1">.</span><span className="dot-2">.</span><span className="dot-3">.</span>
             </span>
           ) : (
-            <Typewriter text={error || aiText || ''} />
+            error || aiText || ''
           )}
         </div>
       </div>
 
       <ZoneStatsPanel
         stats={zoneStats} loading={zoneLoading} error={zoneError}
-        geometry={zoneGeometry} activeLayer={activeLayer}
+        geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
       />
       <TransectChart data={transectData} loading={transectLoading} error={transectError} />
       <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />

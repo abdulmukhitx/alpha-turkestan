@@ -42,7 +42,7 @@ function makeMap(container, center, zoom) {
     style: baseStyle(),
     center,
     zoom,
-    attributionControl: false,
+    attributionControl: true,
     dragRotate: false,
     pitchWithRotate: false,
   })
@@ -66,10 +66,9 @@ function setDataLayer(map, index, period) {
 // per-pixel nodata mask. MapLibre's raster layers have no native "clip to
 // polygon" primitive, so the standard equivalent is an inverted mask: one
 // giant world-covering polygon with the oblast boundary punched out as a
-// hole, painted (nearly) opaque in the app's own background color, stacked
-// directly above the data layer. This hides data-layer *and* basemap outside
-// the boundary — MapLibre can't keep the raw basemap visible there without a
-// custom WebGL layer, so this "spotlight" look is the closest native match.
+// hole, painted (nearly) opaque, stacked directly above the data layer —
+// MapLibre can't keep the raw basemap visible there without a custom WebGL
+// layer, so this dark "spotlight" look is the closest native match.
 const WORLD_RING = [[-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]]
 
 function extractExteriorRings(geo) {
@@ -86,6 +85,24 @@ function extractExteriorRings(geo) {
   return rings
 }
 
+function pointInRing(lng, lat, ring) {
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]
+    const [xj, yj] = ring[j]
+    const intersects = ((yi > lat) !== (yj > lat)) &&
+      (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi)
+    if (intersects) inside = !inside
+  }
+  return inside
+}
+
+function insideBoundary(lng, lat, geo) {
+  if (!geo) return true
+  const rings = extractExteriorRings(geo)
+  return rings.length === 0 || rings.some((ring) => pointInRing(lng, lat, ring))
+}
+
 function invertedMaskGeoJSON(geo) {
   return {
     type: 'Feature', properties: {},
@@ -93,24 +110,15 @@ function invertedMaskGeoJSON(geo) {
   }
 }
 
-function setMaskLayer(map, geo) {
-  if (!map.isStyleLoaded() || !geo) return
-  const data = invertedMaskGeoJSON(geo)
-  if (map.getSource('mask')) {
-    map.getSource('mask').setData(data)
-    return
-  }
-  map.addSource('mask', { type: 'geojson', data })
+// Adds the boundary mask + white outline once clipGeo is available. Idempotent
+// source checks make repeated React effects safe while the load listener is
+// explicitly cleaned up when its dependencies change.
+function applyBoundaryMask(map, clipGeo) {
+  if (!clipGeo || map.getSource('mask')) return
+  map.addSource('mask', { type: 'geojson', data: invertedMaskGeoJSON(clipGeo) })
   map.addLayer({ id: 'mask-layer', type: 'fill', source: 'mask', paint: { 'fill-color': '#0D1219', 'fill-opacity': 0.92 } })
-}
 
-function setBoundaryLayer(map, geo) {
-  if (!map.isStyleLoaded() || !geo) return
-  if (map.getSource('boundary')) {
-    map.getSource('boundary').setData(geo)
-    return
-  }
-  map.addSource('boundary', { type: 'geojson', data: geo })
+  map.addSource('boundary', { type: 'geojson', data: clipGeo })
   map.addLayer({
     id: 'boundary-line', type: 'line', source: 'boundary',
     paint: { 'line-color': '#ffffff', 'line-width': 2, 'line-opacity': 0.9 },
@@ -121,6 +129,14 @@ function ensureDrawSources(map) {
   if (map.getSource('draw-points')) return
   map.addSource('draw-points', { type: 'geojson', data: emptyFC() })
   map.addSource('draw-line', { type: 'geojson', data: emptyFC() })
+  map.addSource('result-zone', { type: 'geojson', data: emptyFC() })
+  map.addSource('result-transect', { type: 'geojson', data: emptyFC() })
+  map.addLayer({ id: 'result-zone-fill', type: 'fill', source: 'result-zone',
+    paint: { 'fill-color': '#3B82F6', 'fill-opacity': 0.2 } })
+  map.addLayer({ id: 'result-zone-line', type: 'line', source: 'result-zone',
+    paint: { 'line-color': '#3B82F6', 'line-width': 2 } })
+  map.addLayer({ id: 'result-transect-line', type: 'line', source: 'result-transect',
+    paint: { 'line-color': '#3B82F6', 'line-width': 3, 'line-dasharray': [2, 2] } })
   map.addLayer({ id: 'draw-line-layer', type: 'line', source: 'draw-line',
     paint: { 'line-color': '#3B82F6', 'line-width': 2 } })
   map.addLayer({ id: 'draw-points-layer', type: 'circle', source: 'draw-points', paint: DRAW_POINT_PAINT })
@@ -141,6 +157,9 @@ export default function SplitMapView({
   const rightMapRef = useRef(null)
   const syncingRef = useRef(false)
   const [clipGeo, setClipGeo] = useState(undefined)
+  const clipGeoRef = useRef(clipGeo); clipGeoRef.current = clipGeo
+  const viewContextRef = useRef({ leftPeriod, leftIndex, rightPeriod, rightIndex })
+  viewContextRef.current = { leftPeriod, leftIndex, rightPeriod, rightIndex }
 
   const [sliderPct, setSliderPct] = useState(50)   // 0-100, % of container width
   const draggingRef = useRef(false)
@@ -177,9 +196,14 @@ export default function SplitMapView({
 
     left.on('click', (e) => {
       const { lng, lat } = e.lngLat
+      if (!insideBoundary(lng, lat, clipGeoRef.current)) return
       if (lineDrawModeRef.current) { addLinePoint(left, lng, lat); return }
       if (drawModeRef.current) { addDrawPoint(left, lng, lat); return }
-      callbacksRef.current.onPointClick?.(lat, lng)
+      callbacksRef.current.onPointClick?.(lat, lng, {
+        period: viewContextRef.current.leftPeriod,
+        layer: viewContextRef.current.leftIndex,
+        pane: 'left',
+      })
     })
     left.on('dblclick', (e) => {
       if (lineDrawModeRef.current) { e.preventDefault(); finishLineDraw(); return }
@@ -188,6 +212,18 @@ export default function SplitMapView({
       finishDraw()
     })
     left.on('mousemove', (e) => {
+      callbacksRef.current.onMouseMove?.(e.lngLat.lat, e.lngLat.lng)
+    })
+    right.on('click', (e) => {
+      const { lng, lat } = e.lngLat
+      if (!insideBoundary(lng, lat, clipGeoRef.current)) return
+      callbacksRef.current.onPointClick?.(lat, lng, {
+        period: viewContextRef.current.rightPeriod,
+        layer: viewContextRef.current.rightIndex,
+        pane: 'right',
+      })
+    })
+    right.on('mousemove', (e) => {
       callbacksRef.current.onMouseMove?.(e.lngLat.lat, e.lngLat.lng)
     })
 
@@ -226,11 +262,15 @@ export default function SplitMapView({
     if (!map) return
     const apply = () => {
       setDataLayer(map, leftIndex, leftPeriod)
-      if (clipGeo) { setMaskLayer(map, clipGeo); setBoundaryLayer(map, clipGeo) }
+      applyBoundaryMask(map, clipGeo)
       ensureDrawSources(map)
     }
-    if (map.isStyleLoaded()) apply()
-    else map.once('load', apply)
+    if (map.isStyleLoaded()) {
+      apply()
+      return
+    }
+    map.on('load', apply)
+    return () => map.off('load', apply)
   }, [leftIndex, leftPeriod, clipGeo])
 
   useEffect(() => {
@@ -238,29 +278,32 @@ export default function SplitMapView({
     if (!map) return
     const apply = () => {
       setDataLayer(map, rightIndex, rightPeriod)
-      if (clipGeo) { setMaskLayer(map, clipGeo); setBoundaryLayer(map, clipGeo) }
+      applyBoundaryMask(map, clipGeo)
+      ensureDrawSources(map)
     }
-    if (map.isStyleLoaded()) apply()
-    else map.once('load', apply)
+    if (map.isStyleLoaded()) {
+      apply()
+      return
+    }
+    map.on('load', apply)
+    return () => map.off('load', apply)
   }, [rightIndex, rightPeriod, clipGeo])
 
   // cursor + dblclick-zoom toggling for the interactive (left) map
   useEffect(() => {
     const map = leftMapRef.current
     if (!map) return
-    if (drawMode) { map.getCanvas().style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
-    else { map.getCanvas().style.cursor = ''; map.doubleClickZoom.enable(); clearDraw() }
-  }, [drawMode])
-  useEffect(() => {
-    const map = leftMapRef.current
-    if (!map) return
-    if (lineDrawMode) { map.getCanvas().style.cursor = 'crosshair'; map.doubleClickZoom.disable() }
-    else { map.getCanvas().style.cursor = ''; map.doubleClickZoom.enable(); clearLineDraw() }
-  }, [lineDrawMode])
+    const drawing = drawMode || lineDrawMode
+    map.getCanvas().style.cursor = drawing ? 'crosshair' : ''
+    if (drawing) map.doubleClickZoom.disable()
+    else map.doubleClickZoom.enable()
+    if (!drawMode) clearDraw()
+    if (!lineDrawMode) clearLineDraw()
+  }, [drawMode, lineDrawMode])
 
-  useEffect(() => { if (clearSignal != null) clearDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [clearSignal])
+  useEffect(() => { if (clearSignal != null) clearDraw(true) /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [clearSignal])
   useEffect(() => { if (finishSignal != null) finishDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [finishSignal])
-  useEffect(() => { if (lineClearSignal != null) clearLineDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [lineClearSignal])
+  useEffect(() => { if (lineClearSignal != null) clearLineDraw(true) /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [lineClearSignal])
   useEffect(() => { if (lineFinishSignal != null) finishLineDraw() /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [lineFinishSignal])
 
   function drawPointsFC(pts) {
@@ -280,13 +323,18 @@ export default function SplitMapView({
         : [],
     }
   }
-  function repaintDraw(map) {
-    map.getSource('draw-points')?.setData(drawPointsFC(drawPointsRef.current))
-    map.getSource('draw-line')?.setData(drawLineFC(drawPointsRef.current))
+  function setSourceDataOnBoth(sourceId, data) {
+    for (const map of [leftMapRef.current, rightMapRef.current]) {
+      map?.getSource(sourceId)?.setData(data)
+    }
   }
-  function repaintLine(map) {
-    map.getSource('draw-points')?.setData(drawPointsFC(linePointsRef.current))
-    map.getSource('draw-line')?.setData(drawLineFC(linePointsRef.current))
+  function repaintDraw() {
+    setSourceDataOnBoth('draw-points', drawPointsFC(drawPointsRef.current))
+    setSourceDataOnBoth('draw-line', drawLineFC(drawPointsRef.current))
+  }
+  function repaintLine() {
+    setSourceDataOnBoth('draw-points', drawPointsFC(linePointsRef.current))
+    setSourceDataOnBoth('draw-line', drawLineFC(linePointsRef.current))
   }
 
   function addDrawPoint(map, lng, lat) {
@@ -297,13 +345,13 @@ export default function SplitMapView({
       if (Math.hypot(firstPx.x - clickPx.x, firstPx.y - clickPx.y) < 14) { finishDraw(); return }
     }
     pts.push({ lng, lat })
-    repaintDraw(map)
+    repaintDraw()
     onDrawPointsChangeRef.current?.(pts.length)
   }
-  function clearDraw() {
+  function clearDraw(clearResult = false) {
     drawPointsRef.current = []
-    const map = leftMapRef.current
-    if (map?.getSource('draw-points')) repaintDraw(map)
+    repaintDraw()
+    if (clearResult) setSourceDataOnBoth('result-zone', emptyFC())
     onDrawPointsChangeRef.current?.(0)
   }
   function finishDraw() {
@@ -312,26 +360,38 @@ export default function SplitMapView({
     if (pts.length < 3) return
     const ring = pts.map((p) => [p.lng, p.lat])
     ring.push(ring[0])
-    onPolygonDrawnRef.current?.({ type: 'Polygon', coordinates: [ring] })
+    const geometry = { type: 'Polygon', coordinates: [ring] }
+    setSourceDataOnBoth('result-zone', { type: 'Feature', properties: {}, geometry })
+    onPolygonDrawnRef.current?.(geometry, {
+      period: viewContextRef.current.leftPeriod,
+      layer: viewContextRef.current.leftIndex,
+      pane: 'left',
+    })
   }
 
   function addLinePoint(map, lng, lat) {
     const pts = linePointsRef.current
     pts.push({ lng, lat })
-    repaintLine(map)
+    repaintLine()
     onLineDrawPointsChangeRef.current?.(pts.length)
   }
-  function clearLineDraw() {
+  function clearLineDraw(clearResult = false) {
     linePointsRef.current = []
-    const map = leftMapRef.current
-    if (map?.getSource('draw-points')) repaintLine(map)
+    repaintLine()
+    if (clearResult) setSourceDataOnBoth('result-transect', emptyFC())
     onLineDrawPointsChangeRef.current?.(0)
   }
   function finishLineDraw() {
     const pts = [...linePointsRef.current]
     clearLineDraw()
     if (pts.length < 2) return
-    onLineDrawnRef.current?.({ type: 'LineString', coordinates: pts.map((p) => [p.lng, p.lat]) })
+    const geometry = { type: 'LineString', coordinates: pts.map((p) => [p.lng, p.lat]) }
+    setSourceDataOnBoth('result-transect', { type: 'Feature', properties: {}, geometry })
+    onLineDrawnRef.current?.(geometry, {
+      period: viewContextRef.current.leftPeriod,
+      layer: viewContextRef.current.leftIndex,
+      pane: 'left',
+    })
   }
 
   // ── divider drag ────────────────────────────────────────────────
@@ -345,6 +405,16 @@ export default function SplitMapView({
   function handlePointerDown(e) {
     draggingRef.current = true
     moveSliderTo(e.clientX)
+  }
+  function handleDividerKeyDown(e) {
+    const changes = { ArrowLeft: -2, ArrowRight: 2, Home: -94, End: 94 }
+    if (!(e.key in changes)) return
+    e.preventDefault()
+    setSliderPct((value) => {
+      if (e.key === 'Home') return 6
+      if (e.key === 'End') return 94
+      return Math.max(6, Math.min(94, value + changes[e.key]))
+    })
   }
   useEffect(() => {
     function onMove(e) {
@@ -375,7 +445,7 @@ export default function SplitMapView({
   const rightLabel = periods.find((p) => p.period_id === rightPeriod)?.label || rightPeriod
 
   return (
-    <section className="map-section split-view" ref={containerRef}>
+    <section className="map-section split-view" id="map-workspace" tabIndex={-1} aria-label="Сравнение двух периодов" ref={containerRef}>
       <div className="split-pane split-pane-left" ref={leftElRef} />
       <div className="split-pane split-pane-right" style={{ clipPath: `inset(0 0 0 ${sliderPct}%)` }} ref={rightElRef} />
 
@@ -383,6 +453,13 @@ export default function SplitMapView({
         className="split-divider"
         style={{ left: `${sliderPct}%` }}
         onPointerDown={handlePointerDown}
+        onKeyDown={handleDividerKeyDown}
+        role="slider"
+        tabIndex={0}
+        aria-label="Положение разделителя периодов"
+        aria-valuemin={6}
+        aria-valuemax={94}
+        aria-valuenow={Math.round(sliderPct)}
       >
         <div className="split-handle">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -392,17 +469,17 @@ export default function SplitMapView({
       </div>
 
       <div className="split-topbar">
-        <select value={leftPeriod || ''} onChange={(e) => onLeftPeriodChange(e.target.value)}>
+        <select aria-label="Период слева" value={leftPeriod || ''} onChange={(e) => onLeftPeriodChange(e.target.value)}>
           {periods.map((p) => <option key={p.period_id} value={p.period_id}>{p.label}</option>)}
         </select>
-        <select value={leftIndex} onChange={(e) => onLeftIndexChange(e.target.value)}>
+        <select aria-label="Индекс слева" value={leftIndex} onChange={(e) => onLeftIndexChange(e.target.value)}>
           {INDEX_OPTIONS.map((opt) => <option key={opt.key} value={opt.key}>{opt.code}</option>)}
         </select>
         <span className="split-topbar-arrow">◄──►</span>
-        <select value={rightPeriod || ''} onChange={(e) => onRightPeriodChange(e.target.value)}>
+        <select aria-label="Период справа" value={rightPeriod || ''} onChange={(e) => onRightPeriodChange(e.target.value)}>
           {periods.map((p) => <option key={p.period_id} value={p.period_id}>{p.label}</option>)}
         </select>
-        <select value={rightIndex} onChange={(e) => onRightIndexChange(e.target.value)}>
+        <select aria-label="Индекс справа" value={rightIndex} onChange={(e) => onRightIndexChange(e.target.value)}>
           {INDEX_OPTIONS.map((opt) => <option key={opt.key} value={opt.key}>{opt.code}</option>)}
         </select>
       </div>
@@ -410,13 +487,15 @@ export default function SplitMapView({
       <div className="split-label split-label-left">{leftLabel} · {leftIndex.toUpperCase()}</div>
       <div className="split-label split-label-right">{rightLabel} · {rightIndex.toUpperCase()}</div>
 
-      <div className="map-toolbar">
-        <button className="map-tool-btn" title="Приближение" onClick={() => leftMapRef.current?.zoomIn()}>+</button>
-        <button className="map-tool-btn" title="Отдаление" onClick={() => leftMapRef.current?.zoomOut()}>−</button>
+      <div className="map-toolbar" role="toolbar" aria-label="Управление картами сравнения">
+        <button type="button" className="map-tool-btn" title="Приближение" aria-label="Приблизить обе карты" onClick={() => leftMapRef.current?.zoomIn()}>+</button>
+        <button type="button" className="map-tool-btn" title="Отдаление" aria-label="Отдалить обе карты" onClick={() => leftMapRef.current?.zoomOut()}>−</button>
         <div className="map-tool-sep" />
         <button
+          type="button"
           className="map-tool-btn active"
           title="Выйти из режима сравнения"
+          aria-label="Выйти из режима сравнения"
           aria-pressed="true"
           onClick={onExitSplitMode}
         >

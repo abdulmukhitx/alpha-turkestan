@@ -20,22 +20,47 @@ export async function fetchPeriods() {
 
 export async function fetchPixel(lat, lon, period) {
   const r = await fetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&period=${period}`)
-  if (!r.ok) throw new Error(`Pixel fetch failed: ${r.status}`)
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Pixel fetch failed: ${r.status}`)
+  }
   return r.json()
 }
 
-export async function fetchAnalysis({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence }) {
+export async function fetchAnalysis({ lat, lon, period, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence }) {
   const r = await fetch('/api/analyze', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ lat, lon, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence }),
+    body:    JSON.stringify({ lat, lon, period, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence }),
   })
-  if (!r.ok) throw new Error(`Analysis failed: ${r.status}`)
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Analysis failed: ${r.status}`)
+  }
   return r.json()
 }
 
 /** Leaflet-compatible XYZ tile URL template for a given layer + period. */
 export const tileUrl = (layer, period) => `/tiles/${layer}/{z}/{x}/{y}.png?period=${period}`
+
+/** Experimental all-years linear-trend forecast tile URL. */
+export const forecastTileUrl = (index, targetYear) =>
+  `/tiles/forecast/${index}/${targetYear}/{z}/{x}/{y}.png`
+
+export async function fetchPointForecast(lat, lon, index, targetYear) {
+  const params = new URLSearchParams({
+    lat: lat.toFixed(6),
+    lon: lon.toFixed(6),
+    index,
+    target_year: String(targetYear),
+  })
+  const r = await fetch(`/api/forecast/point?${params}`)
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Forecast failed: ${r.status}`)
+  }
+  return r.json()
+}
 
 export async function fetchZoneStats(geometry, period) {
   const r = await fetch('/api/zone_stats', {
@@ -80,7 +105,7 @@ export async function fetchChangeStats(geometry, periodBefore, periodAfter) {
   return r.json()
 }
 
-export async function fetchZoneReport({ geometry, zoneStats, activeLayer, mapImageBase64 }) {
+export async function fetchZoneReport({ geometry, zoneStats, activeLayer, period }) {
   const r = await fetch('/api/zone_report', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -88,7 +113,7 @@ export async function fetchZoneReport({ geometry, zoneStats, activeLayer, mapIma
       geometry,
       zone_stats:       zoneStats,
       active_layer:     activeLayer,
-      map_image_base64: mapImageBase64,
+      period,
     }),
   })
   if (!r.ok) {

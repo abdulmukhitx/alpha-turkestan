@@ -1,4 +1,4 @@
-export default function TopBar({ lat, lon, health, onRefresh, periods, period, onPeriodChange }) {
+export default function TopBar({ lat, lon, health, onRefresh, periods, period, onPeriodChange, periodDisabled = false }) {
   const online = health && health.status === 'ok'
   const statusText = health
     ? (online ? `Sentinel-2 · ${health.cog ? 'COG mosaic' : health.s2_tiles + ' tiles'}` : 'Backend offline')
@@ -7,13 +7,17 @@ export default function TopBar({ lat, lon, health, onRefresh, periods, period, o
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <div className="brand-mark">
-          <svg width="24" height="24" viewBox="0 0 28 28" fill="none">
-            <circle cx="14" cy="14" r="12" stroke="currentColor" strokeWidth="1.4" strokeDasharray="3 2" />
-            <circle cx="14" cy="14" r="3" fill="currentColor" />
+        <div className="brand-mark" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+            <path d="M4 9.5 14 4l10 5.5v9L14 24 4 18.5v-9Z" stroke="currentColor" strokeWidth="1.3" />
+            <path d="m4 9.5 10 5.5 10-5.5M14 15v9" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="14" cy="15" r="2.6" fill="currentColor" />
           </svg>
         </div>
-        <span className="brand-name">GeoAI<span className="brand-dot">·</span>TKO</span>
+        <div className="brand-copy">
+          <span className="brand-name">GeoAI<span className="brand-dot">·</span>TKO</span>
+          <span className="brand-subtitle">Мониторинг территорий</span>
+        </div>
       </div>
 
       <div className="topbar-center">
@@ -28,22 +32,27 @@ export default function TopBar({ lat, lon, health, onRefresh, periods, period, o
 
       <div className="topbar-right">
         {periods?.length > 0 && (
-          <select
-            className="period-select"
-            value={period}
-            onChange={(e) => onPeriodChange(e.target.value)}
-            title="Период съёмки"
-          >
-            {periods.map((p) => (
-              <option key={p.period_id} value={p.period_id}>{p.label}</option>
-            ))}
-          </select>
+          <label className="period-control">
+            <span>Период</span>
+            <select
+              className="period-select"
+              value={period}
+              onChange={(e) => onPeriodChange(e.target.value)}
+              disabled={periodDisabled}
+              aria-label="Период съёмки"
+              title={periodDisabled ? 'Исторический период недоступен в режиме прогноза' : 'Период съёмки'}
+            >
+              {periods.map((p) => (
+                <option key={p.period_id} value={p.period_id}>{p.label}</option>
+              ))}
+            </select>
+          </label>
         )}
-        <div className={`status-pill ${online ? '' : 'offline'}`}>
+        <div className={`status-pill ${online ? '' : 'offline'}`} role="status" aria-live="polite">
           <span className="status-dot" />
           <span>{statusText}</span>
         </div>
-        <button className="icon-btn" title="Обновить данные" onClick={onRefresh}>
+        <button className="icon-btn" type="button" title="Обновить данные" aria-label="Обновить данные" onClick={onRefresh}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M2 8a6 6 0 1 1 1.5 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
             <path d="M2 12V8h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />

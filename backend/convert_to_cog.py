@@ -109,8 +109,11 @@ def merge_to_cog(tiles):
                     block_bottom = top  - (row_off + row_h) * res
 
                     # Читаем данные из каждого тайла который перекрывает блок
-                    block_data = np.zeros((count, row_h, col_w),
-                                          dtype=np.dtype(dtype))
+                    fill_value = profile["nodata"]
+                    block_data = np.full(
+                        (count, row_h, col_w), fill_value=fill_value,
+                        dtype=np.dtype(dtype),
+                    )
 
                     for src in src_files:
                         # Проверяем пересечение с тайлом
@@ -145,7 +148,12 @@ def merge_to_cog(tiles):
                                 resampling=Resampling.nearest,
                             )
                             # Первый непустой пиксель побеждает (как method="first")
-                            valid = data[0] != (nodata if nodata else 0)
+                            valid = data[0] != fill_value
+                            destination_empty = block_data[0] == fill_value
+                            write_mask = valid[:read_h, :read_w] & destination_empty[
+                                dst_row:dst_row + read_h,
+                                dst_col:dst_col + read_w,
+                            ]
                             for b in range(count):
                                 dst_slice = block_data[
                                     b,
@@ -153,10 +161,9 @@ def merge_to_cog(tiles):
                                     dst_col:dst_col + read_w,
                                 ]
                                 src_slice = data[b, :read_h, :read_w]
-                                mask = valid[:read_h, :read_w]
-                                dst_slice[mask] = src_slice[mask]
-                        except Exception:
-                            pass
+                                dst_slice[write_mask] = src_slice[write_mask]
+                        except Exception as e:
+                            print(f"\n⚠ Ошибка чтения {src.name}: {e}")
 
                     # Записываем блок
                     dst.write(

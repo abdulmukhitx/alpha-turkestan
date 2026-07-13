@@ -18,7 +18,7 @@ export default function ChangeDetectionBar({
   return (
     <div className={`change-bar ${open ? 'open' : ''}`}>
       <div className="change-bar-inner">
-        <div className="change-bar-title">📊 Анализ изменений</div>
+        <div className="change-bar-title"><span className="workflow-dot" />Изменения</div>
 
         <div className="change-bar-controls">
           <label className="change-bar-field">
@@ -63,7 +63,7 @@ export default function ChangeDetectionBar({
             onClick={onToggleDraw}
             disabled={samePeriod}
           >
-            {drawMode ? 'Отменить рисование' : '✏️ Нарисовать зону'}
+            {drawMode ? 'Отменить рисование' : 'Определить зону'}
           </button>
           {drawMode && (
             <button

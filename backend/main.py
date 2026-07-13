@@ -10,7 +10,9 @@ Endpoints:
   GET  /api/periods                     list of available periods for the UI selector
   GET  /tiles/{layer}/{z}/{x}/{y}.png?period=   XYZ tiles  (ndvi / ndwi / ndre / ndmi / bsi)
   GET  /tiles/change/{index}/{z}/{x}/{y}.png?period_before=&period_after=  change-detection XYZ tiles
+  GET  /tiles/forecast/{index}/{target_year}/{z}/{x}/{y}.png  linear-trend forecast tiles
   GET  /api/pixel?lat=&lon=&period=     per-pixel spectral values + indices
+  GET  /api/forecast/point?lat=&lon=&index=&target_year=  point trend forecast
   POST /api/zone_stats                  zonal stats (indices + LULC) for a drawn polygon
   POST /api/change_stats                change-detection zonal stats (index deltas + ML transition matrix)
   GET  /api/change_overview             precomputed change-detection stats for the whole oblast boundary
@@ -24,39 +26,48 @@ Run:
   uvicorn backend.main:app --reload --port 8000
 """
 
-import asyncio, io, json, math, os, threading, traceback
+import asyncio, functools, io, json, math, os, threading, traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
 # Load project-root .env explicitly so it works regardless of CWD
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from fastapi import FastAPI, Query, Response, HTTPException
+from fastapi import FastAPI, Query, Request, Response, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # ── Optional geo libs ─────────────────────────────────────────────
 try:
-    from rio_tiler.io import Reader
-    from rio_tiler.errors import TileOutsideBounds
     import numpy as np
     from PIL import Image
-    TILER_OK = True
+    ARRAY_LIBS_OK = True
+except ImportError as e:
+    np = None
+    Image = None
+    ARRAY_LIBS_OK = False
+    print(f"[warning] NumPy / Pillow not available: {e}")
+
+try:
+    from rio_tiler.io import Reader
+    from rio_tiler.errors import TileOutsideBounds
+    TILER_OK = ARRAY_LIBS_OK
 except ImportError as e:
     TILER_OK = False
-    print(f"⚠  rio-tiler / Pillow not available: {e}")
+    print(f"[warning] rio-tiler not available: {e}")
 
 try:
     import rasterio
     from rasterio.windows import from_bounds as window_from_bounds, Window
     from rasterio.features import geometry_mask
     from pyproj import Transformer
-    RASTERIO_OK = True
+    RASTERIO_OK = ARRAY_LIBS_OK
 except ImportError:
     RASTERIO_OK = False
-    print("⚠  rasterio not available — pixel endpoint uses demo data")
+    print("[warning] rasterio not available - raster analysis disabled")
 
 try:
     from openai import OpenAI
@@ -71,13 +82,13 @@ try:
     SKLEARN_OK = True
 except ImportError:
     SKLEARN_OK = False
-    print("⚠  scikit-learn not available — ML land-cover classification disabled")
+    print("[warning] scikit-learn not available - ML land-cover classification disabled")
 
 # ── Paths ─────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
-MOSAICS_DIR  = Path(r"D:\data\mosaics")
+MOSAICS_DIR  = Path(os.getenv("MOSAICS_DIR", r"D:\data\mosaics"))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
 LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v3.pkl"))
 WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worldcover_turkestan.tif"))
@@ -103,6 +114,12 @@ PERIODS = {
         "cog_path": MOSAICS_DIR / "2023_summer_cdse" / "s2_mosaic_cog.tif",
         "storage": "reflectance",
     },
+    "2024_summer": {
+        "label": "Лето 2024",
+        "date_range": "01.06.2024 – 31.08.2024",
+        "cog_path": MOSAICS_DIR / "2024_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
     "2025_summer": {
         "label": "Лето 2025",
         "date_range": "01.06.2025 – 31.08.2025",
@@ -112,6 +129,26 @@ PERIODS = {
 }
 DEFAULT_PERIOD = "2025_summer"
 _REFLECTANCE_NODATA = -9999
+MAX_ANALYSIS_PIXELS = int(os.getenv("MAX_ANALYSIS_PIXELS", "2000000"))
+MAX_GEOMETRY_VERTICES = int(os.getenv("MAX_GEOMETRY_VERTICES", "10000"))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "2000000"))
+MAX_CONCURRENT_ANALYSES = max(1, int(os.getenv("MAX_CONCURRENT_ANALYSES", "2")))
+MAX_FORECAST_HORIZON_YEARS = max(1, int(os.getenv("MAX_FORECAST_HORIZON_YEARS", "5")))
+ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"}
+ENABLE_CHANGE_OVERVIEW = os.getenv("ENABLE_CHANGE_OVERVIEW", "false").lower() in {"1", "true", "yes"}
+_ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+
+
+def limit_analysis(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        if not _ANALYSIS_SEMAPHORE.acquire(blocking=False):
+            raise HTTPException(status_code=429, detail="Сервер занят другим анализом — повторите запрос позже")
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _ANALYSIS_SEMAPHORE.release()
+    return wrapped
 
 # Kept for the /health and /metadata endpoints, which stay tied to the
 # default period (not part of the period switcher).
@@ -139,13 +176,15 @@ def period_to_reflectance(data: "np.ndarray", period: dict) -> "np.ndarray":
     return data / 10000
 
 
-def period_to_dn_equivalent(window: "np.ndarray", period: dict) -> "np.ndarray":
-    """Bands → DN-equivalent magnitude, used only for classify_ml_v2's texture-std
-    features so they stay on the scale the model was trained on (raw DN), regardless
-    of whether the source period is stored as DN or as physical reflectance."""
-    if period["storage"] == "reflectance":
-        return window * 10000
-    return window
+def period_to_texture_reflectance(window: "np.ndarray", period: dict) -> "np.ndarray":
+    """Bands → physical reflectance for the v3 model's texture features.
+
+    ``extract_samples_v3.py`` trained ``lulc_classifier_v3.pkl`` on 3x3
+    standard deviations calculated from reflectance, not raw Sentinel-2 DN.
+    Keeping this conversion explicit prevents a 10,000x feature-scale mismatch
+    when inference reads a reflectance COG.
+    """
+    return period_to_reflectance(window, period)
 
 
 def s2_assets() -> list[str]:
@@ -177,17 +216,22 @@ def cog_bounds_wgs84() -> list[float] | None:
 #     by /api/zone_stats's bulk per-pixel classification, which builds the
 #     6-feature array — swapping the global model there would break it, so
 #     v1 and v2 are deliberately kept as separate models/globals.
-# v2: XGBoost (13 features: v1's 6 + 7 std_* 3x3-texture features), trained
-#     by src/processing/extract_samples.py + train_xgb.py. Used only by
-#     /api/pixel via classify_ml_v2(). CV accuracy 88.9% vs v1's OOB 74.25%.
+# v3: XGBoost (13 features: v1's 6 + 7 std_* 3x3-texture features), trained
+#     by src/processing/extract_samples_v3.py + train_xgb_v3.py. Used by
+#     /api/pixel and the change-analysis endpoints. The V2 suffix on the
+#     globals/functions remains for API compatibility with the original model.
 # Both optional: if a pickle isn't there yet, the relevant ml_* fields are
 # just omitted and everything else keeps working.
 CLASSIFIER  = None
 CLASS_NAMES: "list[str] | None" = None
+_CLASSIFIER_LOAD_ATTEMPTED = False
+_CLASSIFIER_LOCK = threading.Lock()
 
 CLASSIFIER_V2 = None
 LABEL_ENCODER_V2 = None
 CLASS_NAMES_V2: "list[str] | None" = None
+_CLASSIFIER_V2_LOAD_ATTEMPTED = False
+_CLASSIFIER_V2_LOCK = threading.Lock()
 
 _ML_CLASS_RU = {
     "water":              "Вода",
@@ -199,41 +243,50 @@ _ML_CLASS_RU = {
 }
 
 def load_classifier():
-    global CLASSIFIER, CLASS_NAMES
-    if not (SKLEARN_OK and LULC_MODEL_PATH.exists()):
+    global CLASSIFIER, CLASS_NAMES, _CLASSIFIER_LOAD_ATTEMPTED
+    if _CLASSIFIER_LOAD_ATTEMPTED:
         return
-    try:
-        with open(LULC_MODEL_PATH, "rb") as f:
-            saved = pickle.load(f)
-        CLASSIFIER  = saved["model"]
-        CLASS_NAMES = list(saved["label_encoder"].classes_)
-        print(f"✓ LULC classifier loaded: {len(CLASS_NAMES)} classes")
-    except Exception as e:
-        print(f"⚠  failed to load LULC classifier: {e}")
-
-load_classifier()
+    with _CLASSIFIER_LOCK:
+        if _CLASSIFIER_LOAD_ATTEMPTED:
+            return
+        _CLASSIFIER_LOAD_ATTEMPTED = True
+        if not (SKLEARN_OK and LULC_MODEL_PATH.exists()):
+            return
+        try:
+            with open(LULC_MODEL_PATH, "rb") as f:
+                saved = pickle.load(f)
+            CLASSIFIER  = saved["model"]
+            CLASS_NAMES = list(saved["label_encoder"].classes_)
+            print(f"[ok] LULC classifier loaded: {len(CLASS_NAMES)} classes")
+        except Exception as e:
+            print(f"[warning] failed to load LULC classifier: {e}")
 
 
 def load_classifier_v2():
-    global CLASSIFIER_V2, LABEL_ENCODER_V2, CLASS_NAMES_V2
-    if not LULC_MODEL_V2_PATH.exists():
+    global CLASSIFIER_V2, LABEL_ENCODER_V2, CLASS_NAMES_V2, _CLASSIFIER_V2_LOAD_ATTEMPTED
+    if _CLASSIFIER_V2_LOAD_ATTEMPTED:
         return
-    try:
-        with open(LULC_MODEL_V2_PATH, "rb") as f:
-            saved = pickle.load(f)
-        CLASSIFIER_V2    = saved["model"]
-        LABEL_ENCODER_V2 = saved["label_encoder"]
-        CLASS_NAMES_V2   = list(saved["classes"])
-        print(f"✓ LULC classifier v2 (XGBoost) loaded: {len(CLASS_NAMES_V2)} classes")
-    except Exception as e:
-        print(f"⚠  failed to load LULC classifier v2: {e}")
-
-load_classifier_v2()
+    with _CLASSIFIER_V2_LOCK:
+        if _CLASSIFIER_V2_LOAD_ATTEMPTED:
+            return
+        _CLASSIFIER_V2_LOAD_ATTEMPTED = True
+        if not LULC_MODEL_V2_PATH.exists():
+            return
+        try:
+            with open(LULC_MODEL_V2_PATH, "rb") as f:
+                saved = pickle.load(f)
+            CLASSIFIER_V2    = saved["model"]
+            LABEL_ENCODER_V2 = saved["label_encoder"]
+            CLASS_NAMES_V2   = list(saved["classes"])
+            print(f"[ok] LULC classifier v3 (XGBoost) loaded: {len(CLASS_NAMES_V2)} classes")
+        except Exception as e:
+            print(f"[warning] failed to load LULC classifier v2: {e}")
 
 
 def classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08):
     """RandomForest land-cover prediction from the 5 indices + B08. None if unavailable.
     Legacy v1 — kept for /api/zone_stats's bulk classification (6 features)."""
+    load_classifier()
     if CLASSIFIER is None or None in (ndvi, ndre, ndwi, ndmi, bsi, b08):
         return None
     feats = np.array([[ndvi, ndre, ndwi, ndmi, bsi, b08]], dtype=np.float32)
@@ -250,7 +303,8 @@ def classify_ml(ndvi, ndre, ndwi, ndmi, bsi, b08):
 
 def classify_ml_v2(ndvi, ndre, ndwi, ndmi, bsi, b08, std_bands: "dict | None"):
     """XGBoost land-cover prediction from the 6 v1 features + 7 std_* texture
-    features (3x3 window std per band, raw DN). Used by /api/pixel only."""
+    features (3x3 window std per band, physical reflectance)."""
+    load_classifier_v2()
     if CLASSIFIER_V2 is None or None in (ndvi, ndre, ndwi, ndmi, bsi, b08) or not std_bands:
         return None
     feats = np.array([[
@@ -284,7 +338,7 @@ _B02, _B03, _B04, _B05, _B08, _B8A, _B11 = 0, 1, 2, 3, 4, 5, 6
 LAYERS = {
     "ndvi": {"label": "NDVI — растительность", "range": (0.02,  0.21), "cmap": "rdylgn"},
     "ndwi": {"label": "NDWI — водные объекты", "range": (-0.27, -0.10),"cmap": "rdbu"},
-    "ndre": {"label": "NDRE — стресс растений","range": (-0.30, 0.00), "cmap": "rdylgn"},
+    "ndre": {"label": "NDRE — стресс растений","range": (-0.03, 0.51), "cmap": "rdylgn"},
     "ndmi": {"label": "NDMI — влажность почвы","range": (-0.20, 0.16), "cmap": "rdbu"},
     "bsi":  {"label": "BSI — голая почва",     "range": (0.12,  0.29), "cmap": "oranges"},
     "savi": {"label": "SAVI — покрытие раст.", "range": (-0.10, 0.35), "cmap": "rdylgn"},
@@ -455,6 +509,166 @@ def compute_index(data: "np.ndarray", layer: str, period: dict) -> "np.ndarray":
     return np.zeros(data.shape[1:], dtype=np.float32)
 
 
+# ── Experimental linear-trend forecast helpers ───────────────────
+_INDEX_LIMITS = {
+    "ndvi": (-1.0, 1.0), "ndwi": (-1.0, 1.0), "ndre": (-1.0, 1.0),
+    "ndmi": (-1.0, 1.0), "bsi": (-1.0, 1.0), "nbr": (-1.0, 1.0),
+    "savi": (-1.5, 1.5),
+}
+
+
+def _period_year(period_id: str) -> int | None:
+    try:
+        year = int(period_id[:4])
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= 2200 else None
+
+
+def forecast_source_periods() -> list[tuple[int, str, dict]]:
+    """Available annual periods sorted by year.
+
+    At least three observations are required. The registry remains the single
+    source of truth, so adding a future annual mosaic automatically extends the
+    baseline without changing the forecast implementation.
+    """
+    result = []
+    for period_id, cfg in PERIODS.items():
+        year = _period_year(period_id)
+        if year is not None and cog_available(cfg):
+            result.append((year, period_id, cfg))
+    return sorted(result, key=lambda item: item[0])
+
+
+def forecast_config() -> dict:
+    sources = forecast_source_periods()
+    years = [year for year, _, _ in sources]
+    enabled = len(sources) >= 3
+    latest_year = years[-1] if years else None
+    return {
+        "enabled": enabled,
+        "method": "ordinary_least_squares",
+        "prototype": True,
+        "source_years": years,
+        "observations": len(years),
+        "min_target_year": latest_year + 1 if enabled else None,
+        "max_target_year": latest_year + MAX_FORECAST_HORIZON_YEARS if enabled else None,
+        "confidence": "low",
+    }
+
+
+def validate_forecast_request(index: str, target_year: int) -> list[tuple[int, str, dict]]:
+    if index not in LAYERS:
+        raise HTTPException(status_code=404, detail=f"Неизвестный индекс: {index}")
+    sources = forecast_source_periods()
+    if len(sources) < 3:
+        raise HTTPException(
+            status_code=503,
+            detail="Для линейного прогноза нужны минимум три доступных годовых периода",
+        )
+    latest_year = sources[-1][0]
+    if target_year <= latest_year or target_year > latest_year + MAX_FORECAST_HORIZON_YEARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Год прогноза должен быть от {latest_year + 1} "
+                f"до {latest_year + MAX_FORECAST_HORIZON_YEARS}"
+            ),
+        )
+    return sources
+
+
+def linear_trend_array(years: "np.ndarray", values: "np.ndarray", target_year: int) -> "np.ndarray":
+    """OLS forecast along axis 0 for scalar, point, or raster values."""
+    x = np.asarray(years, dtype=np.float32)
+    y = np.asarray(values, dtype=np.float32)
+    if x.ndim != 1 or y.shape[0] != x.size or x.size < 3:
+        raise ValueError("linear trend requires at least three matching observations")
+    centered = x - x.mean()
+    denominator = float(np.sum(centered ** 2))
+    if denominator <= 0:
+        raise ValueError("forecast years must contain temporal variation")
+    reshape = (x.size,) + (1,) * (y.ndim - 1)
+    slope = np.sum(centered.reshape(reshape) * y, axis=0) / denominator
+    return y.mean(axis=0) + slope * (float(target_year) - float(x.mean()))
+
+
+def linear_trend_summary(years: list[int], values: list[float], target_year: int, index: str) -> dict:
+    """Point estimate plus a transparent sensitivity envelope.
+
+    The range is not called a confidence interval: with only three annual
+    observations that would imply unjustified certainty. Instead it compares
+    the all-years OLS projection with projections from each adjacent observed
+    annual slope and expands the envelope by the in-sample fit RMSE.
+    """
+    x = np.asarray(years, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64)
+    predicted_raw = float(linear_trend_array(x, y, target_year))
+    centered = x - x.mean()
+    slope = float(np.sum(centered * y) / np.sum(centered ** 2))
+    fitted = y.mean() + slope * centered
+    residuals = y - fitted
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    ss_total = float(np.sum((y - y.mean()) ** 2))
+    ss_residual = float(np.sum(residuals ** 2))
+    r_squared = 1.0 - ss_residual / ss_total if ss_total > 1e-12 else 1.0
+
+    horizon = float(target_year - years[-1])
+    adjacent_slopes = np.diff(y) / np.diff(x)
+    alternatives = [predicted_raw]
+    alternatives.extend(float(y[-1] + annual_slope * horizon) for annual_slope in adjacent_slopes)
+    lower_raw = min(alternatives) - rmse
+    upper_raw = max(alternatives) + rmse
+
+    lower_limit, upper_limit = _INDEX_LIMITS[index]
+    predicted = float(np.clip(predicted_raw, lower_limit, upper_limit))
+    lower = float(np.clip(lower_raw, lower_limit, upper_limit))
+    upper = float(np.clip(upper_raw, lower_limit, upper_limit))
+    latest_value = float(y[-1])
+    delta = predicted - latest_value
+    signed_annual_change = slope * DIRECTION_SIGN.get(index, 1)
+    if abs(signed_annual_change) < 0.005:
+        direction, direction_ru = "stable", "без выраженного тренда"
+    elif signed_annual_change > 0:
+        direction, direction_ru = "improving", "улучшение"
+    else:
+        direction, direction_ru = "degrading", "ухудшение"
+
+    same_sign = bool(np.all(adjacent_slopes >= 0) or np.all(adjacent_slopes <= 0))
+    trend_quality = "consistent" if same_sign and r_squared >= 0.8 else "variable"
+    return {
+        "predicted": round(predicted, 4),
+        "latest_value": round(latest_value, 4),
+        "change_from_latest": round(delta, 4),
+        "slope_per_year": round(slope, 4),
+        "sensitivity_low": round(min(lower, upper), 4),
+        "sensitivity_high": round(max(lower, upper), 4),
+        "fit_rmse": round(rmse, 4),
+        "r_squared": round(float(np.clip(r_squared, 0.0, 1.0)), 4),
+        "direction": direction,
+        "direction_ru": direction_ru,
+        "trend_quality": trend_quality,
+    }
+
+
+def read_point_indices(lat: float, lon: float, period: dict) -> dict[str, float] | None:
+    if not (RASTERIO_OK and cog_available(period)):
+        return None
+    with rasterio.open(period["cog_path"]) as src:
+        transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        px, py = transformer.transform(lon, lat)
+        row, col = src.index(px, py)
+        if not (0 <= row < src.height and 0 <= col < src.width):
+            return None
+        raw = src.read(window=((row, row + 1), (col, col + 1))).astype(np.float32)
+        if raw.shape[0] < 7 or period_nodata_mask(raw[:7], period).all():
+            return None
+        return {
+            index: float(compute_index(raw[:7], index, period)[0, 0])
+            for index in LAYERS
+        }
+
+
 # ── PNG renderers ─────────────────────────────────────────────────
 def render_index(index: "np.ndarray", mask: "np.ndarray",
                  cmap: str, vmin: float, vmax: float) -> bytes:
@@ -474,22 +688,45 @@ def render_index(index: "np.ndarray", mask: "np.ndarray",
 
 app = FastAPI(
     title      = "GeoAI-TKO API",
-    version    = "3.0.0",
+    version    = "4.0.0",
     docs_url   = "/api/docs",
     redoc_url  = "/api/redoc",
 )
 
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins  = ["*"],
+    allow_origins  = CORS_ORIGINS,
     allow_methods  = ["GET", "POST", "OPTIONS"],
-    allow_headers  = ["*"],
+    allow_headers  = ["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH"}:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BYTES:
+                    return JSONResponse(status_code=413, content={"detail": "Тело запроса слишком большое"})
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Некорректный Content-Length"})
+    return await call_next(request)
 
 
 @app.get("/health")
 async def health():
     assets = s2_assets()
+    forecast = forecast_config()
     return {
         "status":    "ok",
         "version":   "4.0.0",
@@ -501,15 +738,24 @@ async def health():
         "s2_tiles":  len(assets),
         "s2_dir":    str(S2_DIR),
         "ai_ready":  bool(os.getenv("GROQ_API_KEY") or os.getenv("DEEPSEEK_API_KEY")),
-        "lulc_classifier": CLASSIFIER is not None,
-        "lulc_classifier_v2": CLASSIFIER_V2 is not None,
+        "lulc_classifier": bool(SKLEARN_OK and LULC_MODEL_PATH.exists()),
+        "lulc_classifier_v2": bool(SKLEARN_OK and LULC_MODEL_V2_PATH.exists()),
+        "lulc_classifier_loaded": CLASSIFIER is not None,
+        "lulc_classifier_v2_loaded": CLASSIFIER_V2 is not None,
+        "linear_forecast": forecast["enabled"],
+        "linear_forecast_source_years": forecast["source_years"],
     }
 
 
 @app.get("/api/periods")
 async def periods():
     return [
-        {"period_id": k, "label": v["label"], "date_range": v["date_range"]}
+        {
+            "period_id": k,
+            "label": v["label"],
+            "date_range": v["date_range"],
+            "available": cog_available(v),
+        }
         for k, v in PERIODS.items()
     ]
 
@@ -519,9 +765,11 @@ async def periods():
 # ════════════════════════════════════════════════════════════════
 
 @app.get("/tiles/{layer}/{z}/{x}/{y}.png")
-async def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_PERIOD)):
-    if not TILER_OK or layer not in LAYERS:
-        return Response(content=blank_tile(), media_type="image/png")
+def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_PERIOD)):
+    if layer not in LAYERS:
+        raise HTTPException(status_code=404, detail=f"Неизвестный слой: {layer}")
+    if not TILER_OK:
+        raise HTTPException(status_code=503, detail="Сервис тайлов недоступен")
 
     period_cfg = resolve_period(period)
     data, mask = mosaic_tile(x, y, z, period_cfg)
@@ -547,6 +795,117 @@ async def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_P
     return Response(content=content, media_type="image/png",
                     headers={"Cache-Control": "no-cache, no-store, must-revalidate",
                               "Pragma": "no-cache"})
+
+
+@app.get("/tiles/forecast/{index}/{target_year}/{z}/{x}/{y}.png")
+async def forecast_tile(index: str, target_year: int, z: int, x: int, y: int):
+    """Render the all-years OLS extrapolation for one spectral index.
+
+    This deliberately remains an on-demand prototype. A later ML pipeline can
+    replace the source with precomputed forecast COGs while keeping the same
+    frontend tile contract.
+    """
+    if not TILER_OK:
+        raise HTTPException(status_code=503, detail="Сервис тайлов недоступен")
+    sources = validate_forecast_request(index, target_year)
+    reads = await asyncio.gather(*(
+        run_in_threadpool(mosaic_tile, x, y, z, cfg)
+        for _, _, cfg in sources
+    ))
+    if any(data is None for data, _ in reads):
+        return Response(
+            content=blank_tile(), media_type="image/png",
+            headers={"Cache-Control": "public, max-age=60"},
+        )
+
+    valid = np.logical_and.reduce([(mask > 0) for _, mask in reads])
+    if not valid.any():
+        return Response(
+            content=blank_tile(), media_type="image/png",
+            headers={"Cache-Control": "public, max-age=60"},
+        )
+
+    try:
+        years = np.asarray([year for year, _, _ in sources], dtype=np.float32)
+        values = np.stack([
+            compute_index(data, index, cfg)
+            for (data, _), (_, _, cfg) in zip(reads, sources)
+        ])
+        predicted = linear_trend_array(years, values, target_year)
+        lower_limit, upper_limit = _INDEX_LIMITS[index]
+        predicted = np.clip(predicted, lower_limit, upper_limit)
+        cfg = LAYERS[index]
+        vmin, vmax = cfg["range"]
+        content = render_index(
+            predicted,
+            valid.astype(np.uint8) * 255,
+            cfg["cmap"], vmin, vmax,
+        )
+    except Exception as exc:
+        print(f"forecast render error {index}/{target_year}/{z}/{x}/{y}: {exc}")
+        return Response(content=blank_tile(), media_type="image/png")
+
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-Forecast-Method": "linear-trend-prototype",
+        },
+    )
+
+
+@app.get("/api/forecast/point")
+@limit_analysis
+def forecast_point(
+    lat: float = Query(..., ge=40.0, le=47.0),
+    lon: float = Query(..., ge=65.0, le=72.0),
+    index: str = Query("ndvi"),
+    target_year: int = Query(...),
+):
+    sources = validate_forecast_request(index, target_year)
+    history = []
+    observed_values = []
+    for year, period_id, cfg in sources:
+        values = read_point_indices(lat, lon, cfg)
+        if values is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Нет данных для точки в периоде {period_id}",
+            )
+        value = values[index]
+        if not math.isfinite(value):
+            raise HTTPException(status_code=404, detail=f"Некорректное значение в периоде {period_id}")
+        observed_values.append(float(value))
+        history.append({
+            "year": year,
+            "period": period_id,
+            "label": cfg["label"],
+            "value": round(float(value), 4),
+        })
+
+    trend = linear_trend_summary(
+        [item["year"] for item in history],
+        observed_values,
+        target_year,
+        index,
+    )
+    return {
+        "lat": lat,
+        "lon": lon,
+        "index": index,
+        "index_label": LAYERS[index]["label"],
+        "target_year": target_year,
+        "method": "ordinary_least_squares",
+        "prototype": True,
+        "confidence": "low",
+        "history": history,
+        "trend": trend,
+        "disclaimer": (
+            "Экспериментальная экстраполяция трёх летних наблюдений. "
+            "Она показывает сценарий продолжения текущего тренда, а не гарантированный прогноз."
+        ),
+    }
 
 
 _CHANGE_RESCALE_CACHE: dict = {}   # (period_before, period_after, index) -> max_abs (float)
@@ -622,8 +981,10 @@ async def change_tile(
     Rescale is one global value per (periods, index) triple — computed once
     from a coarse overview and cached — so every tile shares the same color
     scale and tile-boundary seams don't appear."""
-    if not TILER_OK or index not in LAYERS:
-        return Response(content=blank_tile(), media_type="image/png")
+    if index not in LAYERS:
+        raise HTTPException(status_code=404, detail=f"Неизвестный индекс: {index}")
+    if not TILER_OK:
+        raise HTTPException(status_code=503, detail="Сервис тайлов недоступен")
 
     before_cfg = resolve_period(period_before)
     after_cfg  = resolve_period(period_after)
@@ -694,7 +1055,7 @@ def _demo(lat, lon):
 
 
 @app.get("/api/pixel")
-async def pixel(
+def pixel(
     # Bounds cover the full COG extent (≈40.7–46.5°N, 65.7–71.4°E) with margin.
     # The old 40.8–44.0 / 67.5–71.5 box wrongly 422'd valid points like 44.15°N.
     lat: float = Query(..., ge=40.0, le=47.0),
@@ -718,20 +1079,19 @@ async def pixel(
             b   = period_to_reflectance(raw[:7], period_cfg)
             eps = 1e-10
 
-            # 3x3 window (clipped at raster edges) for the v2 classifier's
-            # texture features — std per band of DN-equivalent magnitude, same
-            # convention as src/processing/extract_samples.py's
-            # read_point_window() (which was trained on raw DN).
+            # 3x3 window (clipped at raster edges) for the v3 classifier's
+            # texture features. The v3 training extractor computed these
+            # standard deviations from physical reflectance.
             row_off, col_off = max(0, row - 1), max(0, col - 1)
             row_end, col_end = min(src.height, row + 2), min(src.width, col + 2)
             win = src.read(window=((row_off, row_end), (col_off, col_end))).astype(np.float32)
             win_nodata = period_nodata_mask(win, period_cfg)
             valid_px = ~win_nodata
-            win_dn = period_to_dn_equivalent(win, period_cfg)
+            win_refl = period_to_texture_reflectance(win, period_cfg)
             if valid_px.sum() < 3:
                 std_vals = np.zeros(7, dtype=np.float32)
             else:
-                std_vals = win_dn[:, valid_px].std(axis=1)
+                std_vals = win_refl[:, valid_px].std(axis=1)
             std_bands = {
                 name: round(float(v), 4)
                 for name, v in zip(("B02", "B03", "B04", "B05", "B08", "B8A", "B11"), std_vals)
@@ -769,8 +1129,13 @@ async def pixel(
             except Exception:
                 continue
 
-    if not result:
+    if not result and ENABLE_DEMO_DATA:
         result = _demo(lat, lon)
+
+    if not result:
+        if not RASTERIO_OK or not cog_available(period_cfg):
+            raise HTTPException(status_code=503, detail="Растровые данные выбранного периода недоступны")
+        raise HTTPException(status_code=404, detail="Нет спутниковых данных для выбранной точки и периода")
 
     def safe(v):
         return None if (v is None or (isinstance(v,float) and math.isnan(v))) else v
@@ -799,6 +1164,63 @@ async def pixel(
 #   ZONE STATISTICS
 # ════════════════════════════════════════════════════════════════
 
+
+def _validate_position(position) -> tuple[float, float]:
+    if not isinstance(position, (list, tuple)) or len(position) != 2:
+        raise HTTPException(status_code=400, detail="Каждая координата должна иметь формат [долгота, широта]")
+    lon, lat = position
+    if isinstance(lon, bool) or isinstance(lat, bool) or not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+        raise HTTPException(status_code=400, detail="Координаты должны быть числами")
+    lon, lat = float(lon), float(lat)
+    if not (math.isfinite(lon) and math.isfinite(lat)):
+        raise HTTPException(status_code=400, detail="Координаты должны быть конечными числами")
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        raise HTTPException(status_code=400, detail="Координаты находятся вне допустимого диапазона WGS84")
+    return lon, lat
+
+
+def _validate_polygon_geometry(geometry: dict, allow_multi: bool = True) -> list:
+    if not isinstance(geometry, dict):
+        raise HTTPException(status_code=400, detail="Ожидается объект GeoJSON Polygon")
+    gtype = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if gtype == "Polygon":
+        polygons = [coordinates]
+    elif gtype == "MultiPolygon" and allow_multi:
+        polygons = coordinates
+    else:
+        expected = "Polygon или MultiPolygon" if allow_multi else "Polygon"
+        raise HTTPException(status_code=400, detail=f"Ожидается GeoJSON {expected}")
+    if not isinstance(polygons, list) or not polygons:
+        raise HTTPException(status_code=400, detail="Полигон не содержит координат")
+
+    vertex_count = 0
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            raise HTTPException(status_code=400, detail="Полигон должен содержать хотя бы одно кольцо")
+        for ring in polygon:
+            if not isinstance(ring, list) or len(ring) < 4:
+                raise HTTPException(status_code=400, detail="Кольцо полигона должно содержать минимум 4 координаты")
+            validated_ring = [_validate_position(position) for position in ring]
+            if validated_ring[0] != validated_ring[-1]:
+                raise HTTPException(status_code=400, detail="Кольцо полигона должно быть замкнуто")
+            vertex_count += len(validated_ring)
+    if vertex_count > MAX_GEOMETRY_VERTICES:
+        raise HTTPException(status_code=413, detail="Геометрия содержит слишком много вершин")
+    return polygons
+
+
+def _validate_linestring_geometry(geometry: dict) -> list[tuple[float, float]]:
+    if not isinstance(geometry, dict) or geometry.get("type") != "LineString":
+        raise HTTPException(status_code=400, detail="Ожидается GeoJSON LineString")
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) < 2:
+        raise HTTPException(status_code=400, detail="Линия должна содержать минимум 2 точки")
+    if len(coordinates) > MAX_GEOMETRY_VERTICES:
+        raise HTTPException(status_code=413, detail="Линия содержит слишком много вершин")
+    return [_validate_position(position) for position in coordinates]
+
+
 class ZoneStatsReq(BaseModel):
     geometry: dict
     period:   str = DEFAULT_PERIOD
@@ -821,14 +1243,14 @@ def _zone_index_stats(arr: "np.ndarray") -> dict:
 
 
 @app.post("/api/zone_stats")
-async def zone_stats(req: ZoneStatsReq):
+@limit_analysis
+def zone_stats(req: ZoneStatsReq):
     period_cfg = resolve_period(req.period)
     if not (RASTERIO_OK and cog_available(period_cfg)):
         raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
 
     geom = req.geometry
-    if not geom or geom.get("type") != "Polygon" or not geom.get("coordinates"):
-        raise HTTPException(status_code=400, detail="Ожидается GeoJSON Polygon")
+    _validate_polygon_geometry(geom, allow_multi=False)
 
     try:
         with rasterio.open(period_cfg["cog_path"]) as ds:
@@ -855,6 +1277,11 @@ async def zone_stats(req: ZoneStatsReq):
             window = window.round_offsets().round_lengths()
             if window.width <= 0 or window.height <= 0:
                 raise HTTPException(status_code=400, detail="Полигон слишком мал или вне покрытия")
+            if int(window.width) * int(window.height) > MAX_ANALYSIS_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Полигон слишком большой для анализа — нарисуйте зону меньшего размера",
+                )
 
             win_transform = ds.window_transform(window)
             data = ds.read(window=window).astype(np.float32)  # (7, h, w)
@@ -870,7 +1297,7 @@ async def zone_stats(req: ZoneStatsReq):
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка чтения растровых данных")
 
     nodata_mask = period_nodata_mask(data, period_cfg)
     valid_mask = poly_mask & ~nodata_mask
@@ -908,6 +1335,7 @@ async def zone_stats(req: ZoneStatsReq):
 
     px_area_ha = 0.01  # 10m x 10m pixel
     lulc = {}
+    load_classifier()
     if CLASSIFIER is not None:
         feats = np.stack([ndvi, ndre, ndwi, ndmi, bsi, b08], axis=1).astype(np.float32)
         preds = CLASSIFIER.predict(feats)
@@ -945,7 +1373,7 @@ def _transect_index(layer: str, b02, b03, b04, b05, b08, b8a, b11, eps: float):
     if layer == "ndvi": return (b08 - b04) / (b08 + b04 + eps)
     if layer == "ndwi": return (b03 - b08) / (b03 + b08 + eps)
     if layer == "ndre": return (b08 - b05) / (b08 + b05 + eps)
-    if layer == "ndmi": return (b08 - b11) / (b08 + b11 + eps)
+    if layer == "ndmi": return (b8a - b11) / (b8a + b11 + eps)
     if layer == "bsi":  return ((b11 + b04) - (b08 + b02)) / ((b11 + b04) + (b08 + b02) + eps)
     if layer == "savi": return (b08 - b04) / (b08 + b04 + 0.5 + eps) * 1.5
     if layer == "nbr":  return (b08 - b11) / (b08 + b11 + eps)
@@ -953,7 +1381,8 @@ def _transect_index(layer: str, b02, b03, b04, b05, b08, b8a, b11, eps: float):
 
 
 @app.post("/api/transect")
-async def transect(req: TransectReq):
+@limit_analysis
+def transect(req: TransectReq):
     period_cfg = resolve_period(req.period)
     if not (RASTERIO_OK and cog_available(period_cfg)):
         raise HTTPException(status_code=500, detail="COG / rasterio недоступны на сервере")
@@ -961,12 +1390,7 @@ async def transect(req: TransectReq):
     if req.layer not in _TRANSECT_LAYERS:
         raise HTTPException(status_code=400, detail=f"layer должен быть одним из: {sorted(_TRANSECT_LAYERS)}")
 
-    geom = req.geometry
-    if not geom or geom.get("type") != "LineString" or not geom.get("coordinates"):
-        raise HTTPException(status_code=400, detail="Ожидается GeoJSON LineString")
-    coords = geom["coordinates"]
-    if len(coords) < 2:
-        raise HTTPException(status_code=400, detail="Линия должна содержать минимум 2 точки")
+    coords = _validate_linestring_geometry(req.geometry)
 
     try:
         with rasterio.open(period_cfg["cog_path"]) as ds:
@@ -1030,7 +1454,7 @@ async def transect(req: TransectReq):
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка чтения растровых данных")
 
     eps = 1e-10
     points = []
@@ -1069,11 +1493,14 @@ async def transect(req: TransectReq):
 class AnalyzeReq(BaseModel):
     lat:        float       = Field(..., ge=40.0, le=47.0)
     lon:        float       = Field(..., ge=65.0, le=72.0)
+    period:     str         = DEFAULT_PERIOD
     ndvi:       float | None = None
     ndwi:       float | None = None
     ndre:       float | None = None
     ndmi:       float | None = None
     bsi:        float | None = None
+    savi:       float | None = None
+    nbr:        float | None = None
     ml_class:       str   | None = None
     ml_class_ru:    str   | None = None
     ml_confidence:  float | None = None
@@ -1092,10 +1519,13 @@ REGIONAL_NORMS = {
 }
 
 
-def build_groq_prompt(lat, lon, indices, ml_class, ml_class_ru, ml_confidence):
+def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confidence):
     """Builds the analysis prompt around deviations from this region's normal
     index ranges for the ML-predicted class, rather than just restating it."""
-    ndvi, ndwi, ndmi, bsi, ndre = (indices.get(k) for k in ("NDVI","NDWI","NDMI","BSI","NDRE"))
+    ndvi, ndwi, ndmi, bsi, ndre, savi, nbr = (
+        indices.get(k) for k in ("NDVI", "NDWI", "NDMI", "BSI", "NDRE", "SAVI", "NBR")
+    )
+    period_label = resolve_period(period)["label"].lower()
     norms = REGIONAL_NORMS.get(ml_class, {})
 
     warnings = []
@@ -1140,9 +1570,9 @@ def build_groq_prompt(lat, lon, indices, ml_class, ml_class_ru, ml_confidence):
 
     return f"""Ты агроэколог и эксперт по землепользованию Туркестанской области Казахстана.
 
-Данные Sentinel-2 для точки {lat:.4f}°N, {lon:.4f}°E (лето 2023):
+Данные Sentinel-2 для точки {lat:.4f}°N, {lon:.4f}°E ({period_label}):
 - Тип покрова: {class_label} (уверенность {confidence_pct}%)
-- NDVI={fmt(ndvi)}, NDRE={fmt(ndre)}, NDWI={fmt(ndwi)}, NDMI={fmt(ndmi)}, BSI={fmt(bsi)}
+- NDVI={fmt(ndvi)}, NDRE={fmt(ndre)}, NDWI={fmt(ndwi)}, NDMI={fmt(ndmi)}, BSI={fmt(bsi)}, SAVI={fmt(savi)}, NBR={fmt(nbr)}
 - Выявленные отклонения: {warnings_text}
 
 Напиши 2-3 предложения на русском языке:
@@ -1154,9 +1584,17 @@ def build_groq_prompt(lat, lon, indices, ml_class, ml_class_ru, ml_confidence):
 
 
 @app.post("/api/analyze")
-async def analyze(req: AnalyzeReq):
-    indices = {"NDVI": req.ndvi, "NDWI": req.ndwi, "NDRE": req.ndre, "NDMI": req.ndmi, "BSI": req.bsi}
-    prompt = build_groq_prompt(req.lat, req.lon, indices, req.ml_class, req.ml_class_ru, req.ml_confidence)
+@limit_analysis
+def analyze(req: AnalyzeReq):
+    resolve_period(req.period)
+    indices = {
+        "NDVI": req.ndvi, "NDWI": req.ndwi, "NDRE": req.ndre,
+        "NDMI": req.ndmi, "BSI": req.bsi, "SAVI": req.savi, "NBR": req.nbr,
+    }
+    prompt = build_groq_prompt(
+        req.lat, req.lon, req.period, indices,
+        req.ml_class, req.ml_class_ru, req.ml_confidence,
+    )
     system = ("Эксперт по дистанционному зондированию Центральной Азии. "
               "Анализируешь Sentinel-2. Отвечай кратко и конкретно на русском.")
 
@@ -1173,18 +1611,18 @@ async def analyze(req: AnalyzeReq):
                     messages=[{"role":"system","content":system},
                                {"role":"user","content":prompt}])
                 return {"analysis": r.choices[0].message.content,
-                        "source":   env.split("_")[0].lower()}
+                        "source": env.split("_")[0].lower(), "model": model}
             except Exception as e:
                 print(f"AI error ({env}): {e}")
 
     # Local fallback
     ndvi = req.ndvi
     if ndvi is None:
-        return {"analysis":"Данные недоступны — выберите другую точку.", "source":"local"}
+        return {"analysis":"Данные недоступны — выберите другую точку.", "source":"local", "model":"local"}
     if   ndvi > 0.5:  txt = f"NDVI={ndvi:.2f} — активная густая растительность. Вероятно ирригированные поля или пойма Сырдарьи. Состояние хорошее."
     elif ndvi > 0.25: txt = f"NDVI={ndvi:.2f} — умеренная растительность. Характерно для пастбищ или полей в начале вегетационного сезона."
     else:             txt = f"NDVI={ndvi:.2f} — слабая растительность. Пустынные или деградированные земли. Возможны засоление и опустынивание."
-    return {"analysis": txt, "source": "local"}
+    return {"analysis": txt, "source": "local", "model": "local"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1195,7 +1633,7 @@ class ZoneReportReq(BaseModel):
     geometry:         dict
     zone_stats:       dict
     active_layer:     str | None = None
-    map_image_base64: str | None = None   # captured client-side, used only for the PDF
+    period:           str = DEFAULT_PERIOD
 
 
 _LULC_LABELS_RU = {
@@ -1209,12 +1647,13 @@ _LULC_LABELS_RU = {
 _LULC_ORDER = ["agriculture", "urban", "dense_vegetation", "sparse_vegetation", "bare_soil", "water"]
 
 
-def build_zone_report_prompt(stats: dict, active_layer: str | None) -> str:
+def build_zone_report_prompt(stats: dict, active_layer: str | None, period: str) -> str:
     """Detailed Russian prompt for a 4-section structured zone report (vs. the
     short 2-3 sentence pixel-level prompt in build_groq_prompt above)."""
     area_ha = stats.get("area_ha") or 0
     idx     = stats.get("indices") or {}
     lulc    = stats.get("lulc") or {}
+    period_label = resolve_period(period)["label"]
 
     def i(key, field):
         v = (idx.get(key) or {}).get(field)
@@ -1230,6 +1669,7 @@ def build_zone_report_prompt(stats: dict, active_layer: str | None) -> str:
 
 ДАННЫЕ ЗОНЫ:
 - Общая площадь: {area_ha:.2f} га
+- Период съёмки: {period_label}
 - Активный слой при анализе: {active_layer or "ndvi"}
 
 СПЕКТРАЛЬНЫЕ ИНДЕКСЫ (среднее по зоне):
@@ -1277,8 +1717,16 @@ def _local_zone_report(stats: dict) -> str:
 
 
 @app.post("/api/zone_report")
-async def zone_report(req: ZoneReportReq):
-    prompt = build_zone_report_prompt(req.zone_stats, req.active_layer)
+@limit_analysis
+def zone_report(req: ZoneReportReq):
+    _validate_polygon_geometry(req.geometry, allow_multi=False)
+    resolve_period(req.period)
+    area_ha = req.zone_stats.get("area_ha") if isinstance(req.zone_stats, dict) else None
+    if isinstance(area_ha, bool) or not isinstance(area_ha, (int, float)) or not math.isfinite(float(area_ha)):
+        raise HTTPException(status_code=400, detail="zone_stats.area_ha должен быть конечным числом")
+    if not isinstance(req.zone_stats.get("indices"), dict) or not isinstance(req.zone_stats.get("lulc"), dict):
+        raise HTTPException(status_code=400, detail="zone_stats должен содержать объекты indices и lulc")
+    prompt = build_zone_report_prompt(req.zone_stats, req.active_layer, req.period)
     system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
               "Пишешь развёрнутые структурированные аналитические отчёты на русском языке.")
 
@@ -1292,11 +1740,11 @@ async def zone_report(req: ZoneReportReq):
                     model="llama-3.1-8b-instant", max_tokens=1500, temperature=0.4,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": prompt}])
-                return {"groq_analysis": r.choices[0].message.content}
+                return {"groq_analysis": r.choices[0].message.content, "model": "llama-3.1-8b-instant"}
             except Exception as e:
                 print(f"Zone report AI error: {e}")
 
-    return {"groq_analysis": _local_zone_report(req.zone_stats)}
+    return {"groq_analysis": _local_zone_report(req.zone_stats), "model": "local"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1359,12 +1807,7 @@ def _normalize_geometry_polygons(geometry: dict) -> list:
     MultiPolygon support exists for the official oblast boundary (Task 3's
     /api/change_overview); hand-drawn zones from the frontend are always a
     plain Polygon, handled as the trivial single-polygon case."""
-    gtype = (geometry or {}).get("type")
-    if gtype == "Polygon":
-        return [geometry["coordinates"]]
-    if gtype == "MultiPolygon":
-        return geometry["coordinates"]
-    raise HTTPException(status_code=400, detail="Ожидается GeoJSON Polygon или MultiPolygon")
+    return _validate_polygon_geometry(geometry, allow_multi=True)
 
 
 def _project_polygons(polygons: list, transformer: "Transformer") -> list:
@@ -1421,10 +1864,10 @@ def _windowed_std_valid(band: "np.ndarray", valid: "np.ndarray", size: int = 3) 
     return std.astype(np.float32)
 
 
-def _v3_texture_stds(dn_padded: "np.ndarray", valid_padded: "np.ndarray") -> list:
-    """dn_padded: (7, h+2, w+2) DN-equivalent bands; valid_padded: (h+2, w+2)
+def _v3_texture_stds(refl_padded: "np.ndarray", valid_padded: "np.ndarray") -> list:
+    """refl_padded: (7, h+2, w+2) reflectance bands; valid_padded: (h+2, w+2)
     bool. Returns 7 std maps cropped back to (h, w), band order B02..B11."""
-    return [_windowed_std_valid(dn_padded[i], valid_padded)[1:-1, 1:-1] for i in range(7)]
+    return [_windowed_std_valid(refl_padded[i], valid_padded)[1:-1, 1:-1] for i in range(7)]
 
 
 def _build_v3_features(idx_map: dict, refl: "np.ndarray", stds: list) -> "np.ndarray":
@@ -1519,7 +1962,7 @@ def build_change_stats_prompt(stats: dict) -> str:
 #   CHANGE STATS — zonal change detection for a drawn polygon
 # ════════════════════════════════════════════════════════════════
 
-_CHANGE_STATS_MAX_PIXELS = 20_000_000  # ~2000 ha guard against an unreasonably huge drawn polygon
+_CHANGE_STATS_MAX_PIXELS = MAX_ANALYSIS_PIXELS
 
 
 class ChangeStatsReq(BaseModel):
@@ -1529,6 +1972,9 @@ class ChangeStatsReq(BaseModel):
 
 
 def _compute_change_stats(geometry: dict, period_before: str, period_after: str) -> dict:
+    load_classifier_v2()
+    if period_before == period_after:
+        raise HTTPException(status_code=400, detail="Для анализа изменений выберите разные периоды")
     before_cfg = resolve_period(period_before)
     after_cfg  = resolve_period(period_after)
     if not (RASTERIO_OK and cog_available(before_cfg) and cog_available(after_cfg)):
@@ -1556,7 +2002,7 @@ def _compute_change_stats(geometry: dict, period_before: str, period_after: str)
             if window.width <= 0 or window.height <= 0:
                 raise HTTPException(status_code=400, detail="Полигон слишком мал или вне покрытия")
             if window.width * window.height > _CHANGE_STATS_MAX_PIXELS:
-                raise HTTPException(status_code=400,
+                raise HTTPException(status_code=413,
                                     detail="Полигон слишком большой для этого анализа — нарисуйте зону меньшего размера")
 
             window_after = window_from_bounds(minx, miny, maxx, maxy, transform=ds_after.transform)
@@ -1574,7 +2020,7 @@ def _compute_change_stats(geometry: dict, period_before: str, period_after: str)
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка чтения COG: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка чтения растровых данных")
 
     nodata_before_p = period_nodata_mask(data_before_p, before_cfg)
     nodata_after_p  = period_nodata_mask(data_after_p,  after_cfg)
@@ -1596,10 +2042,10 @@ def _compute_change_stats(geometry: dict, period_before: str, period_after: str)
     px_area_ha = 0.01
     ml_transitions = None
     if CLASSIFIER_V2 is not None and LABEL_ENCODER_V2 is not None:
-        dn_before_p = period_to_dn_equivalent(data_before_p, before_cfg)
-        dn_after_p  = period_to_dn_equivalent(data_after_p,  after_cfg)
-        stds_before = _v3_texture_stds(dn_before_p, ~nodata_before_p)
-        stds_after  = _v3_texture_stds(dn_after_p,  ~nodata_after_p)
+        texture_before_p = period_to_texture_reflectance(data_before_p, before_cfg)
+        texture_after_p  = period_to_texture_reflectance(data_after_p,  after_cfg)
+        stds_before = _v3_texture_stds(texture_before_p, ~nodata_before_p)
+        stds_after  = _v3_texture_stds(texture_after_p,  ~nodata_after_p)
 
         pred_before = _predict_v3_encoded(idx_before, refl_before, stds_before, valid_mask)
         pred_after  = _predict_v3_encoded(idx_after,  refl_after,  stds_after,  valid_mask)
@@ -1620,7 +2066,8 @@ def _compute_change_stats(geometry: dict, period_before: str, period_after: str)
 
 
 @app.post("/api/change_stats")
-async def change_stats(req: ChangeStatsReq):
+@limit_analysis
+def change_stats(req: ChangeStatsReq):
     stats = _compute_change_stats(req.geometry, req.period_before, req.period_after)
 
     groq_analysis = None
@@ -1688,6 +2135,7 @@ def _set_overview_progress(pct: float):
 
 
 def _compute_change_overview(period_before: str = "2023_summer", period_after: str = "2025_summer") -> dict:
+    load_classifier_v2()
     before_cfg = resolve_period(period_before)
     after_cfg  = resolve_period(period_after)
     polygons = _normalize_geometry_polygons(_load_boundary_geometry())
@@ -1755,10 +2203,10 @@ def _compute_change_overview(period_before: str = "2023_summer", period_after: s
                 a["count"]        += n_valid
 
             if transition_counts is not None:
-                dn_before_p = period_to_dn_equivalent(data_before_p, before_cfg)
-                dn_after_p  = period_to_dn_equivalent(data_after_p,  after_cfg)
-                stds_before = _v3_texture_stds(dn_before_p, ~nodata_before_p)
-                stds_after  = _v3_texture_stds(dn_after_p,  ~nodata_after_p)
+                texture_before_p = period_to_texture_reflectance(data_before_p, before_cfg)
+                texture_after_p  = period_to_texture_reflectance(data_after_p,  after_cfg)
+                stds_before = _v3_texture_stds(texture_before_p, ~nodata_before_p)
+                stds_after  = _v3_texture_stds(texture_after_p,  ~nodata_after_p)
                 pred_before = _predict_v3_encoded(idx_before, refl_before, stds_before, valid_mask)
                 pred_after  = _predict_v3_encoded(idx_after,  refl_after,  stds_after,  valid_mask)
                 pair_idx = pred_before * n_classes + pred_after
@@ -1856,8 +2304,14 @@ def _run_overview_background():
             _OVERVIEW_CACHE.update({"status": "error", "progress": 0, "detail": str(e)})
 
 
-if RASTERIO_OK and BOUNDARY_PATH.exists():
+if ENABLE_CHANGE_OVERVIEW and RASTERIO_OK and BOUNDARY_PATH.exists():
     threading.Thread(target=_run_overview_background, daemon=True).start()
+elif not ENABLE_CHANGE_OVERVIEW:
+    _OVERVIEW_CACHE = {
+        "status": "disabled",
+        "progress": 0,
+        "detail": "Фоновый расчёт отключён; установите ENABLE_CHANGE_OVERVIEW=true для запуска",
+    }
 else:
     _OVERVIEW_CACHE = {"status": "error", "progress": 0, "detail": "COG/граница области недоступны на сервере"}
 
@@ -1886,7 +2340,8 @@ async def metadata():
         "cmaps":  CMAP_CSS,
         "cog":      cog_available(),
         "s2_tiles": len(s2_assets()),
-        "source": "Sentinel-2 SR / Google Earth Engine",
+        "source": "Sentinel-2 L2A / Copernicus Data Space Ecosystem",
+        "forecast": forecast_config(),
     }
 
 
@@ -1896,4 +2351,9 @@ if DATA_DIR.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "8000")),
+        reload=os.getenv("RELOAD", "true").lower() in {"1", "true", "yes"},
+    )

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet-boundary-canvas'   // attaches L.TileLayer.boundaryCanvas
-import { tileUrl, changeTileUrl } from '../api'
+import { tileUrl, changeTileUrl, forecastTileUrl } from '../api'
 
 // Change-detection overlay sits on top of the normal index layer (not instead
 // of it) at this fixed opacity — see ChangeDetectionBar for period/index pick.
@@ -33,8 +33,8 @@ export default function MapView({
   activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
-  changeMode, onToggleChangeMode, changeIndex, changePeriodBefore, changePeriodAfter,
-  splitMode, onToggleSplitMode,
+  changeMode, changeIndex, changePeriodBefore, changePeriodAfter,
+  forecastMode, forecastYear,
 }) {
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
@@ -85,7 +85,7 @@ export default function MapView({
   // init map once
   useEffect(() => {
     const map = L.map(elRef.current, {
-      center, zoom, zoomControl: false, attributionControl: false, preferCanvas: true,
+      center, zoom, zoomControl: false, attributionControl: true, preferCanvas: true,
     })
     mapRef.current = map
 
@@ -157,20 +157,19 @@ export default function MapView({
   // keep bbox ref current (used for fallback click-gating and fit button)
   useEffect(() => { boundsRef.current = bounds }, [bounds])
 
-  // toggle draw mode: cursor + disable double-click zoom (dblclick finishes the polygon instead)
+  // Drawing modes are mutually exclusive in App; one combined effect keeps
+  // cursor/zoom state correct during the transition between them.
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
     const container = map.getContainer()
-    if (drawMode) {
-      container.style.cursor = 'crosshair'
-      map.doubleClickZoom.disable()
-    } else {
-      container.style.cursor = ''
-      map.doubleClickZoom.enable()
-      clearDraw(map)
-    }
-  }, [drawMode])
+    const drawing = drawMode || lineDrawMode
+    container.style.cursor = drawing ? 'crosshair' : ''
+    if (drawing) map.doubleClickZoom.disable()
+    else map.doubleClickZoom.enable()
+    if (!drawMode) clearDraw(map)
+    if (!lineDrawMode) clearLineDraw(map)
+  }, [drawMode, lineDrawMode])
 
   // external "clear" trigger (e.g. a Clear button in the side panel)
   useEffect(() => {
@@ -188,21 +187,6 @@ export default function MapView({
     finishDraw(map)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishSignal])
-
-  // toggle line-draw mode (transect tool) — independent of polygon draw mode
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map) return
-    const container = map.getContainer()
-    if (lineDrawMode) {
-      container.style.cursor = 'crosshair'
-      map.doubleClickZoom.disable()
-    } else {
-      container.style.cursor = ''
-      map.doubleClickZoom.enable()
-      clearLineDraw(map)
-    }
-  }, [lineDrawMode])
 
   useEffect(() => {
     const map = mapRef.current
@@ -418,16 +402,25 @@ export default function MapView({
 
     // "satellite" is a virtual layer — no index tiles, just the basemap/boundary/labels underneath
     if (activeLayer === 'satellite') {
-      Object.values(overlaysRef.current).forEach((layer) => layer.setOpacity(0))
+      Object.values(overlaysRef.current).forEach((layer) => map.removeLayer(layer))
+      overlaysRef.current = {}
       return
     }
 
-    // keyed by layer+period — each period is a separate cached tile layer,
-    // toggled by opacity like the existing per-layer caching below
-    const key = `${activeLayer}:${period}`
+    const showForecast = forecastMode && !!forecastYear
+    const key = showForecast
+      ? `forecast:${activeLayer}:${forecastYear}`
+      : `${activeLayer}:${period}`
+    Object.entries(overlaysRef.current).forEach(([id, layer]) => {
+      if (id === key) return
+      map.removeLayer(layer)
+      delete overlaysRef.current[id]
+    })
     if (!overlaysRef.current[key]) {
       const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
-      const url = tileUrl(activeLayer, period)
+      const url = showForecast
+        ? forecastTileUrl(activeLayer, forecastYear)
+        : tileUrl(activeLayer, period)
       const layer = (clipGeo && L.TileLayer.boundaryCanvas)
         ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
         : L.tileLayer(url, common)
@@ -435,10 +428,8 @@ export default function MapView({
       overlaysRef.current[key] = layer
       boundaryRef.current?.bringToFront?.()   // keep outline above the data
     }
-    Object.entries(overlaysRef.current).forEach(([id, layer]) => {
-      layer.setOpacity(id === key ? opacity : 0)
-    })
-  }, [activeLayer, period, opacity, clipGeo])
+    overlaysRef.current[key].setOpacity(opacity)
+  }, [activeLayer, period, opacity, clipGeo, forecastMode, forecastYear])
 
   // change-detection overlay — independent of the normal index layer above,
   // stacked on top of it at a fixed opacity rather than replacing it
@@ -497,46 +488,25 @@ export default function MapView({
   }
 
   return (
-    <section className="map-section">
+    <section className="map-section" id="map-workspace" tabIndex={-1} aria-label="Интерактивная карта Туркестанской области">
       <div ref={elRef} id="map" />
 
-      <div className="map-toolbar">
-        <button className="map-tool-btn" title="Приближение" onClick={zoomIn}>+</button>
-        <button className="map-tool-btn" title="Отдаление" onClick={zoomOut}>−</button>
+      <div className="map-toolbar" role="toolbar" aria-label="Управление картой">
+        <button type="button" className="map-tool-btn" title="Приближение" aria-label="Приблизить карту" onClick={zoomIn}>+</button>
+        <button type="button" className="map-tool-btn" title="Отдаление" aria-label="Отдалить карту" onClick={zoomOut}>−</button>
         <div className="map-tool-sep" />
-        <button className="map-tool-btn" title="По всей области" onClick={fit}>⊕</button>
-        <button className="map-tool-btn" title={`Базовая карта: ${basemapName} (нажмите для переключения)`} onClick={toggleBasemap}>⊞</button>
+        <button type="button" className="map-tool-btn" title="По всей области" aria-label="Показать всю область" onClick={fit}>⊕</button>
+        <button type="button" className="map-tool-btn" title={`Базовая карта: ${basemapName} (нажмите для переключения)`} aria-label={`Переключить базовую карту. Сейчас: ${basemapName}`} onClick={toggleBasemap}>⊞</button>
         <div className="map-tool-sep" />
         <button
+          type="button"
           className="map-tool-btn"
           title={labelsOn ? 'Скрыть подписи (города, дороги)' : 'Показать подписи'}
+          aria-label={labelsOn ? 'Скрыть подписи городов и дорог' : 'Показать подписи городов и дорог'}
           aria-pressed={labelsOn}
           onClick={toggleLabels}
         >
           {labelsOn ? 'Abc' : 'abc'}
-        </button>
-        <div className="map-tool-sep" />
-        <button
-          className={`map-tool-btn ${changeMode ? 'active' : ''}`}
-          title="Анализ изменений"
-          aria-pressed={changeMode}
-          onClick={onToggleChangeMode}
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <path d="M2 5h9M11 5 8.5 2.5M11 5 8.5 7.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-            <path d="M14 11H5M5 11l2.5 2.5M5 11l2.5-2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
-        <button
-          className={`map-tool-btn ${splitMode ? 'active' : ''}`}
-          title="Сравнить периоды"
-          aria-pressed={splitMode}
-          onClick={onToggleSplitMode}
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <rect x="1.5" y="2.5" width="5.5" height="11" rx="1" stroke="currentColor" strokeWidth="1.3" />
-            <rect x="9" y="2.5" width="5.5" height="11" rx="1" stroke="currentColor" strokeWidth="1.3" />
-          </svg>
         </button>
       </div>
 
@@ -545,6 +515,12 @@ export default function MapView({
         <span className="map-footer-sep">·</span>
         <span>EPSG:32641</span>
         <span className="map-footer-sep">·</span>
+        {forecastMode && (
+          <>
+            <span>Прогноз {forecastYear}</span>
+            <span className="map-footer-sep">·</span>
+          </>
+        )}
         <span>{hover ? `${hover.lat.toFixed(5)}°N · ${hover.lng.toFixed(5)}°E` : 'Наведите курсор на карту'}</span>
       </div>
     </section>
