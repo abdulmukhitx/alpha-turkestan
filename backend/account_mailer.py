@@ -104,6 +104,22 @@ class AccountMailer:
     def _action_url(self, query_key: str, token: str) -> str:
         return f"{self.public_app_url}/?{urlencode({query_key: token})}"
 
+    def status(self) -> dict:
+        if self.development_mode:
+            mode = "development"
+            configured = True
+        elif self.smtp_host:
+            mode = "smtp"
+            configured = True
+        else:
+            mode = "disabled"
+            configured = False
+        return {
+            "configured": configured,
+            "mode": mode,
+            "starttls": bool(self.smtp_starttls) if mode == "smtp" else None,
+        }
+
     def send_verification(self, user: dict, token: str, locale: str = "ru") -> DeliveryResult:
         url = self._action_url("verify_email", token)
         return self._deliver(user, url, locale, "verify")

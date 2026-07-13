@@ -1,5 +1,6 @@
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts'
 import { useI18n } from '../i18n.jsx'
+import SaveAnalysisAction from './SaveAnalysisAction.jsx'
 
 const INDEX_CODES = {
   ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI',
@@ -12,7 +13,7 @@ const DIRECTION_COLORS = {
   stable: '#eab308',
 }
 
-export default function ForecastPanel({ point, result, loading, error, targetYear, index, onClose }) {
+export default function ForecastPanel({ point, result, loading, error, targetYear, index, canSaveAnalysis, onSaveAnalysis, onClose }) {
   const { t } = useI18n()
   const trend = result?.trend
   const code = INDEX_CODES[result?.index || index] || (result?.index || index || '').toUpperCase()
@@ -36,6 +37,7 @@ export default function ForecastPanel({ point, result, loading, error, targetYea
         </div>
         <button className="panel-close" type="button" onClick={onClose} aria-label={t('analysis.hide')}>×</button>
       </div>
+      <SaveAnalysisAction visible={canSaveAnalysis && !!result} onSave={onSaveAnalysis} />
 
       {!point ? (
         <div className="click-prompt">

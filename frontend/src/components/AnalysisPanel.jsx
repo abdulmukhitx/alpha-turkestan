@@ -2,6 +2,7 @@ import ZoneStatsPanel from './ZoneStatsPanel.jsx'
 import TransectChart from './TransectChart.jsx'
 import ChangeStatsPanel from './ChangeStatsPanel.jsx'
 import ForecastPanel from './ForecastPanel.jsx'
+import SaveAnalysisAction from './SaveAnalysisAction.jsx'
 import { useI18n } from '../i18n.jsx'
 
 function PanelHeader({ hasPoint, onClose }) {
@@ -72,6 +73,8 @@ export default function AnalysisPanel({
   transectData, transectLoading, transectError,
   changeStats, changeLoading, changeError,
   forecastMode, forecastResult, forecastLoading, forecastError, forecastYear, forecastIndex,
+  alertRules, onAlertRulesChange, alertsCloudMode,
+  canSaveAnalysis, onSaveAnalysis,
   onClose,
 }) {
   const { t } = useI18n()
@@ -84,6 +87,8 @@ export default function AnalysisPanel({
         error={forecastError}
         targetYear={forecastYear}
         index={forecastIndex}
+        canSaveAnalysis={canSaveAnalysis}
+        onSaveAnalysis={onSaveAnalysis}
         onClose={onClose}
       />
     )
@@ -93,6 +98,7 @@ export default function AnalysisPanel({
     return (
       <aside className="panel panel-right" id="analysis-panel" aria-label={t('analysis.title')}>
         <PanelHeader hasPoint={false} onClose={onClose} />
+        <SaveAnalysisAction visible={canSaveAnalysis && !!(zoneStats || transectData || changeStats)} onSave={onSaveAnalysis} />
         <div className="click-prompt">
           <svg className="click-icon" width="30" height="30" viewBox="0 0 32 32" fill="none">
             <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="1" strokeDasharray="3 2" opacity="0.5" />
@@ -107,6 +113,7 @@ export default function AnalysisPanel({
           geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
           zoneName={zoneName} timeSeries={zoneTimeSeries}
           timeSeriesLoading={zoneTimeSeriesLoading} timeSeriesError={zoneTimeSeriesError}
+          alertRules={alertRules} onAlertRulesChange={onAlertRulesChange} alertsCloudMode={alertsCloudMode}
         />
         <TransectChart data={transectData} loading={transectLoading} error={transectError} />
         <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />
@@ -117,6 +124,7 @@ export default function AnalysisPanel({
   return (
     <aside className="panel panel-right" id="analysis-panel" aria-label={t('analysis.title')}>
       <PanelHeader hasPoint onClose={onClose} />
+      <SaveAnalysisAction visible={canSaveAnalysis && !!(pixel || zoneStats || transectData || changeStats)} onSave={onSaveAnalysis} />
 
       <div className="result-location">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
@@ -181,6 +189,7 @@ export default function AnalysisPanel({
         geometry={zoneGeometry} activeLayer={activeLayer} period={zonePeriod}
         zoneName={zoneName} timeSeries={zoneTimeSeries}
         timeSeriesLoading={zoneTimeSeriesLoading} timeSeriesError={zoneTimeSeriesError}
+        alertRules={alertRules} onAlertRulesChange={onAlertRulesChange} alertsCloudMode={alertsCloudMode}
       />
       <TransectChart data={transectData} loading={transectLoading} error={transectError} />
       <ChangeStatsPanel stats={changeStats} loading={changeLoading} error={changeError} />

@@ -78,6 +78,7 @@ export default function TopBar({
           </svg>
         </button>
         <button
+          data-account-entry="true"
           className={`account-entry ${account ? 'authenticated' : ''}`}
           type="button"
           onClick={onAccountOpen}

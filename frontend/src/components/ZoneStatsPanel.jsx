@@ -46,6 +46,7 @@ function indexBarColor(mean, key) {
 export default function ZoneStatsPanel({
   stats, loading, error, geometry, activeLayer, period, zoneName,
   timeSeries, timeSeriesLoading, timeSeriesError,
+  alertRules, onAlertRulesChange, alertsCloudMode,
 }) {
   const { t, formatNumber } = useI18n()
   if (!loading && !error && !stats) return null
@@ -105,6 +106,9 @@ export default function ZoneStatsPanel({
             loading={timeSeriesLoading}
             error={timeSeriesError}
             activeLayer={activeLayer}
+            alertRules={alertRules}
+            onAlertRulesChange={onAlertRulesChange}
+            alertsCloudMode={alertsCloudMode}
           />
 
           {stats.lulc && Object.keys(stats.lulc).length > 0 && (

@@ -12,14 +12,27 @@ async function accountRequest(path, options = {}) {
     const message = Array.isArray(detail?.detail)
       ? detail.detail.map((item) => item.msg).filter(Boolean).join('. ')
       : (detail?.detail?.message || detail?.detail)
-    let code = null
+    const providerErrorCodes = {
+      google_token_invalid: 'error.googleInvalid',
+      google_link_required: 'error.googleLinkRequired',
+      google_identity_conflict: 'error.googleIdentityConflict',
+      google_not_configured: 'error.googleUnavailable',
+      google_unavailable: 'error.googleUnavailable',
+      email_verification_required: 'error.emailVerificationRequired',
+    }
+    let code = providerErrorCodes[detail?.detail?.code] || null
     if (response.status === 429) code = 'error.tooManyRequests'
     else if (path.endsWith('/register') && response.status === 409) code = 'error.duplicateEmail'
-    else if (path.endsWith('/login') && response.status === 401) code = 'error.invalidCredentials'
+    else if (path === '/api/account/login' && response.status === 401) code = 'error.invalidCredentials'
     else if (path.endsWith('/verification/confirm') && response.status === 400) code = 'error.invalidVerificationLink'
     else if (path.endsWith('/password/reset') && response.status === 400) code = 'error.invalidResetLink'
+    else if (path.endsWith('/password/change') && response.status === 401) code = 'error.wrongPassword'
+    else if (path.endsWith('/password/change') && response.status === 400) code = 'error.passwordUnchanged'
+    else if (path.endsWith('/password/change') && response.status === 422) code = 'error.passwordPolicy'
+    else if (path.includes('/sessions/') && response.status === 404) code = 'error.sessionNotFound'
+    else if (path.includes('/analyses/') && response.status === 404) code = 'error.analysisNotFound'
     else if (path === '/api/account' && response.status === 401) code = 'error.wrongPassword'
-    else if (response.status === 403) code = 'error.securityCheck'
+    else if (response.status === 403 && !code) code = 'error.securityCheck'
     const error = new Error(message || `Account request failed: ${response.status}`)
     error.code = code
     throw error
@@ -46,6 +59,16 @@ export const loginAccount = (details) => accountRequest('/api/account/login', {
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
 })
 
+export const fetchAccountAuthConfig = () => accountRequest('/api/account/auth/config')
+
+export const loginWithGoogle = (details) => accountRequest('/api/account/google/login', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
+})
+
+export const linkGoogleAccount = (details) => accountRequest('/api/account/google/link', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
+})
+
 export const resendEmailVerification = () => accountRequest('/api/account/verification/resend', {
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS,
 })
@@ -62,6 +85,20 @@ export const resetAccountPassword = (details) => accountRequest('/api/account/pa
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
 })
 
+export const changeAccountPassword = (details) => accountRequest('/api/account/password/change', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
+})
+
+export const fetchAccountSessions = () => accountRequest('/api/account/sessions')
+
+export const revokeAccountSession = (sessionId) => accountRequest(`/api/account/sessions/${encodeURIComponent(sessionId)}`, {
+  method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
+})
+
+export const revokeOtherAccountSessions = () => accountRequest('/api/account/sessions/revoke-others', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS,
+})
+
 export const logoutAccount = () => accountRequest('/api/account/logout', {
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS,
 })
@@ -76,7 +113,7 @@ export const updateAccountPreferences = (preferences) => accountRequest('/api/ac
 
 export const fetchAccountExport = () => accountRequest('/api/account/export')
 
-export const deleteAccount = (password) => accountRequest('/api/account', {
+export const deleteAccount = (password = null) => accountRequest('/api/account', {
   method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify({ password }),
 })
 
@@ -96,6 +133,16 @@ export const deleteAccountZone = (id) => accountRequest(`/api/account/zones/${en
 
 export const importAccountZones = (zones) => accountRequest('/api/account/zones/import', {
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify({ zones }),
+})
+
+export const fetchSavedAnalyses = () => accountRequest('/api/account/analyses')
+
+export const createSavedAnalysis = (analysis) => accountRequest('/api/account/analyses', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(analysis),
+})
+
+export const deleteSavedAnalysis = (analysisId) => accountRequest(`/api/account/analyses/${encodeURIComponent(analysisId)}`, {
+  method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
 })
 
 export async function fetchHealth() {

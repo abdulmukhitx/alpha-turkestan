@@ -2,23 +2,25 @@ import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import TopBar from './components/TopBar.jsx'
 import LayerPanel from './components/LayerPanel.jsx'
 import MapView from './components/MapView.jsx'
-import AnalysisPanel from './components/AnalysisPanel.jsx'
 import ChangeDetectionBar from './components/ChangeDetectionBar.jsx'
 import ForecastBar from './components/ForecastBar.jsx'
 import WorkspaceNav from './components/WorkspaceNav.jsx'
 import AccountDialog from './components/AccountDialog.jsx'
 import ZoneMigrationDialog from './components/ZoneMigrationDialog.jsx'
 import {
-  createAccountZone, deleteAccount, deleteAccountZone, fetchAccountExport, fetchAccountZones,
+  changeAccountPassword, createAccountZone, createSavedAnalysis, deleteAccount, deleteAccountZone, deleteSavedAnalysis,
+  fetchAccountAuthConfig, fetchAccountExport, fetchAccountSessions, fetchAccountZones, fetchSavedAnalyses,
   confirmEmailVerification, fetchAnalysis, fetchChangeStats, fetchCurrentAccount, fetchHealth, fetchMetadata, fetchPeriods,
   fetchPixel, fetchPointForecast, fetchTransect, fetchZoneStats, fetchZoneTimeSeries, importAccountZones,
-  loginAccount, logoutAccount, registerAccount, requestPasswordReset, resendEmailVerification, resetAccountPassword,
+  linkGoogleAccount, loginAccount, loginWithGoogle, logoutAccount, registerAccount, requestPasswordReset, resendEmailVerification, resetAccountPassword,
+  revokeAccountSession, revokeOtherAccountSessions,
   updateAccountPreferences, updateAccountProfile, updateAccountZone,
 } from './api'
 import { clearSavedZones, cloneGeometry, newZoneId, readSavedZones, writeSavedZones } from './zoneStorage.js'
 import { useI18n } from './i18n.jsx'
 
 const SplitMapView = lazy(() => import('./components/SplitMapView.jsx'))
+const AnalysisPanel = lazy(() => import('./components/AnalysisPanel.jsx'))
 
 const FALLBACK_CENTER = [43.39, 68.36]
 const FALLBACK_ZOOM = 7
@@ -42,18 +44,21 @@ export default function App() {
   const [periods, setPeriods] = useState([])
   const [period, setPeriod] = useState('2025_summer')
   const [activeLayer, setActiveLayer] = useState('ndvi')
+  const [defaultBasemap, setDefaultBasemap] = useState('satellite')
   const [opacity, setOpacity] = useState(0.85)
   const [hoverPos, setHoverPos] = useState(null)
   const [leftPanelOpen, setLeftPanelOpen] = useState(true)
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
 
   const [account, setAccount] = useState(null)
+  const [accountAuthConfig, setAccountAuthConfig] = useState({ google: { enabled: false, client_id: null } })
   const [accountLoading, setAccountLoading] = useState(true)
   const [accountDialogOpen, setAccountDialogOpen] = useState(false)
   const [accountDialogView, setAccountDialogView] = useState('login')
   const [accountDialogNotice, setAccountDialogNotice] = useState('')
   const [accountDialogError, setAccountDialogError] = useState('')
   const [passwordResetToken, setPasswordResetToken] = useState('')
+  const [analysisHistoryRevision, setAnalysisHistoryRevision] = useState(0)
   const [pendingLocalZones, setPendingLocalZones] = useState(null)
   const [migrationLoading, setMigrationLoading] = useState(false)
   const [migrationError, setMigrationError] = useState(null)
@@ -234,15 +239,23 @@ export default function App() {
 
   function refreshData() {
     fetchHealth().then(setHealth).catch(() => setHealth({ status: 'offline' }))
+    refreshAccountAuthConfig().catch(() => {})
     fetchMetadata().then(setMeta).catch(() => setMeta(null))
     fetchPeriods()
       .then((items) => setPeriods(items.filter((item) => item.available !== false)))
       .catch(() => setPeriods([]))
   }
 
+  async function refreshAccountAuthConfig() {
+    const config = await fetchAccountAuthConfig()
+    setAccountAuthConfig(config)
+    return config
+  }
+
   function applyAccountPreferences(preferences = {}) {
     if (preferences.locale) setLocale(preferences.locale)
     if (preferences.default_layer) setActiveLayer(preferences.default_layer)
+    if (preferences.default_basemap) setDefaultBasemap(preferences.default_basemap)
     if (preferences.default_period) setPeriod(preferences.default_period)
     if (typeof preferences.default_opacity === 'number') setOpacity(preferences.default_opacity)
     if (typeof preferences.left_panel_open === 'boolean') setLeftPanelOpen(preferences.left_panel_open)
@@ -251,13 +264,18 @@ export default function App() {
 
   async function activateAccountSession(session, { offerMigration = true } = {}) {
     const localZones = readSavedZones()
-    const result = await fetchAccountZones()
     setAccount(session)
-    setSavedZones(result.zones || [])
     setActiveZoneId(null)
     setZoneDirty(false)
     setZoneStorageError(null)
     applyAccountPreferences(session.preferences)
+    if (!session.user.email_verified) {
+      setSavedZones(localZones)
+      setPendingLocalZones(null)
+      return session
+    }
+    const result = await fetchAccountZones()
+    setSavedZones(result.zones || [])
     if (offerMigration && localZones.length) {
       setPendingLocalZones(localZones)
       setMigrationError(null)
@@ -330,6 +348,19 @@ export default function App() {
     return session
   }
 
+  async function handleGoogleLogin(credential) {
+    const session = await loginWithGoogle({ credential, locale })
+    await activateAccountSession(session)
+    setAccountDialogOpen(false)
+    return session
+  }
+
+  async function handleGoogleLink(credential) {
+    const session = await linkGoogleAccount({ credential, locale })
+    setAccount(session)
+    return session
+  }
+
   async function handleSaveProfile(displayName, preferences) {
     await updateAccountProfile(displayName)
     const session = await updateAccountPreferences(preferences)
@@ -362,6 +393,81 @@ export default function App() {
 
   async function handleResendVerification() {
     return resendEmailVerification()
+  }
+
+  async function handleAlertRulesChange(thresholdAlerts) {
+    if (!account) return null
+    const session = await updateAccountPreferences({
+      ...account.preferences,
+      threshold_alerts: thresholdAlerts,
+    })
+    setAccount(session)
+    return session
+  }
+
+  async function handleSaveAnalysis() {
+    let analysis = null
+    if (forecastMode && forecastResult) {
+      analysis = {
+        kind: 'forecast',
+        title: t('history.forecastTitle', { index: activeLayer.toUpperCase(), year: forecastYear }),
+        payload: { point, index: activeLayer, target_year: forecastYear, result: forecastResult },
+      }
+    } else if (changeStats) {
+      analysis = {
+        kind: 'change',
+        title: t('history.changeTitle', { before: changePeriodBefore.slice(0, 4), after: changePeriodAfter.slice(0, 4) }),
+        payload: {
+          geometry: changePolygon,
+          index: changeIndex,
+          period_before: changePeriodBefore,
+          period_after: changePeriodAfter,
+          result: changeStats,
+        },
+      }
+    } else if (zoneStats) {
+      analysis = {
+        kind: 'zone',
+        title: activeSavedZone?.name || t('history.zoneTitle'),
+        payload: {
+          geometry: zonePolygon,
+          index: zoneContext.layer,
+          period: zoneContext.period,
+          result: zoneStats,
+          time_series: zoneTimeSeries,
+        },
+      }
+    } else if (transectData) {
+      analysis = {
+        kind: 'transect',
+        title: t('history.transectTitle', { index: activeLayer.toUpperCase() }),
+        payload: { index: activeLayer, period, result: transectData },
+      }
+    } else if (pixel) {
+      analysis = {
+        kind: 'point',
+        title: t('history.pointTitle', { index: activeLayer.toUpperCase(), period: period.slice(0, 4) }),
+        payload: { point, index: activeLayer, period, result: pixel, interpretation: aiText },
+      }
+    }
+    if (!analysis) throw new Error(t('history.nothingToSave'))
+    const saved = await createSavedAnalysis(analysis)
+    setAnalysisHistoryRevision((value) => value + 1)
+    return saved
+  }
+
+  async function handleRevokeAccountSession(sessionId) {
+    const result = await revokeAccountSession(sessionId)
+    if (result.current) {
+      setAccount(null)
+      setSavedZones(readSavedZones())
+      setActiveZoneId(null)
+      setZoneDirty(false)
+      setPendingLocalZones(null)
+      setMigrationError(null)
+      setAccountDialogOpen(false)
+    }
+    return result
   }
 
   async function handleLogout() {
@@ -402,6 +508,7 @@ export default function App() {
   }
 
   function openAccountDialog() {
+    refreshAccountAuthConfig().catch(() => {})
     setAccountDialogView(account ? 'profile' : 'login')
     setAccountDialogNotice('')
     setAccountDialogError('')
@@ -592,7 +699,7 @@ export default function App() {
       createdAt: now,
       updatedAt: now,
     }
-    if (account) {
+    if (account?.user?.email_verified) {
       try {
         const saved = await createAccountZone(zone)
         setSavedZones((current) => [saved, ...current])
@@ -613,7 +720,7 @@ export default function App() {
 
   async function handleUpdateZone() {
     if (!zonePolygon || !activeZoneId) return false
-    if (account) {
+    if (account?.user?.email_verified) {
       try {
         const updated = await updateAccountZone(activeZoneId, { geometry: cloneGeometry(zonePolygon) })
         setSavedZones((current) => current.map((zone) => zone.id === activeZoneId ? updated : zone))
@@ -655,7 +762,7 @@ export default function App() {
   }
 
   async function handleRenameZone(id, name) {
-    if (account) {
+    if (account?.user?.email_verified) {
       try {
         const updated = await updateAccountZone(id, { name })
         setSavedZones((current) => current.map((zone) => zone.id === id ? updated : zone))
@@ -675,7 +782,7 @@ export default function App() {
   async function handleDeleteZone(id) {
     const zone = savedZones.find((item) => item.id === id)
     if (!zone || !window.confirm(t('saved.deleteConfirm', { name: zone.name }))) return false
-    if (account) {
+    if (account?.user?.email_verified) {
       try {
         await deleteAccountZone(id)
         setSavedZones((current) => current.filter((item) => item.id !== id))
@@ -934,6 +1041,7 @@ export default function App() {
         onPeriodChange={setPeriod}
         periodDisabled={forecastMode}
         account={account}
+        authConfig={accountAuthConfig}
         accountLoading={accountLoading}
         onAccountOpen={openAccountDialog}
         onLocaleChange={handleLocaleChange}
@@ -996,6 +1104,7 @@ export default function App() {
             bounds={meta?.region?.bounds}
             center={meta?.region?.center || FALLBACK_CENTER}
             zoom={FALLBACK_ZOOM}
+            initialBasemap={defaultBasemap}
             leftPeriod={splitLeftPeriod}
             leftIndex={splitLeftIndex}
             onLeftPeriodChange={setSplitLeftPeriod}
@@ -1027,6 +1136,7 @@ export default function App() {
             bounds={meta?.region?.bounds}
             center={meta?.region?.center || FALLBACK_CENTER}
             zoom={FALLBACK_ZOOM}
+            initialBasemap={defaultBasemap}
             onPointClick={handlePointClick}
             onMouseMove={(lat, lng) => setHoverPos({ lat, lng })}
             onZoomChange={() => {}}
@@ -1054,6 +1164,7 @@ export default function App() {
         )}
 
         {showRightPanel && (
+          <Suspense fallback={<aside className="panel panel-right map-lazy-loading">{t('boot.map')}</aside>}>
           <AnalysisPanel
             point={point}
             pixel={pixel}
@@ -1082,8 +1193,14 @@ export default function App() {
             forecastError={forecastError}
             forecastYear={forecastYear}
             forecastIndex={activeLayer}
+            alertRules={account?.preferences?.threshold_alerts || []}
+            onAlertRulesChange={handleAlertRulesChange}
+            alertsCloudMode={account?.user?.email_verified === true}
+            canSaveAnalysis={account?.user?.email_verified === true}
+            onSaveAnalysis={handleSaveAnalysis}
             onClose={() => setRightPanelOpen(false)}
           />
+          </Suspense>
         )}
       </main>
 
@@ -1119,10 +1236,14 @@ export default function App() {
         initialError={accountDialogError}
         resetToken={passwordResetToken}
         account={account}
+        authConfig={accountAuthConfig}
         periods={periods}
         onClose={() => { setAccountDialogOpen(false); setAccountDialogNotice(''); setAccountDialogError('') }}
         onLogin={handleLogin}
         onRegister={handleRegister}
+        onGoogleLogin={handleGoogleLogin}
+        onGoogleLink={handleGoogleLink}
+        onRefreshAuthConfig={refreshAccountAuthConfig}
         onSaveProfile={handleSaveProfile}
         onLogout={handleLogout}
         onExport={fetchAccountExport}
@@ -1130,6 +1251,13 @@ export default function App() {
         onForgotPassword={handleForgotPassword}
         onResetPassword={handleResetPassword}
         onResendVerification={handleResendVerification}
+        onChangePassword={changeAccountPassword}
+        onFetchSessions={fetchAccountSessions}
+        onRevokeSession={handleRevokeAccountSession}
+        onRevokeOtherSessions={revokeOtherAccountSessions}
+        analysisRefreshKey={analysisHistoryRevision}
+        onFetchAnalyses={fetchSavedAnalyses}
+        onDeleteAnalysis={deleteSavedAnalysis}
       />
 
       <ZoneMigrationDialog

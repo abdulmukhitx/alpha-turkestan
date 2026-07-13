@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useI18n } from '../i18n.jsx'
+import AccountSecurityPanel from './AccountSecurityPanel.jsx'
+import AnalysisHistoryPanel from './AnalysisHistoryPanel.jsx'
+import GoogleSignInButton from './GoogleSignInButton.jsx'
 
 const LAYER_OPTIONS = [
   ['satellite', 'layer.satellite'],
@@ -27,11 +30,14 @@ function downloadJson(payload) {
 }
 
 export default function AccountDialog({
-  open, initialView = 'login', initialNotice = '', initialError = '', resetToken = '', account, periods,
+  open, initialView = 'login', initialNotice = '', initialError = '', resetToken = '', account, authConfig, periods,
   onClose, onLogin, onRegister, onSaveProfile, onLogout, onExport, onDeleteAccount,
+  onGoogleLogin, onGoogleLink, onRefreshAuthConfig,
   onForgotPassword, onResetPassword, onResendVerification,
+  onChangePassword, onFetchSessions, onRevokeSession, onRevokeOtherSessions,
+  analysisRefreshKey, onFetchAnalyses, onDeleteAnalysis,
 }) {
-  const { locale, t, periodLabel } = useI18n()
+  const { locale, t, formatDate, periodLabel } = useI18n()
   const [view, setView] = useState(initialView)
   const [authForm, setAuthForm] = useState(EMPTY_AUTH)
   const [profileForm, setProfileForm] = useState(null)
@@ -42,6 +48,11 @@ export default function AccountDialog({
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deletePassword, setDeletePassword] = useState('')
   const [developmentLink, setDevelopmentLink] = useState('')
+  const dialogRef = useRef(null)
+  const busyRef = useRef(busy)
+  const onCloseRef = useRef(onClose)
+  busyRef.current = busy
+  onCloseRef.current = onClose
 
   const availablePeriodIds = useMemo(() => new Set(periods.map((item) => item.period_id)), [periods])
 
@@ -61,12 +72,14 @@ export default function AccountDialog({
         locale: preferences.locale || locale,
         timezone: preferences.timezone || 'Asia/Qyzylorda',
         default_layer: preferences.default_layer || 'ndvi',
+        default_basemap: preferences.default_basemap || 'satellite',
         default_period: availablePeriodIds.has(preferences.default_period)
           ? preferences.default_period
           : (periods.at(-1)?.period_id || '2025_summer'),
         default_opacity: preferences.default_opacity ?? 0.85,
         left_panel_open: preferences.left_panel_open !== false,
         right_panel_open: preferences.right_panel_open === true,
+        threshold_alerts: preferences.threshold_alerts || [],
       })
     } else {
       setAuthForm(EMPTY_AUTH)
@@ -78,12 +91,45 @@ export default function AccountDialog({
 
   useEffect(() => {
     if (!open) return undefined
+    const previouslyFocused = document.activeElement
+    const frame = window.requestAnimationFrame(() => {
+      const focusable = dialogRef.current?.querySelector('input:not(:disabled), select:not(:disabled)')
+        || dialogRef.current?.querySelector('button:not(:disabled), a[href]')
+      focusable?.focus()
+    })
     function handleKey(event) {
-      if (event.key === 'Escape' && !busy) onClose()
+      if (event.key === 'Escape' && !busyRef.current) {
+        onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return
+      const focusable = [...dialogRef.current.querySelectorAll(
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href], iframe'
+      )].filter((element) => element.offsetParent !== null)
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [open, busy, onClose])
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('keydown', handleKey)
+      const fallback = document.querySelector('[data-account-entry="true"]')
+      const restoreTarget = previouslyFocused instanceof HTMLElement
+        && previouslyFocused !== document.body
+        && previouslyFocused.isConnected
+        ? previouslyFocused
+        : fallback
+      restoreTarget?.focus()
+    }
+  }, [open])
 
   if (!open) return null
 
@@ -97,12 +143,29 @@ export default function AccountDialog({
   }
 
   function showDelivery(result, successKey) {
+    const delivery = result?.delivery || result?.verification_delivery
+    if (delivery?.sent === false) {
+      setNotice('')
+      setDevelopmentLink('')
+      setError(t('error.emailDelivery'))
+      return false
+    }
+    setError('')
     setNotice(t(successKey))
-    setDevelopmentLink(result?.delivery?.preview_url || result?.verification_delivery?.preview_url || '')
+    setDevelopmentLink(delivery?.preview_url || '')
+    return true
   }
 
   function localizedError(requestError, fallbackKey) {
     return requestError?.code ? t(requestError.code) : (requestError?.message || t(fallbackKey))
+  }
+
+  function accountDate(value) {
+    if (!value) return t('account.notAvailable')
+    const date = new Date(value)
+    return Number.isNaN(date.getTime())
+      ? value
+      : formatDate(date, { dateStyle: 'medium', timeStyle: 'short' })
   }
 
   async function submitAuth(event) {
@@ -188,9 +251,42 @@ export default function AccountDialog({
     setBusy(true)
     setError('')
     try {
-      await onDeleteAccount(deletePassword)
+      await onDeleteAccount(account.user.has_password === false ? null : deletePassword)
     } catch (requestError) {
       setError(localizedError(requestError, 'error.deleteAccount'))
+      setBusy(false)
+    }
+  }
+
+  async function handleGoogleCredential(credential, linking = false) {
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      if (linking) {
+        await onGoogleLink(credential)
+        setNotice(t('account.googleConnected'))
+      } else {
+        await onGoogleLogin(credential)
+      }
+    } catch (requestError) {
+      setError(localizedError(requestError, linking ? 'error.googleLink' : 'error.googleLogin'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function retryGoogleConfiguration() {
+    setBusy(true)
+    setError('')
+    try {
+      const config = await onRefreshAuthConfig()
+      if (!config?.google?.enabled || !config?.google?.client_id) {
+        setError(t('error.googleRestartRequired'))
+      }
+    } catch {
+      setError(t('error.googleUnavailable'))
+    } finally {
       setBusy(false)
     }
   }
@@ -202,10 +298,13 @@ export default function AccountDialog({
       : view === 'reset'
         ? t('account.newPasswordTitle')
         : t('account.login')
+  const googleEnabled = Boolean(authConfig?.google?.enabled && authConfig?.google?.client_id)
+  const googleLinked = account?.user?.auth_methods?.includes('google') === true
+  const hasPassword = account?.user?.has_password !== false
 
   return (
     <div className="account-overlay" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
-      <section className="account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-dialog-title">
+      <section ref={dialogRef} className="account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-dialog-title">
         <button type="button" className="account-dialog-close" onClick={onClose} disabled={busy} aria-label={t('common.close')}>×</button>
 
         {account && profileForm ? (
@@ -217,6 +316,11 @@ export default function AccountDialog({
                 <h2 id="account-dialog-title">{t('account.title')}</h2>
                 <p>{account.user.email}</p>
               </div>
+            </div>
+
+            <div className="account-profile-meta">
+              <span>{t('account.memberSince')} <strong>{accountDate(account.user.created_at)}</strong></span>
+              <span>{t('account.lastLogin')} <strong>{accountDate(account.user.last_login_at)}</strong></span>
             </div>
 
             <div className={`account-verification ${account.user.email_verified ? 'verified' : ''}`}>
@@ -266,12 +370,20 @@ export default function AccountDialog({
                     </select>
                   </label>
                   <label>
-                    <span>{t('account.period')}</span>
-                    <select value={profileForm.default_period} onChange={(event) => setProfileField('default_period', event.target.value)}>
-                      {periods.map((item) => <option key={item.period_id} value={item.period_id}>{periodLabel(item)}</option>)}
+                    <span>{t('account.basemap')}</span>
+                    <select value={profileForm.default_basemap} onChange={(event) => setProfileField('default_basemap', event.target.value)}>
+                      <option value="satellite">{t('map.basemapSatellite')}</option>
+                      <option value="terrain">{t('map.basemapTerrain')}</option>
+                      <option value="dark">{t('map.basemapDark')}</option>
                     </select>
                   </label>
                 </div>
+                <label>
+                  <span>{t('account.period')}</span>
+                  <select value={profileForm.default_period} onChange={(event) => setProfileField('default_period', event.target.value)}>
+                    {periods.map((item) => <option key={item.period_id} value={item.period_id}>{periodLabel(item)}</option>)}
+                  </select>
+                </label>
                 <label>
                   <span>{t('layer.opacity')} · {Math.round(profileForm.default_opacity * 100)}%</span>
                   <input type="range" min="0" max="100" value={Math.round(profileForm.default_opacity * 100)} onChange={(event) => setProfileField('default_opacity', Number(event.target.value) / 100)} />
@@ -292,6 +404,40 @@ export default function AccountDialog({
               </div>
             </form>
 
+            {(googleEnabled || googleLinked) && (
+              <section className="account-google-connection" aria-labelledby="account-google-title">
+                <div>
+                  <h3 id="account-google-title">{t('account.googleSignIn')}</h3>
+                  <p>{googleLinked ? t('account.googleLinked') : t('account.googleLinkHelp')}</p>
+                </div>
+                {googleLinked ? (
+                  <span className="account-provider-connected">✓ {t('account.connected')}</span>
+                ) : (
+                  <GoogleSignInButton
+                    clientId={authConfig.google.client_id}
+                    locale={locale}
+                    disabled={busy}
+                    onCredential={(credential) => handleGoogleCredential(credential, true)}
+                    onError={() => setError(t('error.googleUnavailable'))}
+                  />
+                )}
+              </section>
+            )}
+
+            <AccountSecurityPanel
+              hasPassword={hasPassword}
+              onChangePassword={onChangePassword}
+              onFetchSessions={onFetchSessions}
+              onRevokeSession={onRevokeSession}
+              onRevokeOtherSessions={onRevokeOtherSessions}
+            />
+
+            <AnalysisHistoryPanel
+              refreshKey={analysisRefreshKey}
+              onFetch={onFetchAnalyses}
+              onDelete={onDeleteAnalysis}
+            />
+
             <div className="account-data-actions">
               <button type="button" onClick={handleExport} disabled={busy}>{t('account.export')}</button>
               <button type="button" className="danger-link" onClick={() => setDeleteOpen((value) => !value)} disabled={busy}>{t('account.delete')}</button>
@@ -299,9 +445,9 @@ export default function AccountDialog({
             {deleteOpen && (
               <div className="account-delete-box">
                 <strong>{t('account.deletePermanent')}</strong>
-                <p>{t('account.deleteHelp')}</p>
-                <input type="password" autoComplete="current-password" value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} placeholder={t('account.currentPassword')} />
-                <button type="button" onClick={handleDelete} disabled={busy || !deletePassword}>{t('account.deleteForever')}</button>
+                <p>{hasPassword ? t('account.deleteHelp') : t('account.deleteGoogleHelp')}</p>
+                {hasPassword && <input type="password" autoComplete="current-password" value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} placeholder={t('account.currentPassword')} />}
+                <button type="button" onClick={handleDelete} disabled={busy || (hasPassword && !deletePassword)}>{t('account.deleteForever')}</button>
               </div>
             )}
           </>
@@ -337,6 +483,27 @@ export default function AccountDialog({
                 {busy ? t('common.wait') : view === 'register' ? t('account.createAndLogin') : view === 'recover' ? t('account.sendReset') : view === 'reset' ? t('account.resetPassword') : t('top.signInShort')}
               </button>
             </form>
+
+            {(view === 'login' || view === 'register') && (
+              <div className="account-google-auth">
+                <div className="account-auth-divider"><span>{t('account.or')}</span></div>
+                {googleEnabled ? (
+                  <GoogleSignInButton
+                    clientId={authConfig.google.client_id}
+                    locale={locale}
+                    disabled={busy}
+                    onCredential={(credential) => handleGoogleCredential(credential, false)}
+                    onError={() => setError(t('error.googleUnavailable'))}
+                  />
+                ) : (
+                  <div className="account-google-unavailable" role="status">
+                    <span className="account-google-mark" aria-hidden="true">G</span>
+                    <span><strong>{t('account.googleSignIn')}</strong><small>{t('account.googleRestartHelp')}</small></span>
+                    <button type="button" onClick={retryGoogleConfiguration} disabled={busy}>{t('account.retryGoogle')}</button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {view === 'login' && <button type="button" className="account-switch-view" onClick={() => { setView('recover'); setError(''); setNotice('') }} disabled={busy}>{t('account.forgot')}</button>}
             {view !== 'reset' && (

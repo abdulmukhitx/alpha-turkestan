@@ -27,7 +27,7 @@ Run:
   uvicorn backend.main:app --reload --port 8000
 """
 
-import asyncio, functools, io, json, math, os, threading, traceback
+import asyncio, functools, io, json, logging, math, os, threading, time, traceback, uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,10 +43,12 @@ from pydantic import BaseModel, Field
 
 try:
     from .account_api import create_account_router
+    from .backup_accounts import backup_status
     from .account_mailer import AccountMailer
     from .account_store import AccountStore
 except ImportError:  # supports `python backend/main.py`
     from account_api import create_account_router
+    from backup_accounts import backup_status
     from account_mailer import AccountMailer
     from account_store import AccountStore
 
@@ -99,6 +101,31 @@ BASE_DIR = Path(__file__).parent.parent
 DATA_DIR  = BASE_DIR / "data"
 S2_DIR    = BASE_DIR / "src" / "processing" / "s2_work"
 APP_DB_PATH = Path(os.getenv("APP_DB_PATH", str(BASE_DIR / "data" / "geoai_tko.sqlite3")))
+ACCOUNT_BACKUP_DIR = Path(
+    os.getenv("ACCOUNT_BACKUP_DIR", str(BASE_DIR / "backups" / "accounts"))
+)
+BACKUP_MAX_AGE_HOURS = float(os.getenv("BACKUP_MAX_AGE_HOURS", "36"))
+BACKUP_HEALTH_REQUIRED = os.getenv("BACKUP_HEALTH_REQUIRED", "false").lower() in {
+    "1", "true", "yes"
+}
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
+LOGGER = logging.getLogger("geoai_tko")
+LOGGER.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+if not LOGGER.handlers:
+    log_handler = logging.StreamHandler()
+    log_handler.setFormatter(logging.Formatter("%(message)s"))
+    LOGGER.addHandler(log_handler)
+LOGGER.propagate = False
+
+
+def log_event(level: int, event: str, **fields) -> None:
+    LOGGER.log(
+        level,
+        json.dumps(
+            {"event": event, **fields}, ensure_ascii=False, separators=(",", ":")
+        ),
+    )
 MOSAICS_DIR  = Path(os.getenv("MOSAICS_DIR", r"D:\data\mosaics"))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
 LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v3.pkl"))
@@ -723,6 +750,40 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    started = time.perf_counter()
+    should_log = not request.url.path.startswith(("/tiles/", "/data/"))
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if should_log:
+            log_event(
+                logging.ERROR,
+                "http_request_failed",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                error=type(exc).__name__,
+            )
+        raise
+    response.headers["X-Request-ID"] = request_id
+    if should_log:
+        log_event(
+            logging.INFO if response.status_code < 500 else logging.ERROR,
+            "http_request",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status=response.status_code,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            client=request.client.host if request.client else None,
+        )
+    return response
+
+
+@app.middleware("http")
 async def limit_request_body(request: Request, call_next):
     if request.method in {"POST", "PUT", "PATCH"}:
         content_length = request.headers.get("content-length")
@@ -739,8 +800,17 @@ async def limit_request_body(request: Request, call_next):
 async def health():
     assets = s2_assets()
     forecast = forecast_config()
+    account_database = ACCOUNT_STORE.health_status()
+    account_backup = backup_status(ACCOUNT_BACKUP_DIR, BACKUP_MAX_AGE_HOURS)
+    account_backup["required"] = BACKUP_HEALTH_REQUIRED
+    account_mail = ACCOUNT_MAILER.status()
+    operationally_ready = (
+        account_database["ok"]
+        and account_mail["configured"]
+        and (not BACKUP_HEALTH_REQUIRED or account_backup["fresh"])
+    )
     return {
-        "status":    "ok",
+        "status":    "ok" if operationally_ready else "degraded",
         "version":   "4.0.0",
         "tiler":     TILER_OK,
         "rasterio":  RASTERIO_OK,
@@ -756,6 +826,11 @@ async def health():
         "lulc_classifier_v2_loaded": CLASSIFIER_V2 is not None,
         "linear_forecast": forecast["enabled"],
         "linear_forecast_source_years": forecast["source_years"],
+        "accounts": {
+            "database": account_database,
+            "email": account_mail,
+            "backup": account_backup,
+        },
     }
 
 
@@ -1244,6 +1319,7 @@ app.include_router(create_account_router(
     validate_geometry=lambda geometry: _validate_polygon_geometry(geometry, allow_multi=False),
     secure_cookie=os.getenv("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"},
     mailer=ACCOUNT_MAILER,
+    google_client_id=GOOGLE_CLIENT_ID,
 ))
 
 

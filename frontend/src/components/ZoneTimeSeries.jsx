@@ -14,15 +14,18 @@ const DEFAULT_THRESHOLDS = { ndvi: 0.2, ndre: 0.15, ndwi: 0, ndmi: -0.1, bsi: 0.
 
 function readAlerts() {
   try {
-    const value = JSON.parse(window.localStorage.getItem(ALERT_STORAGE_KEY) || '[]')
-    return Array.isArray(value)
-      ? value.filter((rule) => INDEX_OPTIONS.some(([key]) => key === rule.index)
-        && ['below', 'above'].includes(rule.operator) && Number.isFinite(Number(rule.value)))
-        .map((rule) => ({ ...rule, value: Number(rule.value) }))
-      : []
+    return normalizeAlerts(JSON.parse(window.localStorage.getItem(ALERT_STORAGE_KEY) || '[]'))
   } catch {
     return []
   }
+}
+
+function normalizeAlerts(value) {
+  return Array.isArray(value)
+    ? value.filter((rule) => INDEX_OPTIONS.some(([key]) => key === rule.index)
+      && ['below', 'above'].includes(rule.operator) && Number.isFinite(Number(rule.value)))
+      .map((rule) => ({ ...rule, value: Number(rule.value) }))
+    : []
 }
 
 function ruleId() {
@@ -53,13 +56,15 @@ function ChartTooltip({ active, payload, label }) {
   )
 }
 
-export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
-  const { t, periodLabel } = useI18n()
+export default function ZoneTimeSeries({
+  data, loading, error, activeLayer, alertRules, onAlertRulesChange, alertsCloudMode = false,
+}) {
+  const { t, formatNumber, periodLabel } = useI18n()
   const initialIndex = INDEX_OPTIONS.some(([key]) => key === activeLayer) ? activeLayer : 'ndvi'
   const [selectedIndex, setSelectedIndex] = useState(initialIndex)
   const [operator, setOperator] = useState('below')
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLDS[initialIndex])
-  const [alerts, setAlerts] = useState(readAlerts)
+  const [alerts, setAlerts] = useState(() => alertsCloudMode ? normalizeAlerts(alertRules) : readAlerts())
   const [storageError, setStorageError] = useState(null)
 
   useEffect(() => {
@@ -67,6 +72,10 @@ export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
     setSelectedIndex(activeLayer)
     setThreshold(DEFAULT_THRESHOLDS[activeLayer])
   }, [activeLayer])
+
+  useEffect(() => {
+    if (alertsCloudMode) setAlerts(normalizeAlerts(alertRules))
+  }, [alertRules, alertsCloudMode])
 
   const observations = data?.observations || []
   const chartData = useMemo(() => observations.map((item) => {
@@ -85,8 +94,19 @@ export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
   const latest = observations[observations.length - 1]
   const activeBreaches = alertSummaries.filter((rule) => ruleMatches(rule, latest?.indices?.[rule.index]?.mean))
 
-  function persist(next) {
+  async function persist(next) {
+    const previous = alerts
     setAlerts(next)
+    if (alertsCloudMode) {
+      try {
+        await onAlertRulesChange(next)
+        setStorageError(null)
+      } catch (requestError) {
+        setAlerts(previous)
+        setStorageError(requestError.message || t('timeseries.cloudStorageError'))
+      }
+      return
+    }
     try {
       window.localStorage.setItem(ALERT_STORAGE_KEY, JSON.stringify(next))
       setStorageError(null)
@@ -95,11 +115,11 @@ export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
     }
   }
 
-  function addAlert(event) {
+  async function addAlert(event) {
     event.preventDefault()
     const value = Number(threshold)
     if (!Number.isFinite(value) || value < -1 || value > 1) return
-    persist([...alerts, { id: ruleId(), index: selectedIndex, operator, value }])
+    await persist([...alerts, { id: ruleId(), index: selectedIndex, operator, value }])
   }
 
   if (!loading && !error && !data) return null
@@ -110,6 +130,7 @@ export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
         <span>{t('timeseries.series')}</span>
         {observations.length > 0 && <span>{observations[0].year}–{observations[observations.length - 1].year}</span>}
       </div>
+      {alertsCloudMode && <div className="timeseries-cloud-note">{t('timeseries.cloudRules')}</div>}
 
       {loading && <div className="zone-loading" role="status">{t('timeseries.collecting')}</div>}
       {!loading && error && <div className="zone-error">{error}</div>}
@@ -154,6 +175,16 @@ export default function ZoneTimeSeries({ data, loading, error, activeLayer }) {
               </ComposedChart>
             </ResponsiveContainer>
           </div>
+          <p className="sr-only">
+            {t('timeseries.chartSummary', {
+              index: codeFor(selectedIndex),
+              count: observations.length,
+              year: latest?.year || '',
+              value: Number.isFinite(latest?.indices?.[selectedIndex]?.mean)
+                ? formatNumber(latest.indices[selectedIndex].mean, { maximumFractionDigits: 4 })
+                : t('account.notAvailable'),
+            })}
+          </p>
 
           <div className={`threshold-status ${activeBreaches.length ? 'alerting' : ''}`} role="status">
             <strong>{activeBreaches.length ? t('timeseries.activeWarnings', { count: activeBreaches.length }) : t('timeseries.thresholdsNormal')}</strong>

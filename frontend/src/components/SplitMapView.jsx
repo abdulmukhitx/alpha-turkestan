@@ -16,7 +16,11 @@ const INDEX_OPTIONS = [
   { key: 'nbr',  code: 'NBR' },
 ]
 
-const BASEMAP_URL = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+const BASEMAP_URLS = {
+  satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  terrain: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}',
+  dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+}
 
 const DRAW_POINT_PAINT = {
   'circle-radius': ['case', ['==', ['get', 'first'], 1], 6, 4],
@@ -27,20 +31,20 @@ const DRAW_POINT_PAINT = {
 
 function emptyFC() { return { type: 'FeatureCollection', features: [] } }
 
-function baseStyle() {
+function baseStyle(basemap = 'satellite') {
   return {
     version: 8,
     sources: {
-      basemap: { type: 'raster', tiles: [BASEMAP_URL], tileSize: 256 },
+      basemap: { type: 'raster', tiles: [BASEMAP_URLS[basemap] || BASEMAP_URLS.satellite], tileSize: 256 },
     },
     layers: [{ id: 'basemap', type: 'raster', source: 'basemap' }],
   }
 }
 
-function makeMap(container, center, zoom) {
+function makeMap(container, center, zoom, basemap) {
   return new maplibregl.Map({
     container,
-    style: baseStyle(),
+    style: baseStyle(basemap),
     center,
     zoom,
     attributionControl: true,
@@ -144,7 +148,7 @@ function ensureDrawSources(map) {
 }
 
 export default function SplitMapView({
-  periods, bounds, center, zoom,
+  periods, bounds, center, zoom, initialBasemap = 'satellite',
   leftPeriod, leftIndex, onLeftPeriodChange, onLeftIndexChange,
   rightPeriod, rightIndex, onRightPeriodChange, onRightIndexChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
@@ -182,8 +186,8 @@ export default function SplitMapView({
   // ── init both instances once, synced ──────────────────────────
   useEffect(() => {
     const c = center ? [center[1], center[0]] : [68.36, 43.39]   // App passes [lat,lon] — MapLibre wants [lon,lat]
-    const left  = makeMap(leftElRef.current,  c, zoom || 7)
-    const right = makeMap(rightElRef.current, c, zoom || 7)
+    const left  = makeMap(leftElRef.current,  c, zoom || 7, initialBasemap)
+    const right = makeMap(rightElRef.current, c, zoom || 7, initialBasemap)
     leftMapRef.current = left
     rightMapRef.current = right
 

@@ -31,7 +31,7 @@ const BASEMAP_ORDER = ['satellite', 'terrain', 'dark']
 const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png'
 
 export default function MapView({
-  activeLayer, period, opacity, bounds, center, zoom, onPointClick, onMouseMove, onZoomChange,
+  activeLayer, period, opacity, bounds, center, zoom, initialBasemap = 'satellite', onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   zoneGeometry, zoneEditMode, onPolygonEdited, zoneFocusSignal,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
@@ -39,10 +39,11 @@ export default function MapView({
   forecastMode, forecastYear,
 }) {
   const { t } = useI18n()
+  const preferredBasemap = BASEMAPS[initialBasemap] ? initialBasemap : 'satellite'
   const elRef       = useRef(null)
   const mapRef      = useRef(null)
   const basemapRef  = useRef(null)
-  const basemapKind = useRef('satellite')
+  const basemapKind = useRef(preferredBasemap)
   const labelsRef   = useRef(null)
   const overlaysRef = useRef({})
   const changeOverlayRef    = useRef(null)
@@ -83,7 +84,7 @@ export default function MapView({
 
   const [zoomLevel, setZoomLevel] = useState(zoom)
   const [hover, setHover] = useState(null)
-  const [basemapKey, setBasemapKey] = useState('satellite')
+  const [basemapKey, setBasemapKey] = useState(preferredBasemap)
   const [labelsOn, setLabelsOn] = useState(true)
   // undefined = boundary still loading, object = clip GeoJSON, null = no clip (fallback)
   const [clipGeo, setClipGeo] = useState(undefined)
@@ -98,10 +99,10 @@ export default function MapView({
     // basemap stays UNclipped — visible across the whole view
     // crossOrigin so html2canvas (zone-report screenshot) can read these tiles
     // without tainting its canvas — same reason the index tile layers set it below.
-    basemapRef.current = L.tileLayer(BASEMAPS.satellite.url, {
+    basemapRef.current = L.tileLayer(BASEMAPS[preferredBasemap].url, {
       maxZoom: 18,
       subdomains: 'abcd',
-      attribution: BASEMAPS.satellite.attribution,
+      attribution: BASEMAPS[preferredBasemap].attribution,
       crossOrigin: true,
     }).addTo(map)
 
@@ -159,6 +160,13 @@ export default function MapView({
     return () => map.remove()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    if (!BASEMAPS[initialBasemap] || !basemapRef.current) return
+    basemapKind.current = initialBasemap
+    basemapRef.current.setUrl(BASEMAPS[initialBasemap].url)
+    setBasemapKey(initialBasemap)
+  }, [initialBasemap])
 
   // keep bbox ref current (used for fallback click-gating and fit button)
   useEffect(() => { boundsRef.current = bounds }, [bounds])
