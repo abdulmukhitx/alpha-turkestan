@@ -1,4 +1,13 @@
-/* All requests go through the Vite dev proxy → http://localhost:8000 */
+/*
+ * Local development leaves VITE_API_BASE_URL empty and uses Vite's proxy.
+ * Production points it at the public FastAPI origin (for example,
+ * https://api.geo-tko.online).
+ */
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '')
+
+export const apiUrl = (path) => `${API_BASE_URL}${path}`
+
+const apiFetch = (path, options) => fetch(apiUrl(path), options)
 
 const ACCOUNT_MUTATION_HEADERS = {
   'Content-Type': 'application/json',
@@ -6,7 +15,7 @@ const ACCOUNT_MUTATION_HEADERS = {
 }
 
 async function accountRequest(path, options = {}) {
-  const response = await fetch(path, { credentials: 'same-origin', ...options })
+  const response = await apiFetch(path, { credentials: 'include', ...options })
   if (!response.ok) {
     const detail = await response.json().catch(() => null)
     const message = Array.isArray(detail?.detail)
@@ -42,7 +51,7 @@ async function accountRequest(path, options = {}) {
 }
 
 export async function fetchCurrentAccount() {
-  const response = await fetch('/api/account/me', { credentials: 'same-origin' })
+  const response = await apiFetch('/api/account/me', { credentials: 'include' })
   if (response.status === 401) return null
   if (!response.ok) {
     const detail = await response.json().catch(() => null)
@@ -146,25 +155,25 @@ export const deleteSavedAnalysis = (analysisId) => accountRequest(`/api/account/
 })
 
 export async function fetchHealth() {
-  const r = await fetch('/health')
+  const r = await apiFetch('/health')
   if (!r.ok) throw new Error(`Health fetch failed: ${r.status}`)
   return r.json()
 }
 
 export async function fetchMetadata() {
-  const r = await fetch('/metadata')
+  const r = await apiFetch('/metadata')
   if (!r.ok) throw new Error(`Metadata fetch failed: ${r.status}`)
   return r.json()
 }
 
 export async function fetchPeriods() {
-  const r = await fetch('/api/periods')
+  const r = await apiFetch('/api/periods')
   if (!r.ok) throw new Error(`Periods fetch failed: ${r.status}`)
   return r.json()
 }
 
 export async function fetchPixel(lat, lon, period) {
-  const r = await fetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&period=${period}`)
+  const r = await apiFetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&period=${period}`)
   if (!r.ok) {
     const detail = await r.json().catch(() => null)
     throw new Error(detail?.detail || `Pixel fetch failed: ${r.status}`)
@@ -173,7 +182,7 @@ export async function fetchPixel(lat, lon, period) {
 }
 
 export async function fetchAnalysis({ lat, lon, period, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence, locale = 'ru' }) {
-  const r = await fetch('/api/analyze', {
+  const r = await apiFetch('/api/analyze', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ lat, lon, period, ndvi, ndwi, ndre, ndmi, bsi, savi, nbr, ml_class, ml_class_ru, ml_confidence, locale }),
@@ -186,11 +195,11 @@ export async function fetchAnalysis({ lat, lon, period, ndvi, ndwi, ndre, ndmi, 
 }
 
 /** Leaflet-compatible XYZ tile URL template for a given layer + period. */
-export const tileUrl = (layer, period) => `/tiles/${layer}/{z}/{x}/{y}.png?period=${period}`
+export const tileUrl = (layer, period) => apiUrl(`/tiles/${layer}/{z}/{x}/{y}.png?period=${period}`)
 
 /** Experimental all-years linear-trend forecast tile URL. */
 export const forecastTileUrl = (index, targetYear) =>
-  `/tiles/forecast/${index}/${targetYear}/{z}/{x}/{y}.png`
+  apiUrl(`/tiles/forecast/${index}/${targetYear}/{z}/{x}/{y}.png`)
 
 export async function fetchPointForecast(lat, lon, index, targetYear) {
   const params = new URLSearchParams({
@@ -199,7 +208,7 @@ export async function fetchPointForecast(lat, lon, index, targetYear) {
     index,
     target_year: String(targetYear),
   })
-  const r = await fetch(`/api/forecast/point?${params}`)
+  const r = await apiFetch(`/api/forecast/point?${params}`)
   if (!r.ok) {
     const detail = await r.json().catch(() => null)
     throw new Error(detail?.detail || `Forecast failed: ${r.status}`)
@@ -208,7 +217,7 @@ export async function fetchPointForecast(lat, lon, index, targetYear) {
 }
 
 export async function fetchZoneStats(geometry, period) {
-  const r = await fetch('/api/zone_stats', {
+  const r = await apiFetch('/api/zone_stats', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ geometry, period }),
@@ -221,7 +230,7 @@ export async function fetchZoneStats(geometry, period) {
 }
 
 export async function fetchZoneTimeSeries(geometry) {
-  const r = await fetch('/api/zone_timeseries', {
+  const r = await apiFetch('/api/zone_timeseries', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ geometry }),
@@ -234,7 +243,7 @@ export async function fetchZoneTimeSeries(geometry) {
 }
 
 export async function fetchTransect(geometry, layer, period) {
-  const r = await fetch('/api/transect', {
+  const r = await apiFetch('/api/transect', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ geometry, layer, period }),
@@ -248,10 +257,10 @@ export async function fetchTransect(geometry, layer, period) {
 
 /** Leaflet-compatible XYZ tile URL template for a change-detection layer. */
 export const changeTileUrl = (index, periodBefore, periodAfter) =>
-  `/tiles/change/${index}/{z}/{x}/{y}.png?period_before=${periodBefore}&period_after=${periodAfter}`
+  apiUrl(`/tiles/change/${index}/{z}/{x}/{y}.png?period_before=${periodBefore}&period_after=${periodAfter}`)
 
 export async function fetchChangeStats(geometry, periodBefore, periodAfter, locale = 'ru') {
-  const r = await fetch('/api/change_stats', {
+  const r = await apiFetch('/api/change_stats', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ geometry, period_before: periodBefore, period_after: periodAfter, locale }),
@@ -264,7 +273,7 @@ export async function fetchChangeStats(geometry, periodBefore, periodAfter, loca
 }
 
 export async function fetchZoneReport({ geometry, zoneStats, activeLayer, period, locale = 'ru' }) {
-  const r = await fetch('/api/zone_report', {
+  const r = await apiFetch('/api/zone_report', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({
