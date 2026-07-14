@@ -231,8 +231,21 @@ class AccountStore:
                 }
                 if "email_verified_at" not in user_columns:
                     connection.execute("ALTER TABLE users ADD COLUMN email_verified_at TEXT")
+                if "email_verified_via" not in user_columns:
+                    connection.execute("ALTER TABLE users ADD COLUMN email_verified_via TEXT")
                 if "last_login_at" not in user_columns:
                     connection.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
+                # Google used to mark passwordless accounts as application-verified.
+                # Requiring our own confirmation email means those legacy Google-only
+                # accounts must verify once. Accounts confirmed through our token are
+                # tagged below and will not be reset on later startups.
+                connection.execute(
+                    "UPDATE users SET email_verified_at = NULL "
+                    "WHERE email_verified_at IS NOT NULL AND email_verified_via IS NULL "
+                    "AND password_hash LIKE 'disabled$%' "
+                    "AND EXISTS(SELECT 1 FROM external_identities "
+                    "WHERE external_identities.user_id = users.id AND provider = 'google')"
+                )
                 session_columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
                 }
@@ -386,7 +399,7 @@ class AccountStore:
                         disabled_password,
                         now,
                         now,
-                        now,
+                        None,
                     ),
                 )
                 connection.execute(
@@ -433,11 +446,6 @@ class AccountStore:
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ExternalIdentityConflictError("external identity is already linked") from exc
-            connection.execute(
-                "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?), updated_at = ? "
-                "WHERE id = ? AND email = ? COLLATE NOCASE",
-                (now, now, user_id, normalized_provider_email),
-            )
         return self.get_user(user_id)
 
     def update_external_identity_email(
@@ -681,7 +689,8 @@ class AccountStore:
                 (now, digest),
             )
             connection.execute(
-                "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?), updated_at = ? "
+                "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?), "
+                "email_verified_via = 'email', updated_at = ? "
                 "WHERE id = ?",
                 (now, now, row["user_id"]),
             )

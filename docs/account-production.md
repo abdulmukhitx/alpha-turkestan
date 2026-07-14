@@ -34,7 +34,7 @@ If the deployment sets a Content Security Policy, allow the Google Identity Serv
 
 ## Email delivery
 
-Password registrations receive a single-use verification link that expires after 24 hours. Until the link is opened, the user can manage the profile and request another email, but cloud zones, saved analyses, imports, and account export are blocked. Google accounts do not receive a second verification email: the backend accepts them only when Google's signed ID token contains `email_verified=true`.
+Password registrations and newly created Google accounts receive a single-use GeoAI verification link that expires after 24 hours. Google sign-in is accepted only when Google's signed ID token contains `email_verified=true`, and the additional GeoAI email confirms delivery through this application's configured mail channel. Until the GeoAI link is opened, the user can manage the profile and request another email, but cloud zones, saved analyses, imports, and account export are blocked. Linking Google does not bypass an unverified account's confirmation requirement.
 
 Configure an SMTP account dedicated to transactional email:
 

@@ -519,7 +519,12 @@ def create_account_router(
                     )
         login_limiter.success(key)
         set_session_cookie(response, create_request_session(user["id"], request))
-        return account_payload(user)
+        result = account_payload(user)
+        if not result["user"]["email_verified"]:
+            result["verification_delivery"] = deliver_verification(
+                result["user"], payload.locale
+            )
+        return result
 
     @router.post("/google/link")
     def link_google(

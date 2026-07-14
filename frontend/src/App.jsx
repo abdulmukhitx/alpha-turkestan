@@ -351,7 +351,7 @@ export default function App() {
   async function handleGoogleLogin(credential) {
     const session = await loginWithGoogle({ credential, locale })
     await activateAccountSession(session)
-    setAccountDialogOpen(false)
+    if (session.user.email_verified) setAccountDialogOpen(false)
     return session
   }
 

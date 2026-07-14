@@ -267,7 +267,10 @@ export default function AccountDialog({
         await onGoogleLink(credential)
         setNotice(t('account.googleConnected'))
       } else {
-        await onGoogleLogin(credential)
+        const result = await onGoogleLogin(credential)
+        if (result?.verification_delivery) {
+          showDelivery(result, 'account.verificationSent')
+        }
       }
     } catch (requestError) {
       setError(localizedError(requestError, linking ? 'error.googleLink' : 'error.googleLogin'))

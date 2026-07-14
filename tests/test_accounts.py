@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -89,7 +91,7 @@ class AccountStoreTests(unittest.TestCase):
             display_name="Google User",
             locale="kk",
         )
-        self.assertTrue(google_user["email_verified"])
+        self.assertFalse(google_user["email_verified"])
         self.assertFalse(google_user["has_password"])
         self.assertEqual(google_user["auth_methods"], ["google"])
         self.assertIsNone(self.store.authenticate("google@example.com", PASSWORD))
@@ -107,7 +109,7 @@ class AccountStoreTests(unittest.TestCase):
             provider_email="local@example.com",
         )
         self.assertEqual(linked["auth_methods"], ["password", "google"])
-        self.assertTrue(linked["email_verified"])
+        self.assertFalse(linked["email_verified"])
         with self.assertRaises(ExternalIdentityConflictError):
             self.store.link_external_identity(
                 local_user["id"],
@@ -135,6 +137,31 @@ class AccountStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.reset_password_with_token(reset, PASSWORD))
         self.assertIsNone(self.store.user_for_session(session))
         self.assertIsNotNone(self.store.authenticate("secure@example.com", "a completely new secure password"))
+
+    def test_legacy_google_verification_is_reset_until_email_link_is_used(self):
+        user = self.store.create_external_user(
+            provider="google",
+            subject="legacy-google-subject",
+            email="legacy.google@example.com",
+            display_name="Legacy Google User",
+            locale="en",
+        )
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "UPDATE users SET email_verified_at = ?, email_verified_via = NULL WHERE id = ?",
+                ("2026-01-01T00:00:00+00:00", user["id"]),
+            )
+            connection.commit()
+
+        migrated = AccountStore(self.store.db_path)
+        self.assertFalse(migrated.get_user(user["id"])["email_verified"])
+
+        token = migrated.create_account_token(
+            user["id"], "verify_email", EMAIL_VERIFICATION_TTL_SECONDS
+        )
+        self.assertTrue(migrated.verify_email_with_token(token)["email_verified"])
+        reopened = AccountStore(self.store.db_path)
+        self.assertTrue(reopened.get_user(user["id"])["email_verified"])
 
     def test_online_backup_is_consistent(self):
         self.store.create_user("backup@example.com", "Backup User", PASSWORD)
@@ -226,7 +253,7 @@ class AccountApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 403)
 
-    def test_google_sign_in_creates_verified_passwordless_account(self):
+    def test_google_sign_in_requires_app_email_confirmation(self):
         credential = "google-new-user-credential-0001"
         self.google_identities[credential] = {
             "sub": "google-subject-new-user",
@@ -246,12 +273,35 @@ class AccountApiTests(unittest.TestCase):
         )
         self.assertEqual(login.status_code, 200, login.text)
         user = login.json()["user"]
-        self.assertTrue(user["email_verified"])
+        self.assertFalse(user["email_verified"])
         self.assertFalse(user["has_password"])
         self.assertEqual(user["auth_methods"], ["google"])
         self.assertEqual(login.json()["preferences"]["locale"], "kk")
+        self.assertTrue(login.json()["verification_delivery"]["sent"])
+        verification_token = parse_qs(
+            urlparse(self.mailer.verification_url).query
+        )["verify_email"][0]
         self.assertIn("geoai_session", self.client.cookies)
+        self.assertEqual(self.client.get("/api/account/zones").status_code, 403)
+
+        confirmation = self.client.post(
+            "/api/account/verification/confirm",
+            headers=self.headers,
+            json={"token": verification_token},
+        )
+        self.assertEqual(confirmation.status_code, 200, confirmation.text)
+        self.assertTrue(confirmation.json()["user"]["email_verified"])
         self.assertEqual(self.client.get("/api/account/zones").status_code, 200)
+
+        self.client.post("/api/account/logout", headers=self.headers)
+        repeated_login = self.client.post(
+            "/api/account/google/login",
+            headers=self.headers,
+            json={"credential": credential, "locale": "kk"},
+        )
+        self.assertEqual(repeated_login.status_code, 200, repeated_login.text)
+        self.assertTrue(repeated_login.json()["user"]["email_verified"])
+        self.assertNotIn("verification_delivery", repeated_login.json())
 
         deleted = self.client.request(
             "DELETE", "/api/account", headers=self.headers, json={"password": None}
@@ -292,7 +342,7 @@ class AccountApiTests(unittest.TestCase):
         )
         self.assertEqual(linked.status_code, 200, linked.text)
         self.assertEqual(linked.json()["user"]["auth_methods"], ["password", "google"])
-        self.assertTrue(linked.json()["user"]["email_verified"])
+        self.assertFalse(linked.json()["user"]["email_verified"])
 
         self.client.post("/api/account/logout", headers=self.headers)
         google_login = self.client.post(
@@ -302,6 +352,8 @@ class AccountApiTests(unittest.TestCase):
         )
         self.assertEqual(google_login.status_code, 200, google_login.text)
         self.assertEqual(google_login.json()["user"]["id"], user_id)
+        self.assertFalse(google_login.json()["user"]["email_verified"])
+        self.assertTrue(google_login.json()["verification_delivery"]["sent"])
 
     def test_invalid_google_credential_is_rejected(self):
         response = self.client.post(
