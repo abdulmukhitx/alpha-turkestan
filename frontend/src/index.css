@@ -820,9 +820,18 @@ input:focus-visible,
   background: rgba(217, 119, 6, 0.09);
 }
 
-/* ── SPLIT SCREEN — two synced Leaflet instances + drag divider ──── */
+/* ── SPLIT SCREEN — two synced MapLibre instances + drag divider ──── */
 .split-view { overflow: hidden; }
-.split-pane { position: absolute; inset: 0; }
+/* MapLibre adds .maplibregl-map to each target element. Its library CSS is
+   loaded after this stylesheet and sets position: relative, which otherwise
+   collapses these empty target divs to 0px tall. The extra specificity keeps
+   both map canvases pinned to the full comparison workspace. */
+.split-view > .split-pane.maplibregl-map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
 .split-pane-right { z-index: 1; }
 
 .split-divider {
