@@ -7,6 +7,7 @@ import ForecastBar from './components/ForecastBar.jsx'
 import WorkspaceNav from './components/WorkspaceNav.jsx'
 import AccountDialog from './components/AccountDialog.jsx'
 import ZoneMigrationDialog from './components/ZoneMigrationDialog.jsx'
+import TimelapseControl from './components/TimelapseControl.jsx'
 import {
   changeAccountPassword, createAccountZone, createSavedAnalysis, deleteAccount, deleteAccountZone, deleteSavedAnalysis,
   fetchAccountAuthConfig, fetchAccountExport, fetchAccountSessions, fetchAccountZones, fetchSavedAnalyses,
@@ -18,6 +19,7 @@ import {
 } from './api'
 import { clearSavedZones, cloneGeometry, newZoneId, readSavedZones, writeSavedZones } from './zoneStorage.js'
 import { useI18n } from './i18n.jsx'
+import { copyText } from './share.js'
 
 const SplitMapView = lazy(() => import('./components/SplitMapView.jsx'))
 const AnalysisPanel = lazy(() => import('./components/AnalysisPanel.jsx'))
@@ -59,6 +61,7 @@ export default function App() {
   const [accountDialogError, setAccountDialogError] = useState('')
   const [passwordResetToken, setPasswordResetToken] = useState('')
   const [analysisHistoryRevision, setAnalysisHistoryRevision] = useState(0)
+  const [shareStatus, setShareStatus] = useState('')
   const [pendingLocalZones, setPendingLocalZones] = useState(null)
   const [migrationLoading, setMigrationLoading] = useState(false)
   const [migrationError, setMigrationError] = useState(null)
@@ -136,6 +139,7 @@ export default function App() {
   const transectReqIdRef = useRef(0)
   const changeReqIdRef = useRef(0)
   const forecastReqIdRef = useRef(0)
+  const deepLinkAppliedRef = useRef(false)
 
   useEffect(() => {
     const total = BOOT_STEPS[BOOT_STEPS.length - 1][0]
@@ -174,6 +178,89 @@ export default function App() {
     if (!minYear || !maxYear) return
     setForecastYear((year) => Math.max(minYear, Math.min(maxYear, year)))
   }, [meta])
+
+  useEffect(() => {
+    if (deepLinkAppliedRef.current || accountLoading || !meta || !periods.length) return
+    const params = new URLSearchParams(window.location.search)
+    const hasWorkspaceLink = ['account', 'analysis', 'zone', 'lat', 'lon', 'period', 'layer', 'mode']
+      .some((key) => params.has(key))
+    if (!hasWorkspaceLink) {
+      deepLinkAppliedRef.current = true
+      return
+    }
+
+    deepLinkAppliedRef.current = true
+    const requestedPeriod = periods.some((item) => item.period_id === params.get('period'))
+      ? params.get('period')
+      : period
+    const requestedLayer = params.get('layer') === 'satellite' || meta.layers?.[params.get('layer')]
+      ? params.get('layer')
+      : activeLayer
+    const requestedMode = params.get('mode')
+
+    setPeriod(requestedPeriod)
+    setActiveLayer(requestedLayer)
+    if (requestedMode === 'compare') setSplitMode(true)
+    else if (requestedMode === 'change') {
+      setChangeMode(true)
+      if (periods.some((item) => item.period_id === params.get('before'))) setChangePeriodBefore(params.get('before'))
+      if (periods.some((item) => item.period_id === params.get('after'))) setChangePeriodAfter(params.get('after'))
+      if (meta.layers?.[params.get('change_index')]) setChangeIndex(params.get('change_index'))
+    } else if (requestedMode === 'forecast' && meta.forecast?.enabled) {
+      setForecastMode(true)
+      const targetYear = Number(params.get('target_year'))
+      if (Number.isInteger(targetYear)) setForecastYear(targetYear)
+    }
+
+    const accountView = params.get('account')
+    if (accountView) {
+      setAccountDialogView(accountView === 'profile' && account ? 'profile' : 'login')
+      setAccountDialogOpen(true)
+    }
+
+    async function restoreLinkedState() {
+      const analysisId = params.get('analysis')
+      if (analysisId) {
+        if (!account?.user?.email_verified) {
+          setAccountDialogView(account ? 'profile' : 'login')
+          setAccountDialogOpen(true)
+          setAccountDialogNotice(t('history.signInHelp'))
+          return
+        }
+        const result = await fetchSavedAnalyses()
+        const analysis = result.analyses?.find((item) => item.id === analysisId)
+        if (!analysis) throw new Error(t('error.analysisNotFound'))
+        applySavedAnalysis(analysis)
+        return
+      }
+
+      const zoneId = params.get('zone')
+      if (zoneId) {
+        const zone = savedZones.find((item) => item.id === zoneId)
+        if (!zone) throw new Error(t('saved.notFound'))
+        const geometry = cloneGeometry(zone.geometry)
+        setZonePolygon(geometry)
+        setActiveZoneId(zone.id)
+        setZoneDirty(false)
+        setZoneEditMode(false)
+        setZoneFocusSignal((value) => value + 1)
+        runZoneStats(geometry, { period: requestedPeriod, layer: requestedLayer, pane: 'main' })
+        return
+      }
+
+      const lat = Number(params.get('lat'))
+      const lon = Number(params.get('lon'))
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        handlePointClick(lat, lon, { period: requestedPeriod, layer: requestedLayer, pane: 'main' })
+      }
+    }
+
+    restoreLinkedState().catch((requestError) => {
+      setZoneStorageError(requestError.message || t('common.error.server'))
+    })
+    // Deep links are intentionally applied once after account, metadata and zones finish loading.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountLoading, meta, periods, account, savedZones])
 
   function clearForecastPoint() {
     forecastReqIdRef.current += 1
@@ -441,7 +528,7 @@ export default function App() {
       analysis = {
         kind: 'transect',
         title: t('history.transectTitle', { index: activeLayer.toUpperCase() }),
-        payload: { index: activeLayer, period, result: transectData },
+        payload: { geometry: transectLine, index: activeLayer, period, result: transectData },
       }
     } else if (pixel) {
       analysis = {
@@ -454,6 +541,94 @@ export default function App() {
     const saved = await createSavedAnalysis(analysis)
     setAnalysisHistoryRevision((value) => value + 1)
     return saved
+  }
+
+  function applySavedAnalysis(analysis) {
+    const payload = analysis.payload || {}
+    setSplitMode(false)
+    setChangeMode(false)
+    setForecastMode(false)
+    setDrawMode(false)
+    setLineDrawMode(false)
+    setRightPanelOpen(true)
+
+    if (analysis.kind === 'point') {
+      if (payload.period) setPeriod(payload.period)
+      if (payload.index) setActiveLayer(payload.index)
+      setPixelPoint(payload.point || null)
+      setPixel(payload.result || null)
+      setAiText(payload.interpretation || '')
+      setAiError(null)
+      return
+    }
+
+    if (analysis.kind === 'zone') {
+      if (payload.period) setPeriod(payload.period)
+      if (payload.index) setActiveLayer(payload.index)
+      setZonePolygon(payload.geometry || null)
+      setZoneStats(payload.result || null)
+      setZoneTimeSeries(payload.time_series || null)
+      setZoneContext({ period: payload.period || period, layer: payload.index || activeLayer, pane: 'main' })
+      setActiveZoneId(null)
+      setZoneDirty(false)
+      setZoneFocusSignal((value) => value + 1)
+      return
+    }
+
+    if (analysis.kind === 'change') {
+      setChangeMode(true)
+      setChangePolygon(payload.geometry || null)
+      setChangeStats(payload.result || null)
+      if (payload.index) setChangeIndex(payload.index)
+      if (payload.period_before) setChangePeriodBefore(payload.period_before)
+      if (payload.period_after) setChangePeriodAfter(payload.period_after)
+      return
+    }
+
+    if (analysis.kind === 'forecast') {
+      setForecastMode(true)
+      setPixelPoint(payload.point || null)
+      setForecastResult(payload.result || null)
+      if (payload.index) setActiveLayer(payload.index)
+      if (payload.target_year) setForecastYear(payload.target_year)
+      return
+    }
+
+    if (analysis.kind === 'transect') {
+      if (payload.period) setPeriod(payload.period)
+      if (payload.index) setActiveLayer(payload.index)
+      setTransectLine(payload.geometry || null)
+      setTransectData(payload.result || null)
+      setTransectContext({ period: payload.period || period, layer: payload.index || activeLayer, pane: 'main' })
+    }
+  }
+
+  async function handleShareWorkspace() {
+    const url = new URL('/map', window.location.origin)
+    url.searchParams.set('period', period)
+    url.searchParams.set('layer', activeLayer)
+    if (splitMode) url.searchParams.set('mode', 'compare')
+    else if (changeMode) {
+      url.searchParams.set('mode', 'change')
+      url.searchParams.set('before', changePeriodBefore || '')
+      url.searchParams.set('after', changePeriodAfter || '')
+      url.searchParams.set('change_index', changeIndex)
+    } else if (forecastMode) {
+      url.searchParams.set('mode', 'forecast')
+      url.searchParams.set('target_year', String(forecastYear))
+    }
+    if (activeZoneId) url.searchParams.set('zone', activeZoneId)
+    else if (point?.lat != null && point?.lng != null) {
+      url.searchParams.set('lat', Number(point.lat).toFixed(6))
+      url.searchParams.set('lon', Number(point.lng).toFixed(6))
+    }
+    try {
+      await copyText(url.toString())
+      setShareStatus(t('nav.linkCopied'))
+      window.setTimeout(() => setShareStatus(''), 1800)
+    } catch (error) {
+      setZoneStorageError(error.message || t('common.error.server'))
+    }
   }
 
   async function handleRevokeAccountSession(sessionId) {
@@ -1057,6 +1232,8 @@ export default function App() {
         rightPanelOpen={showRightPanel}
         onToggleRightPanel={() => setRightPanelOpen((open) => !open)}
         hasResults={hasResults}
+        onShare={handleShareWorkspace}
+        shareStatus={shareStatus}
       />
 
       <main className={workspaceClass}>
@@ -1078,7 +1255,7 @@ export default function App() {
             zoneDirty={zoneDirty}
             zoneEditMode={zoneEditMode}
             zoneStorageError={zoneStorageError}
-            savedZonesCloudMode={!!account}
+            savedZonesCloudMode={account?.user?.email_verified === true}
             onSaveZone={handleSaveZone}
             onUpdateZone={handleUpdateZone}
             onOpenZone={handleOpenZone}
@@ -1132,6 +1309,7 @@ export default function App() {
           <MapView
             activeLayer={activeLayer}
             period={period}
+            periods={periods}
             opacity={opacity}
             bounds={meta?.region?.bounds}
             center={meta?.region?.center || FALLBACK_CENTER}
@@ -1203,6 +1381,13 @@ export default function App() {
           </Suspense>
         )}
       </main>
+
+      <TimelapseControl
+        open={!splitMode && !changeMode && !forecastMode}
+        periods={periods}
+        period={period}
+        onPeriodChange={setPeriod}
+      />
 
       <ChangeDetectionBar
         open={changeMode && !splitMode}

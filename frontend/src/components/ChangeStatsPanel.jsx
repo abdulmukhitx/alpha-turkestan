@@ -1,4 +1,5 @@
 import { useI18n } from '../i18n.jsx'
+import EvidenceBadge from './EvidenceBadge.jsx'
 
 const INDEX_LABELS = {
   ndvi: 'NDVI', ndre: 'NDRE', ndwi: 'NDWI', ndmi: 'NDMI', bsi: 'BSI', savi: 'SAVI', nbr: 'NBR',
@@ -137,6 +138,8 @@ export default function ChangeStatsPanel({ stats, loading, error }) {
             {t('zone.area')} <strong>{formatNumber(stats.area_ha)} {t('unit.ha')}</strong>
             <span className="zone-area-px"> ({formatNumber(stats.pixel_count)} {t('unit.pixels')})</span>
           </div>
+
+          <EvidenceBadge evidence={stats.evidence} />
 
           <div className="zone-block">
             <div className="zone-block-title">{t('zone.indices')}</div>

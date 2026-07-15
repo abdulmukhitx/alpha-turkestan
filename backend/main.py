@@ -46,11 +46,15 @@ try:
     from .backup_accounts import backup_status
     from .account_mailer import AccountMailer
     from .account_store import AccountStore
+    from .rate_limit import SlidingWindowRateLimiter
+    from .monitoring import MonitoringService
 except ImportError:  # supports `python backend/main.py`
     from account_api import create_account_router
     from backup_accounts import backup_status
     from account_mailer import AccountMailer
     from account_store import AccountStore
+    from rate_limit import SlidingWindowRateLimiter
+    from monitoring import MonitoringService
 
 # ── Optional geo libs ─────────────────────────────────────────────
 try:
@@ -130,6 +134,9 @@ MOSAICS_DIR  = Path(os.getenv("MOSAICS_DIR", r"D:\data\mosaics"))
 LULC_MODEL_PATH = Path(os.getenv("LULC_MODEL_PATH", r"D:\data\classifiers\lulc_classifier.pkl"))
 LULC_MODEL_V2_PATH = Path(os.getenv("LULC_MODEL_V2_PATH", r"D:\data\classifiers\lulc_classifier_v3.pkl"))
 WORLDCOVER_PATH = Path(os.getenv("WORLDCOVER_PATH", r"D:\data\reference\esa_worldcover_turkestan.tif"))
+S2_SOURCE = "Copernicus Data Space Ecosystem"
+S2_PRODUCT = "Sentinel-2 MSI Level-2A BOA surface reflectance"
+S2_BANDS = ["B02", "B03", "B04", "B05", "B08", "B8A", "B11"]
 
 # ── Period registry ──────────────────────────────────────────────
 # Independent, non-comparable map states — each period is viewed on its own.
@@ -172,9 +179,22 @@ MAX_GEOMETRY_VERTICES = int(os.getenv("MAX_GEOMETRY_VERTICES", "10000"))
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", "2000000"))
 MAX_CONCURRENT_ANALYSES = max(1, int(os.getenv("MAX_CONCURRENT_ANALYSES", "2")))
 MAX_FORECAST_HORIZON_YEARS = max(1, int(os.getenv("MAX_FORECAST_HORIZON_YEARS", "5")))
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in {"1", "true", "yes"}
+RATE_LIMIT_WINDOW_SECONDS = max(1, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")))
+API_RATE_LIMIT = max(1, int(os.getenv("API_RATE_LIMIT", "120")))
+ANALYSIS_RATE_LIMIT = max(1, int(os.getenv("ANALYSIS_RATE_LIMIT", "20")))
+TILE_RATE_LIMIT = max(1, int(os.getenv("TILE_RATE_LIMIT", "600")))
+TILE_CACHE_SECONDS = max(60, int(os.getenv("TILE_CACHE_SECONDS", "86400")))
+AI_TIMEOUT_SECONDS = max(1.0, float(os.getenv("AI_TIMEOUT_SECONDS", "15")))
+AI_MAX_RETRIES = max(0, min(2, int(os.getenv("AI_MAX_RETRIES", "0"))))
+MONITORING_SCHEDULER_ENABLED = os.getenv("MONITORING_SCHEDULER_ENABLED", "false").lower() in {"1", "true", "yes"}
+MONITORING_INTERVAL_SECONDS = max(60, int(os.getenv("MONITORING_INTERVAL_SECONDS", str(6 * 60 * 60))))
 ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"}
 ENABLE_CHANGE_OVERVIEW = os.getenv("ENABLE_CHANGE_OVERVIEW", "false").lower() in {"1", "true", "yes"}
 _ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+_API_RATE_LIMITER = SlidingWindowRateLimiter()
+
+REGION_FALLBACK_BOUNDS = [40.31, 65.36, 46.46, 71.36]  # south, west, north, east
 
 
 def limit_analysis(func):
@@ -187,6 +207,16 @@ def limit_analysis(func):
         finally:
             _ANALYSIS_SEMAPHORE.release()
     return wrapped
+
+
+def ai_client(api_key: str, base_url: str):
+    """Create a bounded external AI client so requests cannot occupy workers indefinitely."""
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=AI_TIMEOUT_SECONDS,
+        max_retries=AI_MAX_RETRIES,
+    )
 
 # Kept for the /health and /metadata endpoints, which stay tied to the
 # default period (not part of the period switcher).
@@ -233,19 +263,94 @@ def cog_available(period: dict | None = None) -> bool:
     path = (period or PERIODS[DEFAULT_PERIOD])["cog_path"]
     return RASTERIO_OK and path.exists()
 
-_COG_BOUNDS_WGS84: tuple | None = None
+_PERIOD_BOUNDS_WGS84: dict[str, tuple[float, float, float, float]] = {}
 
-def cog_bounds_wgs84() -> list[float] | None:
-    """[south, west, north, east] of the default period's COG, reprojected to WGS84. Cached."""
-    global _COG_BOUNDS_WGS84
-    if not cog_available():
+
+def period_bounds_wgs84(period: dict | None = None) -> list[float] | None:
+    """Return a period COG's [south, west, north, east] bounds in WGS84."""
+    cfg = period or PERIODS[DEFAULT_PERIOD]
+    if not cog_available(cfg):
         return None
-    if _COG_BOUNDS_WGS84 is None:
-        with rasterio.open(COG_PATH) as ds:
+    path = str(cfg["cog_path"])
+    if path not in _PERIOD_BOUNDS_WGS84:
+        with rasterio.open(cfg["cog_path"]) as ds:
             from rasterio.warp import transform_bounds
             l, b, r, t = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds)
-            _COG_BOUNDS_WGS84 = (b, l, t, r)  # S, W, N, E
-    return list(_COG_BOUNDS_WGS84)
+            _PERIOD_BOUNDS_WGS84[path] = (b, l, t, r)
+    return list(_PERIOD_BOUNDS_WGS84[path])
+
+
+def cog_bounds_wgs84() -> list[float] | None:
+    """Backward-compatible default-period bounds used by metadata and change tiles."""
+    return period_bounds_wgs84(PERIODS[DEFAULT_PERIOD])
+
+
+def point_within_bounds(lat: float, lon: float, bounds: list[float]) -> bool:
+    south, west, north, east = bounds
+    return south <= lat <= north and west <= lon <= east
+
+
+def validate_point_coverage(lat: float, lon: float, period: dict | None = None) -> None:
+    """Validate a point against the same COG extent advertised by metadata."""
+    bounds = period_bounds_wgs84(period)
+    if bounds is not None and not point_within_bounds(lat, lon, bounds):
+        raise HTTPException(
+            status_code=404,
+            detail="The selected point is outside the available satellite coverage",
+        )
+
+
+def period_data_version(period: dict) -> str:
+    """Stable cache-buster that changes whenever the source COG changes."""
+    try:
+        stat = period["cog_path"].stat()
+    except OSError:
+        return "unavailable"
+    return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def tile_cache_headers(period: dict) -> dict[str, str]:
+    version = period_data_version(period)
+    return {
+        "Cache-Control": (
+            f"public, max-age={TILE_CACHE_SECONDS}, s-maxage={TILE_CACHE_SECONDS}, "
+            "stale-while-revalidate=3600"
+        ),
+        "ETag": f'"{version}"',
+        "X-Data-Version": version,
+    }
+
+
+def period_evidence(period_id: str, period: dict, *, quality: dict | None = None) -> dict:
+    """Public, path-free lineage and quality disclosure for an analysis result."""
+    evidence_quality = {
+        "grade": "limited",
+        "mask_type": "nodata_only",
+        "nodata_mask_applied": True,
+        "cloud_mask_applied": False,
+        "scl_available": False,
+        "limitation": (
+            "The application mosaic retains seven reflectance bands but no SCL/cloud QA band; "
+            "valid-data masking is applied, while cloud and cloud-shadow screening cannot be verified."
+        ),
+    }
+    if quality:
+        evidence_quality.update(quality)
+    return {
+        "kind": "derived_observation",
+        "source": S2_SOURCE,
+        "mission": "Sentinel-2",
+        "product": S2_PRODUCT,
+        "period_id": period_id,
+        "acquisition_window": period["date_range"],
+        "processing": "Seasonal multi-scene mosaic; spectral indices derived on demand",
+        "spatial_resolution_m": 10,
+        "bands": S2_BANDS,
+        "storage": period["storage"],
+        "data_version": period_data_version(period),
+        "provenance_completeness": "partial",
+        "quality": evidence_quality,
+    }
 
 
 # ── ML land-cover classifier ─────────────────────────────────────
@@ -720,6 +825,20 @@ def render_index(index: "np.ndarray", mask: "np.ndarray",
     return buf.getvalue()
 
 
+def render_true_color(data: "np.ndarray", mask: "np.ndarray", period: dict) -> bytes:
+    """Render B04/B03/B02 BOA reflectance with a stable true-colour stretch."""
+    reflectance = period_to_reflectance(data, period)
+    rgb = np.stack((reflectance[_B04], reflectance[_B03], reflectance[_B02]), axis=-1)
+    # The 2.5x Copernicus true-colour convention maps 0.4 reflectance to white.
+    rgb = np.clip(rgb * 2.5, 0.0, 1.0)
+    rgb = np.power(rgb, 1 / 2.2)
+    rgb_u8 = np.rint(rgb * 255).astype(np.uint8)
+    rgba = np.concatenate([rgb_u8, mask[:, :, None]], axis=-1)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, "PNG")
+    return buf.getvalue()
+
+
 # ════════════════════════════════════════════════════════════════
 #   APP
 # ════════════════════════════════════════════════════════════════
@@ -746,7 +865,60 @@ app.add_middleware(
     allow_credentials = True,
     allow_methods  = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers  = ["Content-Type", "X-Requested-With"],
+    expose_headers = ["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"],
 )
+
+
+_EXPENSIVE_API_PATHS = {
+    "/api/analyze",
+    "/api/change_stats",
+    "/api/forecast/point",
+    "/api/transect",
+    "/api/zone_report",
+    "/api/zone_stats",
+    "/api/zone_timeseries",
+}
+
+
+def _rate_limit_policy(path: str) -> tuple[str, int] | None:
+    if path.startswith("/tiles/"):
+        return "tiles", TILE_RATE_LIMIT
+    if path in _EXPENSIVE_API_PATHS:
+        return "analysis", ANALYSIS_RATE_LIMIT
+    if path.startswith("/api/"):
+        return "api", API_RATE_LIMIT
+    return None
+
+
+@app.middleware("http")
+async def rate_limit_requests(request: Request, call_next):
+    if not RATE_LIMIT_ENABLED or request.method == "OPTIONS":
+        return await call_next(request)
+
+    policy = _rate_limit_policy(request.url.path)
+    if policy is None:
+        return await call_next(request)
+
+    bucket, limit = policy
+    client = request.client.host if request.client else "unknown"
+    allowed, remaining, retry_after = _API_RATE_LIMITER.consume(
+        f"{bucket}:{client}", limit=limit, window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+    headers = {
+        "X-RateLimit-Limit": str(limit),
+        "X-RateLimit-Remaining": str(remaining),
+    }
+    if not allowed:
+        headers["Retry-After"] = str(retry_after)
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please retry later."},
+            headers=headers,
+        )
+
+    response = await call_next(request)
+    response.headers.update(headers)
+    return response
 
 
 @app.middleware("http")
@@ -796,8 +968,7 @@ async def limit_request_body(request: Request, call_next):
     return await call_next(request)
 
 
-@app.get("/health")
-async def health():
+def health_payload() -> dict:
     assets = s2_assets()
     forecast = forecast_config()
     account_database = ACCOUNT_STORE.health_status()
@@ -816,9 +987,7 @@ async def health():
         "rasterio":  RASTERIO_OK,
         "ai":        AI_OK,
         "cog":       cog_available(),
-        "cog_path":  str(COG_PATH),
         "s2_tiles":  len(assets),
-        "s2_dir":    str(S2_DIR),
         "ai_ready":  bool(os.getenv("GROQ_API_KEY") or os.getenv("DEEPSEEK_API_KEY")),
         "lulc_classifier": bool(SKLEARN_OK and LULC_MODEL_PATH.exists()),
         "lulc_classifier_v2": bool(SKLEARN_OK and LULC_MODEL_V2_PATH.exists()),
@@ -826,12 +995,40 @@ async def health():
         "lulc_classifier_v2_loaded": CLASSIFIER_V2 is not None,
         "linear_forecast": forecast["enabled"],
         "linear_forecast_source_years": forecast["source_years"],
+        "monitoring": monitoring_service_status(),
         "accounts": {
             "database": account_database,
             "email": account_mail,
             "backup": account_backup,
         },
     }
+
+
+@app.get("/healthz")
+async def healthz():
+    """Minimal liveness probe. It intentionally performs no dependency checks."""
+    return {"status": "ok", "version": "4.0.0"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe for serving core raster and account requests."""
+    account_database = ACCOUNT_STORE.health_status()
+    ready = bool(TILER_OK and RASTERIO_OK and cog_available() and account_database["ok"])
+    content = {
+        "status": "ready" if ready else "not_ready",
+        "components": {
+            "tiles": bool(TILER_OK and RASTERIO_OK and cog_available()),
+            "accounts": bool(account_database["ok"]),
+        },
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=content)
+
+
+@app.get("/health")
+async def health():
+    """Frontend-safe component health without host filesystem disclosure."""
+    return health_payload()
 
 
 @app.get("/api/periods")
@@ -842,6 +1039,8 @@ async def periods():
             "label": v["label"],
             "date_range": v["date_range"],
             "available": cog_available(v),
+            "data_version": period_data_version(v),
+            "evidence": period_evidence(k, v),
         }
         for k, v in PERIODS.items()
     ]
@@ -853,17 +1052,18 @@ async def periods():
 
 @app.get("/tiles/{layer}/{z}/{x}/{y}.png")
 def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_PERIOD)):
-    if layer not in LAYERS:
+    if layer != "rgb" and layer not in LAYERS:
         raise HTTPException(status_code=404, detail=f"Неизвестный слой: {layer}")
     if not TILER_OK:
         raise HTTPException(status_code=503, detail="Сервис тайлов недоступен")
 
     period_cfg = resolve_period(period)
+    cache_headers = tile_cache_headers(period_cfg)
     data, mask = mosaic_tile(x, y, z, period_cfg)
 
     if data is None:
         return Response(content=blank_tile(), media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=60"})
+                        headers=cache_headers)
 
     # Normalize mask to uint8 0/255. rio-tiler 9.x returns a uint16 mask
     # (valid = 65535); stacking that with uint8 RGB would upcast the RGBA
@@ -871,17 +1071,22 @@ def tile(layer: str, z: int, x: int, y: int, period: str = Query(DEFAULT_PERIOD)
     mask = (mask > 0).astype(np.uint8) * 255
 
     try:
-        cfg     = LAYERS[layer]
-        vmin, vmax = cfg["range"]
-        index   = compute_index(data, layer, period_cfg)
-        content = render_index(index, mask, cfg["cmap"], vmin, vmax)
+        if layer == "rgb":
+            content = render_true_color(data, mask, period_cfg)
+        else:
+            cfg = LAYERS[layer]
+            vmin, vmax = cfg["range"]
+            index = compute_index(data, layer, period_cfg)
+            content = render_index(index, mask, cfg["cmap"], vmin, vmax)
     except Exception as e:
-        print(f"render error {layer}/{z}/{x}/{y}: {e}")
-        return Response(content=blank_tile(), media_type="image/png")
+        log_event(
+            logging.ERROR, "tile_render_failed", layer=layer, z=z, x=x, y=y,
+            period=period, error=type(e).__name__,
+        )
+        return Response(content=blank_tile(), media_type="image/png", headers=cache_headers)
 
     return Response(content=content, media_type="image/png",
-                    headers={"Cache-Control": "no-cache, no-store, must-revalidate",
-                              "Pragma": "no-cache"})
+                    headers=cache_headers)
 
 
 @app.get("/tiles/forecast/{index}/{target_year}/{z}/{x}/{y}.png")
@@ -945,12 +1150,13 @@ async def forecast_tile(index: str, target_year: int, z: int, x: int, y: int):
 @app.get("/api/forecast/point")
 @limit_analysis
 def forecast_point(
-    lat: float = Query(..., ge=40.0, le=47.0),
-    lon: float = Query(..., ge=65.0, le=72.0),
+    lat: float = Query(..., ge=-90.0, le=90.0),
+    lon: float = Query(..., ge=-180.0, le=180.0),
     index: str = Query("ndvi"),
     target_year: int = Query(...),
 ):
     sources = validate_forecast_request(index, target_year)
+    validate_point_coverage(lat, lon, sources[-1][2])
     history = []
     observed_values = []
     for year, period_id, cfg in sources:
@@ -988,6 +1194,21 @@ def forecast_point(
         "confidence": "low",
         "history": history,
         "trend": trend,
+        "evidence": {
+            "kind": "modeled_scenario",
+            "source": S2_SOURCE,
+            "product": S2_PRODUCT,
+            "acquisition_window": f"{sources[0][0]}–{sources[-1][0]}",
+            "processing": "Ordinary least-squares extrapolation from available annual observations",
+            "data_version": ".".join(period_data_version(cfg) for _, _, cfg in sources),
+            "provenance_completeness": "partial",
+            "quality": {
+                "grade": "experimental",
+                "confidence": "low",
+                "mask_type": "nodata_only",
+                "cloud_mask_applied": False,
+            },
+        },
         "disclaimer": (
             "Экспериментальная экстраполяция трёх летних наблюдений. "
             "Она показывает сценарий продолжения текущего тренда, а не гарантированный прогноз."
@@ -1145,13 +1366,14 @@ def _demo(lat, lon):
 def pixel(
     # Bounds cover the full COG extent (≈40.7–46.5°N, 65.7–71.4°E) with margin.
     # The old 40.8–44.0 / 67.5–71.5 box wrongly 422'd valid points like 44.15°N.
-    lat: float = Query(..., ge=40.0, le=47.0),
-    lon: float = Query(..., ge=65.0, le=72.0),
+    lat: float = Query(..., ge=-90.0, le=90.0),
+    lon: float = Query(..., ge=-180.0, le=180.0),
     period: str = Query(DEFAULT_PERIOD),
 ):
     import math
     result = {}
     period_cfg = resolve_period(period)
+    validate_point_coverage(lat, lon, period_cfg)
 
     def _pixel_from(path: str):
         with rasterio.open(path) as src:
@@ -1244,6 +1466,17 @@ def pixel(
         "ml_confidence":    ml["confidence"]    if ml else None,
         "ml_probabilities": ml["probabilities"] if ml else None,
         "demo":       result.get("demo", False),
+        "evidence": (
+            {
+                "kind": "synthetic_demo",
+                "source": "Deterministic local demo generator",
+                "period_id": period,
+                "provenance_completeness": "complete",
+                "quality": {"grade": "demo", "limitation": "Not satellite evidence"},
+            }
+            if result.get("demo", False)
+            else period_evidence(period, period_cfg, quality={"valid_pixel": True})
+        ),
     }
 
 
@@ -1313,6 +1546,19 @@ def _validate_linestring_geometry(geometry: dict) -> list[tuple[float, float]]:
 # request-size rules as immediate zonal analyses.
 ACCOUNT_STORE = AccountStore(APP_DB_PATH)
 ACCOUNT_MAILER = AccountMailer.from_environment(BASE_DIR)
+MONITORING_SERVICE: MonitoringService | None = None
+
+
+def run_monitoring_for_user(user_id: str) -> dict:
+    if MONITORING_SERVICE is None:
+        raise RuntimeError("monitoring service is not initialized")
+    return MONITORING_SERVICE.run(user_id)
+
+
+def monitoring_service_status() -> dict:
+    return MONITORING_SERVICE.status() if MONITORING_SERVICE else {"enabled": False, "running": False}
+
+
 app.include_router(create_account_router(
     ACCOUNT_STORE,
     allowed_origins=CORS_ORIGINS,
@@ -1320,6 +1566,8 @@ app.include_router(create_account_router(
     secure_cookie=os.getenv("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"},
     mailer=ACCOUNT_MAILER,
     google_client_id=GOOGLE_CLIENT_ID,
+    monitoring_runner=run_monitoring_for_user,
+    monitoring_status=monitoring_service_status,
 ))
 
 
@@ -1410,6 +1658,7 @@ def _calculate_zone_stats(geometry: dict, period_id: str, include_lulc: bool = T
 
     nodata_mask = period_nodata_mask(data, period_cfg)
     valid_mask = poly_mask & ~nodata_mask
+    geometry_pixel_count = int(np.count_nonzero(poly_mask))
     pixel_count = int(np.count_nonzero(valid_mask))
     if pixel_count == 0:
         raise HTTPException(status_code=400, detail="Нет валидных пикселей внутри полигона")
@@ -1460,9 +1709,51 @@ def _calculate_zone_stats(geometry: dict, period_id: str, include_lulc: bool = T
     return {
         "area_ha":     round(pixel_count * px_area_ha, 2),
         "pixel_count": pixel_count,
+        "geometry_pixel_count": geometry_pixel_count,
         "indices":     indices,
         "lulc":        lulc,
+        "evidence": period_evidence(
+            period_id,
+            period_cfg,
+            quality={
+                "valid_pixel_count": pixel_count,
+                "geometry_pixel_count": geometry_pixel_count,
+                "valid_coverage_percent": round(pixel_count / geometry_pixel_count * 100, 2)
+                if geometry_pixel_count else 0.0,
+            },
+        ),
     }
+
+
+def latest_monitoring_period() -> tuple[str, str] | None:
+    """Newest available immutable mosaic and its cache-safe data version."""
+    for period_id, period_cfg in reversed(list(PERIODS.items())):
+        if cog_available(period_cfg):
+            return period_id, period_data_version(period_cfg)
+    return None
+
+
+MONITORING_SERVICE = MonitoringService(
+    ACCOUNT_STORE,
+    ACCOUNT_MAILER,
+    latest_period=latest_monitoring_period,
+    calculate_stats=lambda geometry, period_id: _calculate_zone_stats(
+        geometry, period_id, include_lulc=False,
+    ),
+    enabled=MONITORING_SCHEDULER_ENABLED,
+    interval_seconds=MONITORING_INTERVAL_SECONDS,
+    logger=LOGGER,
+)
+
+
+@app.on_event("startup")
+def start_monitoring_scheduler():
+    MONITORING_SERVICE.start()
+
+
+@app.on_event("shutdown")
+def stop_monitoring_scheduler():
+    MONITORING_SERVICE.stop()
 
 
 @app.post("/api/zone_stats")
@@ -1490,15 +1781,42 @@ def zone_timeseries(req: ZoneTimeSeriesReq):
             "area_ha": stats["area_ha"],
             "pixel_count": stats["pixel_count"],
             "indices": stats["indices"],
+            "evidence": stats["evidence"],
         })
 
     observations.sort(key=lambda item: item["year"])
     if not observations:
         raise HTTPException(status_code=503, detail="Нет доступных периодов для временного ряда")
+
+    baselines = {}
+    for index in LAYERS:
+        values = np.asarray([
+            item["indices"][index]["mean"]
+            for item in observations
+            if item.get("indices", {}).get(index, {}).get("mean") is not None
+        ], dtype=np.float32)
+        if values.size == 0:
+            continue
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        baselines[index] = {
+            "median": round(median, 4),
+            "mean": round(float(np.mean(values)), 4),
+            "std": round(float(np.std(values)), 4),
+            "mad": round(mad, 4),
+            "observation_count": int(values.size),
+        }
+        for item in observations:
+            value = item.get("indices", {}).get(index, {}).get("mean")
+            item.setdefault("anomalies", {})[index] = (
+                round(float(value) - median, 4) if value is not None else None
+            )
     return {
         "observations": observations,
         "years": [item["year"] for item in observations],
-        "source": "Sentinel-2 L2A / Copernicus Data Space Ecosystem",
+        "baselines": baselines,
+        "anomaly_method": "difference_from_available_period_median",
+        "source": f"{S2_PRODUCT} / {S2_SOURCE}",
     }
 
 
@@ -1630,6 +1948,15 @@ def transect(req: TransectReq):
         "total_length_m": round(total_length, 2),
         "points":         points,
         "stats":          stats,
+        "evidence": period_evidence(
+            req.period,
+            period_cfg,
+            quality={
+                "valid_sample_count": len(valid_values),
+                "requested_sample_count": len(points),
+                "valid_coverage_percent": round(len(valid_values) / len(points) * 100, 2),
+            },
+        ),
     }
 
 
@@ -1638,8 +1965,8 @@ def transect(req: TransectReq):
 # ════════════════════════════════════════════════════════════════
 
 class AnalyzeReq(BaseModel):
-    lat:        float       = Field(..., ge=40.0, le=47.0)
-    lon:        float       = Field(..., ge=65.0, le=72.0)
+    lat:        float       = Field(..., ge=-90.0, le=90.0)
+    lon:        float       = Field(..., ge=-180.0, le=180.0)
     period:     str         = DEFAULT_PERIOD
     ndvi:       float | None = None
     ndwi:       float | None = None
@@ -1738,7 +2065,8 @@ def build_groq_prompt(lat, lon, period, indices, ml_class, ml_class_ru, ml_confi
 @app.post("/api/analyze")
 @limit_analysis
 def analyze(req: AnalyzeReq):
-    resolve_period(req.period)
+    period_cfg = resolve_period(req.period)
+    validate_point_coverage(req.lat, req.lon, period_cfg)
     indices = {
         "NDVI": req.ndvi, "NDWI": req.ndwi, "NDRE": req.ndre,
         "NDMI": req.ndmi, "BSI": req.bsi, "SAVI": req.savi, "NBR": req.nbr,
@@ -1759,7 +2087,7 @@ def analyze(req: AnalyzeReq):
             key = os.getenv(env)
             if not key: continue
             try:
-                r = OpenAI(api_key=key, base_url=url).chat.completions.create(
+                r = ai_client(key, url).chat.completions.create(
                     model=model, max_tokens=280, temperature=0.3,
                     messages=[{"role":"system","content":system},
                                {"role":"user","content":prompt}])
@@ -1931,7 +2259,7 @@ def zone_report(req: ZoneReportReq):
             try:
                 # llama3-8b-8192 was decommissioned by Groq — llama-3.1-8b-instant is
                 # its direct successor in the same fast/cheap 8B tier.
-                r = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                r = ai_client(key, "https://api.groq.com/openai/v1").chat.completions.create(
                     model="llama-3.1-8b-instant", max_tokens=1500, temperature=0.4,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": prompt}])
@@ -2259,6 +2587,23 @@ def _compute_change_stats(geometry: dict, period_before: str, period_after: str)
         "period_after":  period_after,
         "indices":       indices_out,
         "ml_transitions": ml_transitions,
+        "evidence": {
+            **period_evidence(
+                period_after,
+                after_cfg,
+                quality={
+                    "valid_pixel_count": pixel_count,
+                    "comparison_mask": "valid_in_both_periods",
+                },
+            ),
+            "kind": "derived_change_observation",
+            "acquisition_window": f"{before_cfg['date_range']} → {after_cfg['date_range']}",
+            "data_version": f"{period_data_version(before_cfg)}.{period_data_version(after_cfg)}",
+            "input_periods": [
+                {"period_id": period_before, "data_version": period_data_version(before_cfg)},
+                {"period_id": period_after, "data_version": period_data_version(after_cfg)},
+            ],
+        },
     }
 
 
@@ -2276,7 +2621,7 @@ def change_stats(req: ChangeStatsReq):
                 response_language = AI_LANGUAGE_NAMES.get(req.locale, AI_LANGUAGE_NAMES["ru"])
                 system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
                           f"Анализируешь изменения между двумя периодами Sentinel-2. Отвечай кратко и конкретно на {response_language} языке.")
-                r = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                r = ai_client(key, "https://api.groq.com/openai/v1").chat.completions.create(
                     model="llama-3.1-8b-instant", max_tokens=500, temperature=0.4,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": prompt}])
@@ -2477,7 +2822,7 @@ def _compute_change_overview(period_before: str = "2023_summer", period_after: s
                 prompt = build_change_stats_prompt(result)
                 system = ("Эксперт по дистанционному зондированию и агрономии Центральной Азии. "
                           "Анализируешь изменения по всей Туркестанской области между двумя периодами Sentinel-2.")
-                r = OpenAI(api_key=key_env, base_url="https://api.groq.com/openai/v1").chat.completions.create(
+                r = ai_client(key_env, "https://api.groq.com/openai/v1").chat.completions.create(
                     model="llama-3.1-8b-instant", max_tokens=600, temperature=0.4,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": prompt}])
@@ -2526,7 +2871,7 @@ async def change_overview():
 
 @app.get("/metadata")
 async def metadata():
-    bounds = cog_bounds_wgs84() or [40.31, 65.36, 46.46, 71.36]  # S,W,N,E
+    bounds = cog_bounds_wgs84() or REGION_FALLBACK_BOUNDS
     center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
     return {
         "region": {
@@ -2539,6 +2884,10 @@ async def metadata():
         "cog":      cog_available(),
         "s2_tiles": len(s2_assets()),
         "source": "Sentinel-2 L2A / Copernicus Data Space Ecosystem",
+        "evidence": period_evidence(DEFAULT_PERIOD, PERIODS[DEFAULT_PERIOD]),
+        "imagery": {
+            "true_color": {"available": cog_available(), "bands": ["B04", "B03", "B02"], "stretch": "2.5x reflectance + gamma 2.2"},
+        },
         "forecast": forecast_config(),
     }
 

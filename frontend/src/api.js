@@ -7,7 +7,22 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\
 
 export const apiUrl = (path) => `${API_BASE_URL}${path}`
 
-const apiFetch = (path, options) => fetch(apiUrl(path), options)
+const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 30_000)
+
+const apiFetch = async (path, options = {}) => {
+  const { signal, timeoutMs = API_TIMEOUT_MS, ...fetchOptions } = options
+  const controller = new AbortController()
+  const abortFromCaller = () => controller.abort(signal?.reason)
+  if (signal?.aborted) abortFromCaller()
+  else signal?.addEventListener('abort', abortFromCaller, { once: true })
+  const timer = setTimeout(() => controller.abort(new Error('Request timed out')), timeoutMs)
+  try {
+    return await fetch(apiUrl(path), { ...fetchOptions, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', abortFromCaller)
+  }
+}
 
 const ACCOUNT_MUTATION_HEADERS = {
   'Content-Type': 'application/json',
@@ -154,6 +169,18 @@ export const deleteSavedAnalysis = (analysisId) => accountRequest(`/api/account/
   method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
 })
 
+export const fetchMonitoringStatus = () => accountRequest('/api/account/monitoring/status')
+
+export const runAccountMonitoring = () => accountRequest('/api/account/monitoring/run', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS,
+})
+
+export const fetchAlertEvents = () => accountRequest('/api/account/alerts')
+
+export const acknowledgeAlertEvent = (alertId) => accountRequest(`/api/account/alerts/${encodeURIComponent(alertId)}/acknowledge`, {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS,
+})
+
 export async function fetchHealth() {
   const r = await apiFetch('/health')
   if (!r.ok) throw new Error(`Health fetch failed: ${r.status}`)
@@ -194,8 +221,11 @@ export async function fetchAnalysis({ lat, lon, period, ndvi, ndwi, ndre, ndmi, 
   return r.json()
 }
 
-/** Leaflet-compatible XYZ tile URL template for a given layer + period. */
-export const tileUrl = (layer, period) => apiUrl(`/tiles/${layer}/{z}/{x}/{y}.png?period=${period}`)
+/** Leaflet-compatible XYZ tile URL. Versioning makes immutable COG updates cache-safe. */
+export const tileUrl = (layer, period, dataVersion = '') => {
+  const version = dataVersion ? `&v=${encodeURIComponent(dataVersion)}` : ''
+  return apiUrl(`/tiles/${layer}/{z}/{x}/{y}.png?period=${encodeURIComponent(period)}${version}`)
+}
 
 /** Experimental all-years linear-trend forecast tile URL. */
 export const forecastTileUrl = (index, targetYear) =>

@@ -253,6 +253,31 @@ class AccountApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 403)
 
+    def test_successful_registrations_are_rate_limited_per_client(self):
+        for index in range(3):
+            response = self.client.post(
+                "/api/account/register",
+                headers=self.headers,
+                json={
+                    "display_name": f"Test User {index}",
+                    "email": f"register-{index}@example.com",
+                    "password": PASSWORD,
+                },
+            )
+            self.assertEqual(response.status_code, 201, response.text)
+
+        rejected = self.client.post(
+            "/api/account/register",
+            headers=self.headers,
+            json={
+                "display_name": "Fourth User",
+                "email": "register-4@example.com",
+                "password": PASSWORD,
+            },
+        )
+        self.assertEqual(rejected.status_code, 429, rejected.text)
+        self.assertIn("Retry-After", rejected.headers)
+
     def test_google_sign_in_requires_app_email_confirmation(self):
         credential = "google-new-user-credential-0001"
         self.google_identities[credential] = {

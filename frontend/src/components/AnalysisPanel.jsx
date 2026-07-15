@@ -3,6 +3,7 @@ import TransectChart from './TransectChart.jsx'
 import ChangeStatsPanel from './ChangeStatsPanel.jsx'
 import ForecastPanel from './ForecastPanel.jsx'
 import SaveAnalysisAction from './SaveAnalysisAction.jsx'
+import EvidenceBadge from './EvidenceBadge.jsx'
 import { useI18n } from '../i18n.jsx'
 
 function PanelHeader({ hasPoint, onClose }) {
@@ -133,6 +134,8 @@ export default function AnalysisPanel({
         </svg>
         <span>{point.lat.toFixed(4)}°N · {point.lng.toFixed(4)}°E</span>
       </div>
+
+      <EvidenceBadge evidence={pixel?.evidence} />
 
       {(pixel?.ml_class || pixel?.ml_class_ru) && (
         <div className="ml-block">

@@ -1,5 +1,6 @@
 import ZoneReport from './ZoneReport.jsx'
 import ZoneTimeSeries from './ZoneTimeSeries.jsx'
+import EvidenceBadge from './EvidenceBadge.jsx'
 import { useI18n } from '../i18n.jsx'
 
 const INDEX_LABELS = {
@@ -74,6 +75,8 @@ export default function ZoneStatsPanel({
             {t('zone.area')} <strong>{formatNumber(stats.area_ha)} {t('unit.ha')}</strong>
             <span className="zone-area-px"> ({formatNumber(stats.pixel_count)} {t('unit.pixels')})</span>
           </div>
+
+          <EvidenceBadge evidence={stats.evidence} />
 
           <div className="zone-block">
             <div className="zone-block-title">{t('zone.indices')}</div>

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 3000",
+    "test": "node --test",
     "build": "vite build",
     "preview": "vite preview --port 3000"
   },
@@ -16,10 +17,11 @@
     "maplibre-gl": "^5.24.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-router": "^7.18.0",
     "recharts": "^3.9.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.2",
-    "vite": "^5.4.11"
+    "vite": "^6.4.3"
   }
 }

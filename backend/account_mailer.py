@@ -58,6 +58,33 @@ MAIL_COPY = {
     },
 }
 
+ALERT_COPY = {
+    "ru": {
+        "subject": "Предупреждение по зоне — GeoAI TKO",
+        "intro": "Правило мониторинга сработало для зоны «{zone}».",
+        "condition": "{index} {operator} {threshold}; наблюдаемое значение: {value}.",
+        "action": "Открыть панель мониторинга",
+        "below": "ниже",
+        "above": "выше",
+    },
+    "kk": {
+        "subject": "Аймақ бойынша ескерту — GeoAI TKO",
+        "intro": "«{zone}» аймағы үшін мониторинг ережесі іске қосылды.",
+        "condition": "{index} {operator} {threshold}; байқалған мән: {value}.",
+        "action": "Мониторинг панелін ашу",
+        "below": "төмен",
+        "above": "жоғары",
+    },
+    "en": {
+        "subject": "Zone monitoring warning — GeoAI TKO",
+        "intro": "A monitoring rule was triggered for “{zone}”.",
+        "condition": "{index} {operator} {threshold}; observed value: {value}.",
+        "action": "Open monitoring dashboard",
+        "below": "below",
+        "above": "above",
+    },
+}
+
 
 class AccountMailer:
     def __init__(
@@ -128,6 +155,19 @@ class AccountMailer:
         url = self._action_url("reset_password", token)
         return self._deliver(user, url, locale, "reset")
 
+    def send_monitoring_alert(
+        self, user: dict, zone: dict, alert: dict, locale: str = "ru",
+    ) -> DeliveryResult:
+        copy = ALERT_COPY.get(locale, ALERT_COPY["ru"])
+        operator = copy[alert["operator"]]
+        url = f"{self.public_app_url}/dashboard?{urlencode({'alert': alert['id']})}"
+        body = (
+            f"{copy['intro'].format(zone=zone['name'])}\n\n"
+            f"{copy['condition'].format(index=alert['index'].upper(), operator=operator, threshold=alert['threshold'], value=alert['observed_value'])}\n\n"
+            f"{copy['action']}:\n{url}\n"
+        )
+        return self._send_message(user, copy["subject"], body, url)
+
     def _deliver(self, user: dict, url: str, locale: str, purpose: str) -> DeliveryResult:
         copy = MAIL_COPY.get(locale, MAIL_COPY["ru"])
         subject = copy[f"{purpose}_subject"]
@@ -137,19 +177,25 @@ class AccountMailer:
             f"{copy[f'{purpose}_expiry']}\n"
         )
 
+        return self._send_message(user, subject, body, url)
+
+    def _send_message(
+        self, user: dict, subject: str, body: str, action_url: str,
+    ) -> DeliveryResult:
+
         if self.development_mode:
             if self.outbox_dir:
                 self.outbox_dir.mkdir(parents=True, exist_ok=True)
                 message_path = self.outbox_dir / f"{uuid.uuid4().hex}.json"
                 message_path.write_text(
                     json.dumps(
-                        {"to": user["email"], "subject": subject, "body": body, "action_url": url},
+                        {"to": user["email"], "subject": subject, "body": body, "action_url": action_url},
                         ensure_ascii=False,
                         indent=2,
                     ),
                     encoding="utf-8",
                 )
-            return DeliveryResult(sent=True, preview_url=url)
+            return DeliveryResult(sent=True, preview_url=action_url)
 
         if not self.smtp_host:
             return DeliveryResult(sent=False)

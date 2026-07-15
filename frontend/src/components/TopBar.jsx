@@ -5,9 +5,12 @@ export default function TopBar({
   account, accountLoading = false, onAccountOpen, onLocaleChange,
 }) {
   const { locale, setLocale, t, periodLabel } = useI18n()
-  const online = health && health.status === 'ok'
+  const online = health && ['ok', 'degraded'].includes(health.status)
+  const degraded = health?.status === 'degraded'
   const statusText = health
-    ? (online ? `Sentinel-2 · ${health.cog ? 'COG mosaic' : t('top.tiles', { count: health.s2_tiles })}` : t('top.offline'))
+    ? (online
+        ? `Sentinel-2 · ${health.cog ? 'COG mosaic' : t('top.tiles', { count: health.s2_tiles })}${degraded ? ` · ${t('top.degraded')}` : ''}`
+        : t('top.offline'))
     : t('top.connecting')
 
   function changeLocale(nextLocale) {
@@ -67,7 +70,7 @@ export default function TopBar({
             <option value="en">EN</option>
           </select>
         </label>
-        <div className={`status-pill ${online ? '' : 'offline'}`} role="status" aria-live="polite">
+        <div className={`status-pill ${online ? (degraded ? 'degraded' : '') : 'offline'}`} role="status" aria-live="polite">
           <span className="status-dot" />
           <span>{statusText}</span>
         </div>

@@ -31,7 +31,7 @@ const BASEMAP_ORDER = ['satellite', 'terrain', 'dark']
 const LABELS_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png'
 
 export default function MapView({
-  activeLayer, period, opacity, bounds, center, zoom, initialBasemap = 'satellite', onPointClick, onMouseMove, onZoomChange,
+  activeLayer, period, periods = [], opacity, bounds, center, zoom, initialBasemap = 'satellite', onPointClick, onMouseMove, onZoomChange,
   drawMode, onPolygonDrawn, clearSignal, finishSignal, onDrawPointsChange,
   zoneGeometry, zoneEditMode, onPolygonEdited, zoneFocusSignal,
   lineDrawMode, onLineDrawn, lineClearSignal, lineFinishSignal, onLineDrawPointsChange,
@@ -497,17 +497,13 @@ export default function MapView({
     if (!map || !activeLayer) return
     if (clipGeo === undefined) return   // wait until boundary load resolves
 
-    // "satellite" is a virtual layer — no index tiles, just the basemap/boundary/labels underneath
-    if (activeLayer === 'satellite') {
-      Object.values(overlaysRef.current).forEach((layer) => map.removeLayer(layer))
-      overlaysRef.current = {}
-      return
-    }
-
+    // The satellite choice uses the app's measured B04/B03/B02 true-colour tiles.
     const showForecast = forecastMode && !!forecastYear
+    const dataLayer = activeLayer === 'satellite' ? 'rgb' : activeLayer
+    const dataVersion = periods.find((item) => item.period_id === period)?.data_version || ''
     const key = showForecast
       ? `forecast:${activeLayer}:${forecastYear}`
-      : `${activeLayer}:${period}`
+      : `${dataLayer}:${period}:${dataVersion}`
     Object.entries(overlaysRef.current).forEach(([id, layer]) => {
       if (id === key) return
       map.removeLayer(layer)
@@ -517,7 +513,7 @@ export default function MapView({
       const common = { opacity, tileSize: 256, minZoom: 4, maxZoom: 18, crossOrigin: true }
       const url = showForecast
         ? forecastTileUrl(activeLayer, forecastYear)
-        : tileUrl(activeLayer, period)
+        : tileUrl(dataLayer, period, dataVersion)
       const layer = (clipGeo && L.TileLayer.boundaryCanvas)
         ? L.TileLayer.boundaryCanvas(url, { ...common, boundary: clipGeo })
         : L.tileLayer(url, common)
@@ -526,7 +522,7 @@ export default function MapView({
       boundaryRef.current?.bringToFront?.()   // keep outline above the data
     }
     overlaysRef.current[key].setOpacity(opacity)
-  }, [activeLayer, period, opacity, clipGeo, forecastMode, forecastYear])
+  }, [activeLayer, period, periods, opacity, clipGeo, forecastMode, forecastYear])
 
   // change-detection overlay — independent of the normal index layer above,
   // stacked on top of it at a fixed opacity rather than replacing it

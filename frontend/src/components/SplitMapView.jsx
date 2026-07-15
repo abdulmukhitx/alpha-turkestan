@@ -54,9 +54,9 @@ function makeMap(container, center, zoom, basemap) {
 }
 
 // Adds/refreshes the data (index/period) raster source+layer for one map.
-function setDataLayer(map, index, period) {
+function setDataLayer(map, index, period, dataVersion = '') {
   if (!map.isStyleLoaded()) return
-  const url = tileUrl(index, period)
+  const url = tileUrl(index, period, dataVersion)
   const sourceId = 'data'
   if (map.getSource(sourceId)) {
     map.getSource(sourceId).setTiles([url])
@@ -266,8 +266,9 @@ export default function SplitMapView({
   useEffect(() => {
     const map = leftMapRef.current
     if (!map) return
+    const dataVersion = periods.find((item) => item.period_id === leftPeriod)?.data_version || ''
     const apply = () => {
-      setDataLayer(map, leftIndex, leftPeriod)
+      setDataLayer(map, leftIndex, leftPeriod, dataVersion)
       applyBoundaryMask(map, clipGeo)
       ensureDrawSources(map)
     }
@@ -277,13 +278,14 @@ export default function SplitMapView({
     }
     map.on('load', apply)
     return () => map.off('load', apply)
-  }, [leftIndex, leftPeriod, clipGeo])
+  }, [leftIndex, leftPeriod, clipGeo, periods])
 
   useEffect(() => {
     const map = rightMapRef.current
     if (!map) return
+    const dataVersion = periods.find((item) => item.period_id === rightPeriod)?.data_version || ''
     const apply = () => {
-      setDataLayer(map, rightIndex, rightPeriod)
+      setDataLayer(map, rightIndex, rightPeriod, dataVersion)
       applyBoundaryMask(map, clipGeo)
       ensureDrawSources(map)
     }
@@ -293,7 +295,7 @@ export default function SplitMapView({
     }
     map.on('load', apply)
     return () => map.off('load', apply)
-  }, [rightIndex, rightPeriod, clipGeo])
+  }, [rightIndex, rightPeriod, clipGeo, periods])
 
   // cursor + dblclick-zoom toggling for the interactive (left) map
   useEffect(() => {

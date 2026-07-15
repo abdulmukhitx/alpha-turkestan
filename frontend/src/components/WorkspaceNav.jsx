@@ -1,4 +1,5 @@
 import { useI18n } from '../i18n.jsx'
+import { NavLink } from 'react-router'
 
 const MODES = [
   { id: 'overview', label: 'nav.overview', hint: 'nav.overviewHint', icon: 'map' },
@@ -66,6 +67,8 @@ export default function WorkspaceNav({
   rightPanelOpen,
   onToggleRightPanel,
   hasResults,
+  onShare,
+  shareStatus,
 }) {
   const { t } = useI18n()
   return (
@@ -97,6 +100,18 @@ export default function WorkspaceNav({
       </div>
 
       <div className="panel-toggle-group" aria-label={t('nav.panels')}>
+        <NavLink className="panel-toggle page-link" to="/dashboard" viewTransition>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 3h6v6H3V3Zm8 0h6v6h-6V3ZM3 11h6v6H3v-6Zm8 0h6v6h-6v-6Z" /></svg>
+          <span>{t('pages.dashboard')}</span>
+        </NavLink>
+        <NavLink className="panel-toggle page-link" to="/history" viewTransition>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12M4 8h12M4 12h8M4 16h6" /></svg>
+          <span>{t('pages.history')}</span>
+        </NavLink>
+        <button type="button" className="panel-toggle" onClick={onShare} title={t('nav.shareHint')}>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="10" r="2" /><circle cx="15" cy="5" r="2" /><circle cx="15" cy="15" r="2" /><path d="m7 9 6-3m-6 5 6 3" /></svg>
+          <span>{shareStatus || t('nav.share')}</span>
+        </button>
         <button
           type="button"
           className={`panel-toggle ${leftPanelOpen ? 'active' : ''}`}

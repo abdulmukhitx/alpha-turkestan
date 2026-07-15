@@ -256,9 +256,12 @@ def create_account_router(
     mailer: AccountMailer | None = None,
     google_client_id: str = "",
     google_token_verifier: Callable[[str, str], dict] | None = None,
+    monitoring_runner: Callable[[str], dict] | None = None,
+    monitoring_status: Callable[[], dict] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/account", tags=["account"])
     login_limiter = AttemptLimiter()
+    registration_limiter = AttemptLimiter(limit=3, window_seconds=60 * 60)
     cookie_name = "__Host-geoai_session" if secure_cookie else "geoai_session"
     google_client_id = google_client_id.strip()
     google_token_verifier = google_token_verifier or verify_google_id_token
@@ -437,13 +440,14 @@ def create_account_router(
         _: None = Depends(require_mutation_request),
     ):
         client_key = f"register:{request.client.host if request.client else 'unknown'}"
-        login_limiter.check(client_key)
+        registration_limiter.check(client_key)
+        # Count successful attempts too; otherwise fresh email addresses can
+        # bypass creation and verification-email resource limits.
+        registration_limiter.failure(client_key)
         try:
             user = store.create_user(payload.email, payload.display_name, payload.password)
         except DuplicateUserError:
-            login_limiter.failure(client_key)
             raise HTTPException(status_code=409, detail="Аккаунт с таким email уже существует")
-        login_limiter.success(client_key)
         set_session_cookie(response, create_request_session(user["id"], request))
         result = account_payload(user)
         result["verification_delivery"] = deliver_verification(user, payload.locale)
@@ -747,6 +751,55 @@ def create_account_router(
         if len(analysis_id) > 100 or not store.delete_analysis(user["id"], analysis_id):
             raise HTTPException(status_code=404, detail="Сохранённый анализ не найден")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.get("/monitoring/status")
+    def get_monitoring_status(user: dict = Depends(verified_user)):
+        alerts = store.list_alerts(user["id"], limit=200)
+        active_count = sum(item["status"] in {"open", "acknowledged"} for item in alerts)
+        return {
+            "service": monitoring_status() if monitoring_status else {"enabled": False, "running": False},
+            "last_run": store.latest_monitoring_run(user["id"]),
+            "active_alerts": active_count,
+            "total_alerts": len(alerts),
+        }
+
+    @router.post("/monitoring/run")
+    def run_monitoring(
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if monitoring_runner is None:
+            raise HTTPException(status_code=503, detail="Сервис мониторинга не настроен")
+        try:
+            return monitoring_runner(user["id"])
+        except RuntimeError as exc:
+            if "already in progress" in str(exc):
+                raise HTTPException(status_code=409, detail="Проверка уже выполняется") from exc
+            LOGGER.error('{"event":"monitoring_run_failed","error":"%s"}', type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Не удалось выполнить мониторинг") from exc
+        except Exception as exc:
+            LOGGER.error('{"event":"monitoring_run_failed","error":"%s"}', type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Не удалось выполнить мониторинг") from exc
+
+    @router.get("/alerts")
+    def list_alert_events(
+        limit: int = 100,
+        user: dict = Depends(verified_user),
+    ):
+        return {"alerts": store.list_alerts(user["id"], limit=limit)}
+
+    @router.post("/alerts/{alert_id}/acknowledge")
+    def acknowledge_alert_event(
+        alert_id: str,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if len(alert_id) > 120:
+            raise HTTPException(status_code=404, detail="Предупреждение не найдено")
+        alert = store.acknowledge_alert(user["id"], alert_id)
+        if not alert:
+            raise HTTPException(status_code=404, detail="Предупреждение не найдено")
+        return alert
 
     @router.post("/zones", status_code=status.HTTP_201_CREATED)
     def create_zone(

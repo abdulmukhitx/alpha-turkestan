@@ -42,16 +42,16 @@ function codeFor(index) {
   return INDEX_OPTIONS.find(([key]) => key === index)?.[1] || index.toUpperCase()
 }
 
-function ChartTooltip({ active, payload, label }) {
+function ChartTooltip({ active, payload, label, mode }) {
   const { t } = useI18n()
   if (!active || !payload?.length) return null
-  const mean = payload.find((entry) => entry.dataKey === 'mean')?.value
+  const mean = payload.find((entry) => entry.dataKey === 'chartValue')?.value
   const range = payload.find((entry) => entry.dataKey === 'range')?.value
   return (
     <div className="timeseries-tooltip">
       <strong>{label}</strong>
-      {Number.isFinite(mean) && <span>{t('timeseries.mean')}: {mean.toFixed(4)}</span>}
-      {Array.isArray(range) && <span>p10–p90: {range[0].toFixed(4)} … {range[1].toFixed(4)}</span>}
+      {Number.isFinite(mean) && <span>{mode === 'anomaly' ? t('timeseries.anomaly') : t('timeseries.mean')}: {mean > 0 && mode === 'anomaly' ? '+' : ''}{mean.toFixed(4)}</span>}
+      {mode !== 'anomaly' && Array.isArray(range) && <span>p10–p90: {range[0].toFixed(4)} … {range[1].toFixed(4)}</span>}
     </div>
   )
 }
@@ -64,6 +64,7 @@ export default function ZoneTimeSeries({
   const [selectedIndex, setSelectedIndex] = useState(initialIndex)
   const [operator, setOperator] = useState('below')
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLDS[initialIndex])
+  const [chartMode, setChartMode] = useState('value')
   const [alerts, setAlerts] = useState(() => alertsCloudMode ? normalizeAlerts(alertRules) : readAlerts())
   const [storageError, setStorageError] = useState(null)
 
@@ -78,14 +79,18 @@ export default function ZoneTimeSeries({
   }, [alertRules, alertsCloudMode])
 
   const observations = data?.observations || []
+  const baseline = data?.baselines?.[selectedIndex]
   const chartData = useMemo(() => observations.map((item) => {
     const stats = item.indices?.[selectedIndex]
+    const anomaly = item.anomalies?.[selectedIndex]
     return {
       year: item.year,
       mean: stats?.mean ?? null,
+      anomaly: anomaly ?? null,
+      chartValue: chartMode === 'anomaly' ? (anomaly ?? null) : (stats?.mean ?? null),
       range: stats ? [stats.p10, stats.p90] : null,
     }
-  }), [observations, selectedIndex])
+  }), [observations, selectedIndex, chartMode])
 
   const alertSummaries = useMemo(() => alerts.map((rule) => {
     const breaches = observations.filter((item) => ruleMatches(rule, item.indices?.[rule.index]?.mean))
@@ -148,6 +153,11 @@ export default function ZoneTimeSeries({
             </select>
           </label>
 
+          <div className="timeseries-mode" role="group" aria-label={t('timeseries.chartMode')}>
+            <button type="button" className={chartMode === 'value' ? 'active' : ''} onClick={() => setChartMode('value')}>{t('timeseries.values')}</button>
+            <button type="button" className={chartMode === 'anomaly' ? 'active' : ''} onClick={() => setChartMode('anomaly')}>{t('timeseries.anomalies')}</button>
+          </div>
+
           <div className="timeseries-chart" aria-label={t('forecast.seriesAria', { code: codeFor(selectedIndex) })}>
             <ResponsiveContainer width="100%" height={210}>
               <ComposedChart data={chartData} margin={{ top: 14, right: 8, bottom: 0, left: -18 }}>
@@ -159,10 +169,11 @@ export default function ZoneTimeSeries({
                 </defs>
                 <CartesianGrid stroke="var(--border)" strokeDasharray="3 4" vertical={false} />
                 <XAxis dataKey="year" tick={{ fill: 'var(--text3)', fontSize: 10 }} axisLine={{ stroke: 'var(--border)' }} tickLine={false} />
-                <YAxis domain={[-1, 1]} allowDataOverflow tick={{ fill: 'var(--text3)', fontSize: 9 }} axisLine={false} tickLine={false} tickFormatter={(value) => value.toFixed(1)} />
-                <Tooltip content={<ChartTooltip />} />
-                <Area type="monotone" dataKey="range" name="p10–p90" stroke="none" fill="url(#zoneRange)" isAnimationActive={false} />
-                <Line type="monotone" dataKey="mean" name={t('timeseries.mean')} stroke="#60A5FA" strokeWidth={2.5} dot={{ r: 3, fill: '#0F172A', stroke: '#60A5FA', strokeWidth: 2 }} connectNulls isAnimationActive={false} />
+                <YAxis domain={chartMode === 'anomaly' ? ['auto', 'auto'] : [-1, 1]} allowDataOverflow tick={{ fill: 'var(--text3)', fontSize: 9 }} axisLine={false} tickLine={false} tickFormatter={(value) => value.toFixed(1)} />
+                <Tooltip content={<ChartTooltip mode={chartMode} />} />
+                {chartMode === 'value' && <Area type="monotone" dataKey="range" name="p10–p90" stroke="none" fill="url(#zoneRange)" isAnimationActive={false} />}
+                <ReferenceLine y={chartMode === 'anomaly' ? 0 : baseline?.median} stroke="#A78BFA" strokeDasharray="3 4" />
+                <Line type="monotone" dataKey="chartValue" name={chartMode === 'anomaly' ? t('timeseries.anomaly') : t('timeseries.mean')} stroke={chartMode === 'anomaly' ? '#A78BFA' : '#60A5FA'} strokeWidth={2.5} dot={{ r: 3, fill: '#0F172A', stroke: chartMode === 'anomaly' ? '#A78BFA' : '#60A5FA', strokeWidth: 2 }} connectNulls isAnimationActive={false} />
                 {alerts.filter((rule) => rule.index === selectedIndex).map((rule) => (
                   <ReferenceLine
                     key={rule.id}

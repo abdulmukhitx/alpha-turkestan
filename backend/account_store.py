@@ -224,6 +224,58 @@ class AccountStore:
                     );
                     CREATE INDEX IF NOT EXISTS saved_analyses_user_created_idx
                         ON saved_analyses(user_id, created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS zone_observations (
+                        user_id TEXT NOT NULL,
+                        zone_id TEXT NOT NULL,
+                        period_id TEXT NOT NULL,
+                        data_version TEXT NOT NULL,
+                        stats_json TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (user_id, zone_id, period_id, data_version),
+                        FOREIGN KEY (user_id, zone_id) REFERENCES zones(user_id, id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS zone_observations_recent_idx
+                        ON zone_observations(user_id, zone_id, observed_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS alert_events (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        zone_id TEXT NOT NULL,
+                        rule_id TEXT NOT NULL,
+                        index_name TEXT NOT NULL,
+                        operator TEXT NOT NULL,
+                        threshold REAL NOT NULL,
+                        observed_value REAL NOT NULL,
+                        period_id TEXT NOT NULL,
+                        data_version TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        delivery_status TEXT NOT NULL,
+                        first_observed_at TEXT NOT NULL,
+                        last_observed_at TEXT NOT NULL,
+                        acknowledged_at TEXT,
+                        resolved_at TEXT,
+                        FOREIGN KEY (user_id, zone_id) REFERENCES zones(user_id, id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS alert_events_user_recent_idx
+                        ON alert_events(user_id, last_observed_at DESC);
+                    CREATE INDEX IF NOT EXISTS alert_events_active_idx
+                        ON alert_events(user_id, zone_id, rule_id, status);
+
+                    CREATE TABLE IF NOT EXISTS monitoring_runs (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+                        status TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        zones_checked INTEGER NOT NULL DEFAULT 0,
+                        alerts_created INTEGER NOT NULL DEFAULT 0,
+                        alerts_resolved INTEGER NOT NULL DEFAULT 0,
+                        error TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS monitoring_runs_recent_idx
+                        ON monitoring_runs(user_id, started_at DESC);
                     """
                 )
                 user_columns = {
@@ -851,13 +903,268 @@ class AccountStore:
             )
         return result.rowcount > 0
 
+    def monitoring_targets(self, user_id: str | None = None) -> list[dict]:
+        """Return verified users, preferences and zones eligible for monitoring."""
+        with self._connect() as connection:
+            parameters: tuple = ()
+            where = "WHERE users.email_verified_at IS NOT NULL"
+            if user_id is not None:
+                where += " AND users.id = ?"
+                parameters = (user_id,)
+            users = connection.execute(
+                "SELECT users.id, users.email, users.display_name, user_preferences.payload "
+                "FROM users JOIN user_preferences ON user_preferences.user_id = users.id "
+                f"{where} ORDER BY users.id",
+                parameters,
+            ).fetchall()
+            targets = []
+            for user in users:
+                zones = connection.execute(
+                    "SELECT * FROM zones WHERE user_id = ? ORDER BY updated_at DESC",
+                    (user["id"],),
+                ).fetchall()
+                targets.append({
+                    "user": {
+                        "id": user["id"],
+                        "email": user["email"],
+                        "display_name": user["display_name"],
+                    },
+                    "preferences": {**DEFAULT_PREFERENCES, **json.loads(user["payload"])},
+                    "zones": [self._public_zone(zone) for zone in zones],
+                })
+        return targets
+
+    def get_zone_observation(
+        self, user_id: str, zone_id: str, period_id: str, data_version: str,
+    ) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM zone_observations WHERE user_id = ? AND zone_id = ? "
+                "AND period_id = ? AND data_version = ?",
+                (user_id, zone_id, period_id, data_version),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "zone_id": row["zone_id"],
+            "period_id": row["period_id"],
+            "data_version": row["data_version"],
+            "stats": json.loads(row["stats_json"]),
+            "observed_at": row["observed_at"],
+        }
+
+    def save_zone_observation(
+        self,
+        user_id: str,
+        zone_id: str,
+        period_id: str,
+        data_version: str,
+        stats: dict,
+        *,
+        observed_at: str | None = None,
+    ) -> dict:
+        timestamp = observed_at or utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO zone_observations "
+                "(user_id, zone_id, period_id, data_version, stats_json, observed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, zone_id, period_id, data_version) DO UPDATE SET "
+                "stats_json = excluded.stats_json, observed_at = excluded.observed_at",
+                (
+                    user_id, zone_id, period_id, data_version,
+                    json.dumps(stats, ensure_ascii=False, separators=(",", ":")),
+                    timestamp, utc_now(),
+                ),
+            )
+        return self.get_zone_observation(user_id, zone_id, period_id, data_version)
+
+    @staticmethod
+    def _public_alert(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "zone_id": row["zone_id"],
+            "rule_id": row["rule_id"],
+            "index": row["index_name"],
+            "operator": row["operator"],
+            "threshold": row["threshold"],
+            "observed_value": row["observed_value"],
+            "period_id": row["period_id"],
+            "data_version": row["data_version"],
+            "status": row["status"],
+            "delivery_status": row["delivery_status"],
+            "first_observed_at": row["first_observed_at"],
+            "last_observed_at": row["last_observed_at"],
+            "acknowledged_at": row["acknowledged_at"],
+            "resolved_at": row["resolved_at"],
+        }
+
+    def active_alert(self, user_id: str, zone_id: str, rule_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM alert_events WHERE user_id = ? AND zone_id = ? AND rule_id = ? "
+                "AND status IN ('open', 'acknowledged') ORDER BY first_observed_at DESC LIMIT 1",
+                (user_id, zone_id, rule_id),
+            ).fetchone()
+        return self._public_alert(row) if row else None
+
+    def active_alerts_for_zone(self, user_id: str, zone_id: str) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM alert_events WHERE user_id = ? AND zone_id = ? "
+                "AND status IN ('open', 'acknowledged') ORDER BY first_observed_at DESC",
+                (user_id, zone_id),
+            ).fetchall()
+        return [self._public_alert(row) for row in rows]
+
+    def create_alert(
+        self,
+        user_id: str,
+        zone_id: str,
+        rule: dict,
+        observed_value: float,
+        period_id: str,
+        data_version: str,
+    ) -> dict:
+        alert_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO alert_events "
+                "(id, user_id, zone_id, rule_id, index_name, operator, threshold, observed_value, "
+                "period_id, data_version, status, delivery_status, first_observed_at, last_observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 'pending', ?, ?)",
+                (
+                    alert_id, user_id, zone_id, rule["id"], rule["index"], rule["operator"],
+                    float(rule["value"]), float(observed_value), period_id, data_version, now, now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM alert_events WHERE id = ?", (alert_id,)).fetchone()
+        return self._public_alert(row)
+
+    def touch_alert(
+        self, alert_id: str, observed_value: float, period_id: str, data_version: str,
+    ) -> dict | None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE alert_events SET observed_value = ?, period_id = ?, data_version = ?, "
+                "last_observed_at = ? WHERE id = ? AND status IN ('open', 'acknowledged')",
+                (float(observed_value), period_id, data_version, utc_now(), alert_id),
+            )
+            row = connection.execute("SELECT * FROM alert_events WHERE id = ?", (alert_id,)).fetchone()
+        return self._public_alert(row) if row else None
+
+    def set_alert_delivery(self, alert_id: str, status: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE alert_events SET delivery_status = ? WHERE id = ?",
+                (status, alert_id),
+            )
+
+    def resolve_alert(self, alert_id: str) -> dict | None:
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE alert_events SET status = 'resolved', resolved_at = ?, last_observed_at = ? "
+                "WHERE id = ? AND status IN ('open', 'acknowledged')",
+                (now, now, alert_id),
+            )
+            row = connection.execute("SELECT * FROM alert_events WHERE id = ?", (alert_id,)).fetchone()
+        return self._public_alert(row) if row else None
+
+    def acknowledge_alert(self, user_id: str, alert_id: str) -> dict | None:
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE alert_events SET status = 'acknowledged', acknowledged_at = ? "
+                "WHERE user_id = ? AND id = ? AND status = 'open'",
+                (now, user_id, alert_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM alert_events WHERE user_id = ? AND id = ?",
+                (user_id, alert_id),
+            ).fetchone()
+        return self._public_alert(row) if row else None
+
+    def list_alerts(self, user_id: str, limit: int = 100) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT alert_events.*, zones.name AS zone_name FROM alert_events "
+                "JOIN zones ON zones.user_id = alert_events.user_id AND zones.id = alert_events.zone_id "
+                "WHERE alert_events.user_id = ? ORDER BY alert_events.last_observed_at DESC LIMIT ?",
+                (user_id, max(1, min(limit, 200))),
+            ).fetchall()
+        alerts = []
+        for row in rows:
+            payload = self._public_alert(row)
+            payload["zone_name"] = row["zone_name"]
+            alerts.append(payload)
+        return alerts
+
+    def create_monitoring_run(self, user_id: str | None = None) -> str:
+        run_id = str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO monitoring_runs (id, user_id, status, started_at) VALUES (?, ?, 'running', ?)",
+                (run_id, user_id, utc_now()),
+            )
+        return run_id
+
+    def finish_monitoring_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        zones_checked: int,
+        alerts_created: int,
+        alerts_resolved: int,
+        error: str | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE monitoring_runs SET status = ?, completed_at = ?, zones_checked = ?, "
+                "alerts_created = ?, alerts_resolved = ?, error = ? WHERE id = ?",
+                (
+                    status, utc_now(), zones_checked, alerts_created,
+                    alerts_resolved, error, run_id,
+                ),
+            )
+
+    def latest_monitoring_run(self, user_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitoring_runs WHERE user_id = ? OR user_id IS NULL "
+                "ORDER BY started_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def export_account(self, user_id: str) -> dict:
+        with self._connect() as connection:
+            observation_rows = connection.execute(
+                "SELECT zone_id, period_id, data_version, stats_json, observed_at "
+                "FROM zone_observations WHERE user_id = ? ORDER BY observed_at DESC",
+                (user_id,),
+            ).fetchall()
+        observations = [
+            {
+                "zone_id": row["zone_id"],
+                "period_id": row["period_id"],
+                "data_version": row["data_version"],
+                "stats": json.loads(row["stats_json"]),
+                "observed_at": row["observed_at"],
+            }
+            for row in observation_rows
+        ]
         return {
             "exported_at": utc_now(),
             "user": self.get_user(user_id),
             "preferences": self.get_preferences(user_id),
             "zones": self.list_zones(user_id),
             "analyses": self.list_analyses(user_id),
+            "observations": observations,
+            "alerts": self.list_alerts(user_id, limit=200),
+            "latest_monitoring_run": self.latest_monitoring_run(user_id),
         }
 
     def delete_account(self, user_id: str) -> None:

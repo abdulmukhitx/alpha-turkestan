@@ -1,6 +1,7 @@
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts'
 import { useI18n } from '../i18n.jsx'
 import SaveAnalysisAction from './SaveAnalysisAction.jsx'
+import EvidenceBadge from './EvidenceBadge.jsx'
 
 const INDEX_CODES = {
   ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI',
@@ -52,6 +53,8 @@ export default function ForecastPanel({ point, result, loading, error, targetYea
           <div className="result-location">
             <span>{point.lat.toFixed(4)}°N · {point.lng.toFixed(4)}°E · {code}</span>
           </div>
+
+          <EvidenceBadge evidence={result?.evidence} />
 
           {loading && <div className="forecast-loading" role="status">{t('forecast.calculating')}</div>}
           {error && <div className="zone-error">{error}</div>}

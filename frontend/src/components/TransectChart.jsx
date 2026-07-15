@@ -1,5 +1,6 @@
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts'
 import { useI18n } from '../i18n.jsx'
+import EvidenceBadge from './EvidenceBadge.jsx'
 
 const LAYER_LABELS = {
   ndvi: 'NDVI', ndwi: 'NDWI', ndre: 'NDRE', ndmi: 'NDMI', bsi: 'BSI', savi: 'SAVI', nbr: 'NBR',
@@ -54,6 +55,8 @@ export default function TransectChart({ data, loading, error }) {
             <span className="zone-block-title">{LAYER_LABELS[data.layer] || data.layer.toUpperCase()}</span>
             <span className="transect-length">{t('transect.length')}: {formatNumber(data.total_length_m)} {t('unit.meters')}</span>
           </div>
+
+          <EvidenceBadge evidence={data.evidence} />
 
           <div className="transect-chart-wrap">
             <ResponsiveContainer width="100%" height={180}>
