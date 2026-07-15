@@ -382,6 +382,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .timelapse-preload.error button { min-height: 34px; padding: 0 13px; border: 1px solid rgba(248,113,113,0.35); border-radius: 8px; color: #FCA5A5; background: rgba(127,29,29,0.18); cursor: pointer; font: 700 9px var(--font-body); }
 .timelapse-ready-note { width: min(100%,620px); display: flex; align-items: center; gap: 6px; color: #6EE7B7; font: 8px var(--font-mono); }
 .timelapse-ready-note span { width: 17px; height: 17px; display: grid; place-items: center; border-radius: 50%; color: #022C22; background: #34D399; font-size: 10px; }
+.timelapse-ready-note small { margin-left: 5px; color: #FCD34D; font: inherit; }
 .timelapse-player { min-height: 72px; display: grid; grid-template-columns: auto auto auto auto minmax(120px,1fr) auto; align-items: center; gap: 13px; padding: 11px 18px; border-top: 1px solid var(--border); background: #0b1727; }
 .timelapse-step-actions { display: flex; gap: 5px; }
 .timelapse-step-actions button { width: 34px; height: 34px; border: 1px solid var(--border); border-radius: 8px; color: var(--text2); background: var(--card-bg); cursor: pointer; font-size: 18px; }

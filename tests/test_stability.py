@@ -104,6 +104,7 @@ class StabilityContractTests(unittest.TestCase):
             "cached": True,
             "width": 640,
             "height": 480,
+            "coverage_percent": 98.75,
         }
         geometry = {
             "type": "Polygon",
@@ -119,6 +120,7 @@ class StabilityContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["content-type"], "image/png")
         self.assertEqual(response.headers["x-timelapse-cache"], "hit")
+        self.assertEqual(response.headers["x-aoi-coverage"], "98.75")
         render.assert_called_once()
 
     def test_historical_tiles_are_cacheable_and_versioned(self):

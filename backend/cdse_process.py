@@ -9,10 +9,12 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import httpx
+from PIL import Image, ImageDraw
 
 
 CDSE_TOKEN_URL = (
@@ -22,7 +24,7 @@ CDSE_TOKEN_URL = (
 CDSE_PROCESS_URL = "https://sh.dataspace.copernicus.eu/process/v1"
 MAX_TOKEN_RESPONSE_BYTES = 1_000_000
 MAX_IMAGE_RESPONSE_BYTES = 12_000_000
-EVALSCRIPT_VERSION = "geoai-tko-v4"
+EVALSCRIPT_VERSION = "geoai-tko-v5"
 SUPPORTED_LAYERS = {"rgb", "ndvi", "ndwi", "ndre", "ndmi", "bsi", "savi", "nbr"}
 
 
@@ -144,6 +146,52 @@ def _output_dimensions(bounds: list[float], max_dimension: int) -> tuple[int, in
     return max(256, round(max_dimension * width / height)), max_dimension
 
 
+def _aoi_coverage_percent(
+    content: bytes,
+    geometry: dict[str, Any],
+    bounds: list[float],
+    width: int,
+    height: int,
+) -> float:
+    """Measure Process API dataMask coverage inside the requested AOI."""
+    try:
+        with Image.open(BytesIO(content)) as source:
+            source.load()
+            if source.size != (width, height):
+                raise SceneRenderError("CDSE returned an unexpected scene image size")
+            alpha = source.convert("RGBA").getchannel("A")
+    except SceneRenderError:
+        raise
+    except Exception as exc:
+        raise SceneRenderError("CDSE returned an invalid scene image") from exc
+
+    west, south, east, north = bounds
+    expected = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(expected)
+
+    def pixel(position: list[float]) -> tuple[float, float]:
+        return (
+            (float(position[0]) - west) / (east - west) * (width - 1),
+            (north - float(position[1])) / (north - south) * (height - 1),
+        )
+
+    coordinates = geometry.get("coordinates") or []
+    polygons = [coordinates] if geometry.get("type") == "Polygon" else coordinates
+    for polygon in polygons:
+        if not polygon:
+            continue
+        draw.polygon([pixel(position) for position in polygon[0]], fill=255)
+        for hole in polygon[1:]:
+            draw.polygon([pixel(position) for position in hole], fill=0)
+
+    expected_count = expected.histogram()[255]
+    if expected_count <= 0:
+        raise SceneRenderError("The selected AOI cannot be rasterized")
+    valid_alpha = alpha.point(lambda value: 255 if value > 0 else 0)
+    valid_count = valid_alpha.histogram(mask=expected)[255]
+    return round(valid_count / expected_count * 100, 2)
+
+
 _INDEX_CONFIG = {
     "ndvi": (["B08", "B04"], "(s.B08-s.B04)/(s.B08+s.B04)", 0.02, 0.21, "rdylgn"),
     "ndwi": (["B03", "B08"], "(s.B03-s.B08)/(s.B03+s.B08)", -0.27, -0.10, "rdbu"),
@@ -162,13 +210,11 @@ _PALETTES = {
 
 
 def _evalscript(layer: str) -> str:
-    clear_mask = "s.dataMask===1 && ![0,1,3,8,9,10,11].includes(s.SCL)"
     if layer == "rgb":
         return f"""//VERSION=3
-function setup() {{ return {{input:[\"B02\",\"B03\",\"B04\",\"SCL\",\"dataMask\"],output:{{bands:4}}}}; }}
+function setup() {{ return {{input:[\"B02\",\"B03\",\"B04\",\"dataMask\"],output:{{bands:4}}}}; }}
 function evaluatePixel(s) {{
-  const clear = {clear_mask};
-  return [Math.min(1,2.5*s.B04),Math.min(1,2.5*s.B03),Math.min(1,2.5*s.B02),clear?1:0];
+  return [Math.min(1,2.5*s.B04),Math.min(1,2.5*s.B03),Math.min(1,2.5*s.B02),s.dataMask];
 }}"""
 
     bands, expression, minimum, maximum, palette_name = _INDEX_CONFIG[layer]
@@ -182,11 +228,21 @@ function ramp(value) {{
   const left=Math.floor(scaled), right=Math.min(palette.length-1,left+1), mix=scaled-left;
   return [0,1,2].map(i=>(palette[left][i]+(palette[right][i]-palette[left][i])*mix)/255);
 }}
+function qualityColour(s) {{
+  if (s.SCL===3) return [0.14,0.17,0.21,1];
+  if ([8,9,10].includes(s.SCL)) return [0.86,0.89,0.93,1];
+  if (s.SCL===11) return [0.78,0.92,1,1];
+  if ([0,1].includes(s.SCL)) return [0.38,0.38,0.38,1];
+  return null;
+}}
 function evaluatePixel(s) {{
+  if (s.dataMask!==1) return [0,0,0,0];
+  const quality = qualityColour(s);
+  if (quality) return quality;
   const denominatorSafe = Object.keys(s).every(key => Number.isFinite(s[key]));
   const value = denominatorSafe ? {expression} : 0;
   const rgb = ramp(Number.isFinite(value)?value:0);
-  return [rgb[0],rgb[1],rgb[2],({clear_mask})?1:0];
+  return [rgb[0],rgb[1],rgb[2],1];
 }}"""
 
 
@@ -294,12 +350,12 @@ class CdseSceneRenderer:
         if acquired_at.tzinfo is None:
             acquired_at = acquired_at.replace(tzinfo=timezone.utc)
         acquired_at = acquired_at.astimezone(timezone.utc)
-        # Sentinel Hub timestamps can represent the AOI granule rather than the
-        # STAC product start. A 30-minute window keeps the selected orbital pass
-        # deterministic while covering that along-track timestamp difference.
-        start = acquired_at - timedelta(minutes=30)
-        end = acquired_at + timedelta(minutes=30)
-        timestamp = acquired_at.isoformat().replace("+00:00", "Z")
+        # The catalogue exposes MGRS granules while the UI exposes one AOI frame
+        # per UTC day. A full-day interval lets Process API stitch every tile
+        # available for that daily acquisition before coverage is measured.
+        start = acquired_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1) - timedelta(microseconds=1)
+        timestamp = acquired_at.date().isoformat()
         cache_identity = {
             "version": EVALSCRIPT_VERSION,
             "geometry": geometry,
@@ -311,7 +367,11 @@ class CdseSceneRenderer:
         cache_path = self._cache_path(cache_identity)
         cached = self._read_cache(cache_path)
         if cached is not None:
-            return {"content": cached, "cached": True, "width": width, "height": height}
+            coverage_percent = _aoi_coverage_percent(cached, geometry, bounds, width, height)
+            return {
+                "content": cached, "cached": True, "width": width, "height": height,
+                "coverage_percent": coverage_percent,
+            }
 
         payload = {
             "input": {
@@ -345,5 +405,9 @@ class CdseSceneRenderer:
         except _AuthenticationRejected:
             token = self._access_token(force_refresh=True)
             content = self._process_fetcher(payload, token, self.timeout_seconds)
+        coverage_percent = _aoi_coverage_percent(content, geometry, bounds, width, height)
         self._write_cache(cache_path, content)
-        return {"content": content, "cached": False, "width": width, "height": height}
+        return {
+            "content": content, "cached": False, "width": width, "height": height,
+            "coverage_percent": coverage_percent,
+        }

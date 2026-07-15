@@ -1226,6 +1226,7 @@ async def timelapse_scene_frame(req: TimelapseSceneFrameReq):
             "ETag": f'"{etag}"',
             "X-Timelapse-Cache": "hit" if rendered["cached"] else "miss",
             "X-CDSE-Scene": req.scene_id[:160],
+            "X-AOI-Coverage": f'{rendered["coverage_percent"]:.2f}',
         },
     )
 
@@ -3088,7 +3089,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-Requested-With"],
     expose_headers=[
         "X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After",
-        "X-Timelapse-Cache", "X-CDSE-Scene",
+        "X-Timelapse-Cache", "X-CDSE-Scene", "X-AOI-Coverage",
     ],
 )
 

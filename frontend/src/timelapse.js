@@ -63,15 +63,20 @@ export function uniqueSceneAcquisitions(scenes = [], limit = 12) {
   const acquisitions = new Map()
   scenes.forEach((scene) => {
     if (!scene?.scene_id || !scene?.acquired_at) return
-    const key = `${String(scene.acquired_at).slice(0, 16)}|${scene.platform || ''}`
+    const key = String(scene.acquired_at).slice(0, 10)
     const current = acquisitions.get(key)
     const cloud = Number.isFinite(Number(scene.cloud_cover)) ? Number(scene.cloud_cover) : Infinity
     const currentCloud = Number.isFinite(Number(current?.cloud_cover)) ? Number(current.cloud_cover) : Infinity
     if (!current || cloud < currentCloud) acquisitions.set(key, scene)
   })
-  return [...acquisitions.values()]
+  const chronological = [...acquisitions.values()]
     .sort((left, right) => String(left.acquired_at).localeCompare(String(right.acquired_at)))
-    .slice(0, Math.max(1, limit))
+  const safeLimit = Math.max(1, limit)
+  if (chronological.length <= safeLimit) return chronological
+  if (safeLimit === 1) return [chronological[0]]
+  return Array.from({ length: safeLimit }, (_, index) => (
+    chronological[Math.round(index * (chronological.length - 1) / (safeLimit - 1))]
+  ))
 }
 
 export function padBounds(bounds, ratio = 0.08) {

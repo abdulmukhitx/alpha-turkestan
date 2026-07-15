@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import threading
 import time
 from collections.abc import Callable
+from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -109,6 +111,29 @@ def _normalise_scene(feature: Any) -> dict[str, Any] | None:
     }
 
 
+def _date_buckets(start_date: str, end_date: str, *, max_buckets: int = 6) -> list[tuple[date, date]]:
+    """Split long searches so an ascending STAC page cannot hide later dates."""
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    total_days = (end - start).days + 1
+    bucket_count = min(max_buckets, max(1, math.ceil(total_days / 31)))
+    buckets = []
+    for index in range(bucket_count):
+        first_offset = math.floor(index * total_days / bucket_count)
+        final_offset = math.floor((index + 1) * total_days / bucket_count) - 1
+        buckets.append((start + timedelta(days=first_offset), start + timedelta(days=final_offset)))
+    return buckets
+
+
+def _evenly_sample(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if len(items) <= limit:
+        return items
+    if limit <= 1:
+        return [items[0]]
+    indexes = [round(index * (len(items) - 1) / (limit - 1)) for index in range(limit)]
+    return [items[index] for index in indexes]
+
+
 class CdseSceneCatalog:
     """Small cached adapter around the official public STAC search endpoint."""
 
@@ -167,36 +192,60 @@ class CdseSceneCatalog:
                 result["cached"] = True
                 return result
 
-        payload: dict[str, Any] = {
-            "collections": [CDSE_COLLECTION],
-            "datetime": f"{start_date}T00:00:00Z/{end_date}T23:59:59Z",
-            "query": {"eo:cloud_cover": {"lte": max_cloud_cover}},
-            "sortby": [{"field": "properties.datetime", "direction": "asc"}],
-            "limit": limit,
-        }
-        if geometry:
-            payload["intersects"] = copy.deepcopy(geometry)
-        else:
-            payload["bbox"] = bbox
-        data = self._fetcher(f"{CDSE_STAC_URL}/search", payload, self.timeout_seconds)
-        features = data.get("features")
-        if not isinstance(features, list):
-            raise SceneSearchError("CDSE catalogue returned an invalid feature collection")
+        # A single ascending STAC page over a multi-month range is dominated by
+        # its first dates (and often several MGRS tiles for the same pass). Query
+        # a small number of disjoint time buckets so candidates represent the
+        # complete requested interval without unbounded pagination.
+        features: list[Any] = []
+        matched_values: list[int] = []
+        upstream_limit = min(100, max(30, limit))
+        for bucket_start, bucket_end in _date_buckets(start_date, end_date):
+            payload: dict[str, Any] = {
+                "collections": [CDSE_COLLECTION],
+                "datetime": f"{bucket_start.isoformat()}T00:00:00Z/{bucket_end.isoformat()}T23:59:59Z",
+                "query": {"eo:cloud_cover": {"lte": max_cloud_cover}},
+                "sortby": [{"field": "properties.datetime", "direction": "asc"}],
+                "limit": upstream_limit,
+            }
+            if geometry:
+                payload["intersects"] = copy.deepcopy(geometry)
+            else:
+                payload["bbox"] = bbox
+            data = self._fetcher(f"{CDSE_STAC_URL}/search", payload, self.timeout_seconds)
+            bucket_features = data.get("features")
+            if not isinstance(bucket_features, list):
+                raise SceneSearchError("CDSE catalogue returned an invalid feature collection")
+            features.extend(bucket_features[:upstream_limit])
+            context = data.get("context")
+            if isinstance(context, dict):
+                matched_value = context.get("matched")
+                if isinstance(matched_value, int) and matched_value >= 0:
+                    matched_values.append(matched_value)
 
-        scenes = []
+        # Sentinel-2 STAC items are granules. The Process API frame is a daily
+        # AOI mosaic, so expose one representative candidate per UTC day rather
+        # than several adjacent MGRS tiles for the same acquisition.
+        acquisitions: dict[str, dict[str, Any]] = {}
         seen_ids: set[str] = set()
-        for feature in features[:limit]:
+        for feature in features:
             scene = _normalise_scene(feature)
             if scene and scene["scene_id"] not in seen_ids:
-                scenes.append(scene)
                 seen_ids.add(scene["scene_id"])
+                acquisition_day = scene["acquired_at"][:10]
+                current = acquisitions.get(acquisition_day)
+                cloud = scene["cloud_cover"] if scene["cloud_cover"] is not None else float("inf")
+                current_cloud = (
+                    current["cloud_cover"]
+                    if current and current["cloud_cover"] is not None
+                    else float("inf")
+                )
+                if current is None or cloud < current_cloud:
+                    scene["acquisition_date"] = acquisition_day
+                    acquisitions[acquisition_day] = scene
 
-        matched = None
-        context = data.get("context")
-        if isinstance(context, dict):
-            matched_value = context.get("matched")
-            if isinstance(matched_value, int) and matched_value >= 0:
-                matched = matched_value
+        chronological = sorted(acquisitions.values(), key=lambda scene: scene["acquired_at"])
+        scenes = _evenly_sample(chronological, limit)
+        matched = sum(matched_values) if matched_values else None
         result = {
             "scenes": scenes,
             "returned": len(scenes),

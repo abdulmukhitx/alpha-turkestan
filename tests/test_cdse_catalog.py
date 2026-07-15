@@ -39,7 +39,7 @@ class CdseSceneCatalogTests(unittest.TestCase):
         )
 
         self.assertEqual(result["returned"], 1)
-        self.assertEqual(result["matched"], 17)
+        self.assertEqual(result["matched"], 51)
         self.assertFalse(result["cached"])
         self.assertFalse(result["scenes"][0]["renderable"])
         self.assertEqual(result["scenes"][0]["cloud_cover"], 4.26)
@@ -48,6 +48,9 @@ class CdseSceneCatalogTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["query"], {"eo:cloud_cover": {"lte": 20}})
         self.assertEqual(calls[0][1]["bbox"], [68.0, 42.0, 69.0, 43.0])
         self.assertEqual(calls[0][2], 7)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0][1]["datetime"].startswith("2025-06-01"))
+        self.assertIn("2025-08-31T23:59:59Z", calls[-1][1]["datetime"])
 
     def test_exact_geometry_search_uses_intersects_instead_of_bbox(self):
         calls = []
@@ -61,8 +64,9 @@ class CdseSceneCatalogTests(unittest.TestCase):
             start_date="2025-01-01", end_date="2025-12-31",
             max_cloud_cover=30, limit=20,
         )
-        self.assertEqual(calls[0]["intersects"], geometry)
-        self.assertNotIn("bbox", calls[0])
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(call["intersects"] == geometry for call in calls))
+        self.assertTrue(all("bbox" not in call for call in calls))
 
     def test_identical_search_uses_cache(self):
         calls = 0
@@ -79,7 +83,31 @@ class CdseSceneCatalogTests(unittest.TestCase):
         )
         self.assertFalse(catalog.search(**query)["cached"])
         self.assertTrue(catalog.search(**query)["cached"])
-        self.assertEqual(calls, 1)
+        self.assertEqual(calls, 6)
+
+    def test_long_search_returns_daily_candidates_across_the_full_range(self):
+        def fetcher(_url, payload, _timeout):
+            day = payload["datetime"][:10]
+            return {
+                "features": [{
+                    "id": f"scene-{day}",
+                    "properties": {
+                        "datetime": f"{day}T06:00:00Z",
+                        "eo:cloud_cover": 5,
+                        "platform": "sentinel-2b",
+                    },
+                }],
+            }
+
+        catalog = CdseSceneCatalog(fetcher=fetcher, cache_seconds=0)
+        result = catalog.search(
+            bbox=[68.0, 42.0, 69.0, 43.0], start_date="2025-01-01",
+            end_date="2025-12-31", max_cloud_cover=30, limit=3,
+        )
+        dates = [scene["acquisition_date"] for scene in result["scenes"]]
+        self.assertEqual(len(dates), 3)
+        self.assertEqual(dates[0], "2025-01-01")
+        self.assertGreaterEqual(dates[-1], "2025-11-01")
 
     def test_invalid_feature_collection_is_rejected(self):
         catalog = CdseSceneCatalog(fetcher=lambda *_args: {"features": "invalid"})

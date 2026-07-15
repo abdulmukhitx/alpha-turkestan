@@ -45,3 +45,15 @@ test('deduplicates overlapping catalogue tiles into chronological acquisitions',
   ]
   assert.deepEqual(uniqueSceneAcquisitions(scenes).map((scene) => scene.scene_id), ['tile-b', 'tile-c'])
 })
+
+test('samples scene candidates across the complete date range', () => {
+  const scenes = Array.from({ length: 15 }, (_, index) => ({
+    scene_id: `scene-${index + 1}`,
+    acquired_at: new Date(Date.UTC(2025, index, 1, 6)).toISOString(),
+    cloud_cover: 5,
+  }))
+  assert.deepEqual(
+    uniqueSceneAcquisitions(scenes, 4).map((scene) => scene.scene_id),
+    ['scene-1', 'scene-6', 'scene-10', 'scene-15'],
+  )
+})

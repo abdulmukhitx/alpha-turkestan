@@ -7,10 +7,10 @@ import {
 } from '../timelapse.js'
 
 const SPEED_OPTIONS = [0.5, 1, 2, 4]
+const MIN_SCENE_COVERAGE = 90
 
 export default function TimelapseControl({
   open, periods = [], period, onPeriodChange, activeLayer = 'satellite', center = [43.3, 68.25],
-  bounds = [40.31, 65.36, 46.46, 71.36],
   zoneGeometry = null,
 }) {
   const { t, periodLabel, formatDate } = useI18n()
@@ -31,6 +31,7 @@ export default function TimelapseControl({
   const [scenePlaybackIds, setScenePlaybackIds] = useState([])
   const [sceneLoading, setSceneLoading] = useState(false)
   const [sceneError, setSceneError] = useState('')
+  const [skippedSceneCount, setSkippedSceneCount] = useState(0)
   const [preloadRequested, setPreloadRequested] = useState(false)
   const [preloadRetry, setPreloadRetry] = useState(0)
   const [preload, setPreload] = useState({ status: 'idle', loaded: 0, total: 0, frames: {}, scope: 'center', error: '', key: '' })
@@ -73,7 +74,7 @@ export default function TimelapseControl({
 
   function frameLabel(frame) {
     if (frame?.source === 'cdse') {
-      return formatDate(new Date(frame.acquired_at), { dateStyle: 'medium', timeStyle: 'short' })
+      return formatDate(new Date(frame.acquired_at), { dateStyle: 'medium' })
     }
     return periodLabel(frame)
   }
@@ -130,10 +131,15 @@ export default function TimelapseControl({
 
   async function findScenes(event) {
     event.preventDefault()
+    if (!selectedAoiBounds || !zoneGeometry) {
+      setSceneError(t('timelapse.drawAoi'))
+      return
+    }
     setSceneLoading(true)
     setSceneError('')
+    setSkippedSceneCount(0)
     try {
-      const [south, west, north, east] = (selectedAoiBounds || bounds).map(Number)
+      const [south, west, north, east] = selectedAoiBounds.map(Number)
       const result = await searchTimelapseScenes({
         bbox: [west, south, east, north],
         geometry: zoneGeometry,
@@ -171,6 +177,7 @@ export default function TimelapseControl({
       return
     }
     setSceneError('')
+    setSkippedSceneCount(0)
     setPlaying(false)
     setScenePlaybackIds(selectedScenes.map((scene) => scene.scene_id))
     setPlayheadId(selectedScenes[0].scene_id)
@@ -211,13 +218,32 @@ export default function TimelapseControl({
               acquiredAt: frame.acquired_at,
               layer: displayLayer,
             }, { signal: controller.signal })
+            if (response.coverage != null && response.coverage < MIN_SCENE_COVERAGE) {
+              onAssetLoaded()
+              continue
+            }
             const prepared = await prepareSceneFrameBlob(response.blob, { onAssetLoaded })
             prepared.cached = response.cached
+            prepared.coverage = response.coverage
             preparedUrls.push(prepared.url)
             preparedFrames[frame.period_id] = prepared
           }
         }
         await Promise.all(Array.from({ length: Math.min(2, frames.length) }, worker))
+        const validFrameIds = frames
+          .filter((frame) => preparedFrames[frame.period_id])
+          .map((frame) => frame.period_id)
+        const skipped = frames.length - validFrameIds.length
+        if (skipped > 0) {
+          if (validFrameIds.length < 2) {
+            throw new Error(t('timelapse.notEnoughCoverage', { count: validFrameIds.length }))
+          }
+          setSkippedSceneCount((count) => count + skipped)
+          setSelectedSceneIds((ids) => ids.filter((id) => validFrameIds.includes(id)))
+          setPlayheadId(validFrameIds[0])
+          setScenePlaybackIds(validFrameIds)
+          return
+        }
       } else {
         for (const frame of frames) {
           const template = tileUrl(displayLayer, frame.period_id, frame.data_version || '')
@@ -418,7 +444,10 @@ export default function TimelapseControl({
                   <strong>{frameLabel(current)}</strong>
                 </div>
                 {preloadReady && (
-                  <div className="timelapse-ready-note"><span aria-hidden="true">✓</span>{t('timelapse.ready', { count: frames.length })}</div>
+                  <div className="timelapse-ready-note">
+                    <span aria-hidden="true">✓</span>{t('timelapse.ready', { count: frames.length })}
+                    {skippedSceneCount > 0 && <small>{t('timelapse.skippedFrames', { count: skippedSceneCount })}</small>}
+                  </div>
                 )}
                 <div className="timelapse-quality-note">
                     <span aria-hidden="true">!</span><p><strong>{t('timelapse.qualityTitle')}</strong>{usingSceneFrames ? t('timelapse.cdseQualityNote') : t('timelapse.qualityNote')}</p>

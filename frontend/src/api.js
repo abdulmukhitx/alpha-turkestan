@@ -248,9 +248,11 @@ export async function fetchTimelapseSceneFrame({ geometry, sceneId, acquiredAt, 
     const detail = await r.json().catch(() => null)
     throw new Error(detail?.detail || `Scene frame failed: ${r.status}`)
   }
+  const coverageValue = Number.parseFloat(r.headers.get('X-AOI-Coverage') || '')
   return {
     blob: await r.blob(),
     cached: r.headers.get('X-Timelapse-Cache') === 'hit',
+    coverage: Number.isFinite(coverageValue) ? coverageValue : null,
   }
 }
 
