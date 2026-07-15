@@ -4,7 +4,9 @@ GeoAI TKO is a FastAPI and React application for Sentinel-2 monitoring of the
 Turkistan Region. It provides spectral-index maps, point and polygon analysis,
 change comparison, transects, an experimental linear forecast, land-cover
 classification, accounts, saved zones and reports in Russian, Kazakh and
-English.
+English. Saved AOIs also act as operational work sites: users can turn a field
+or monitoring alert into an assigned investigation and carry it through to a
+documented outcome.
 
 ## Local development
 
@@ -41,6 +43,26 @@ analyses from `/history`, and share durable map links. A monitoring run records
 one observation for each zone and source-data version, evaluates the account's
 threshold rules, deduplicates active alerts, resolves recovered conditions, and
 uses the configured account email transport for delivery.
+
+The `/work` page is the action layer above monitoring. A verified user can
+create a field task from any saved AOI or directly from an alert, set its type,
+priority, responsible person and due date, and then record:
+
+- the investigation context and original monitoring trigger;
+- field observations and chronological logbook entries;
+- findings, the action taken and the verified outcome;
+- progress through `open`, `in_progress`, `waiting` and `closed` states.
+
+Closing a task requires an outcome. The task snapshots its AOI name and geometry
+when it is created, so account export retains the investigation boundary even
+if the original saved zone is later removed. A print stylesheet turns the task
+workbench into a clean browser/PDF field report.
+
+Field-work API contracts:
+
+- `GET/POST /api/account/cases` lists or creates account-owned field tasks.
+- `GET/PATCH/DELETE /api/account/cases/{id}` reads or changes one task.
+- `POST /api/account/cases/{id}/updates` appends an auditable logbook entry.
 
 Set `MONITORING_SCHEDULER_ENABLED=true` on exactly one backend process to poll
 the newest configured raster every `MONITORING_INTERVAL_SECONDS`. The scheduler
@@ -102,12 +124,14 @@ account backup and email configuration.
 
 For the Vercel frontend project, set **Root Directory** to `frontend`. The
 included `frontend/vercel.json` rewrites direct SPA routes such as `/map`,
-`/dashboard` and `/history` to `index.html`, allowing React Router to handle
+`/dashboard`, `/work` and `/history` to `index.html`, allowing React Router to handle
 refreshes and shared links. Commit the file and redeploy after changing it.
 
 ## Project direction
 
-The planned release sequence is stability, Field Monitor pages, scheduled
-monitoring and notifications, and then data-quality/provenance features. The
-eight-year ML prediction release is intentionally deferred until the full
-temporal dataset is available and validated.
+The platform now covers the first operational loop: observe, open a field task,
+investigate, act, verify and report. The next product increments are geotagged
+photo attachments/offline field capture, team membership and real assignees,
+per-AOI monitoring plans, and automatic follow-up checks against new scenes.
+The eight-year ML prediction release remains intentionally deferred until the
+full temporal dataset is available and validated.

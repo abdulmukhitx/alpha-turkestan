@@ -3,6 +3,7 @@ import { useI18n } from '../i18n.jsx'
 
 const NAV_ITEMS = [
   { to: '/dashboard', label: 'pages.dashboard' },
+  { to: '/work', label: 'pages.work' },
   { to: '/map', label: 'pages.map' },
   { to: '/history', label: 'pages.history' },
 ]

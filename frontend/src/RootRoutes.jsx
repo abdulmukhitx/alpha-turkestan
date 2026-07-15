@@ -4,6 +4,7 @@ import { Navigate, Route, Routes, useLocation } from 'react-router'
 const MapWorkspace = lazy(() => import('./App.jsx'))
 const DashboardPage = lazy(() => import('./pages/DashboardPage.jsx'))
 const HistoryPage = lazy(() => import('./pages/HistoryPage.jsx'))
+const WorkPage = lazy(() => import('./pages/WorkPage.jsx'))
 
 function IndexRedirect() {
   const location = useLocation()
@@ -26,6 +27,7 @@ export default function RootRoutes() {
         <Route index element={<IndexRedirect />} />
         <Route path="/map" element={<MapWorkspace />} />
         <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/work" element={<WorkPage />} />
         <Route path="/history" element={<HistoryPage />} />
         <Route path="*" element={<Navigate replace to="/dashboard" />} />
       </Routes>

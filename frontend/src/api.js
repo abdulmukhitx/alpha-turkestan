@@ -181,6 +181,26 @@ export const deleteSavedAnalysis = (analysisId) => accountRequest(`/api/account/
   method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
 })
 
+export const fetchFieldCases = () => accountRequest('/api/account/cases')
+
+export const fetchFieldCase = (caseId) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}`)
+
+export const createFieldCase = (details) => accountRequest('/api/account/cases', {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(details),
+})
+
+export const updateFieldCase = (caseId, changes) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}`, {
+  method: 'PATCH', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(changes),
+})
+
+export const addFieldCaseUpdate = (caseId, update) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}/updates`, {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(update),
+})
+
+export const deleteFieldCase = (caseId) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}`, {
+  method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
+})
+
 export const fetchMonitoringStatus = () => accountRequest('/api/account/monitoring/status')
 
 export const runAccountMonitoring = () => accountRequest('/api/account/monitoring/run', {

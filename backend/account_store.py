@@ -276,6 +276,54 @@ class AccountStore:
                     );
                     CREATE INDEX IF NOT EXISTS monitoring_runs_recent_idx
                         ON monitoring_runs(user_id, started_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS field_cases (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        zone_id TEXT NOT NULL,
+                        zone_name TEXT NOT NULL,
+                        zone_geometry_json TEXT NOT NULL,
+                        source_alert_id TEXT,
+                        title TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        priority TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        due_date TEXT,
+                        assignee TEXT NOT NULL DEFAULT '',
+                        description TEXT NOT NULL DEFAULT '',
+                        finding TEXT NOT NULL DEFAULT '',
+                        action TEXT NOT NULL DEFAULT '',
+                        resolution TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        closed_at TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS field_cases_user_recent_idx
+                        ON field_cases(user_id, updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS field_cases_user_status_idx
+                        ON field_cases(user_id, status, due_date);
+                    CREATE INDEX IF NOT EXISTS field_cases_zone_idx
+                        ON field_cases(user_id, zone_id, updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS field_cases_alert_idx
+                        ON field_cases(user_id, source_alert_id);
+                    CREATE UNIQUE INDEX IF NOT EXISTS field_cases_alert_unique_idx
+                        ON field_cases(user_id, source_alert_id)
+                        WHERE source_alert_id IS NOT NULL;
+
+                    CREATE TABLE IF NOT EXISTS field_case_updates (
+                        id TEXT PRIMARY KEY,
+                        case_id TEXT NOT NULL REFERENCES field_cases(id) ON DELETE CASCADE,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        latitude REAL,
+                        longitude REAL,
+                        observed_at TEXT,
+                        evidence_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS field_case_updates_case_idx
+                        ON field_case_updates(case_id, created_at DESC);
                     """
                 )
                 user_columns = {
@@ -357,6 +405,46 @@ class AccountStore:
             "kind": row["kind"],
             "title": row["title"],
             "payload": json.loads(row["payload_json"]),
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _public_case(row: sqlite3.Row) -> dict:
+        result = {
+            "id": row["id"],
+            "zone_id": row["zone_id"],
+            "zone_name": row["zone_name"],
+            "zone_geometry": json.loads(row["zone_geometry_json"]),
+            "source_alert_id": row["source_alert_id"],
+            "title": row["title"],
+            "kind": row["kind"],
+            "priority": row["priority"],
+            "status": row["status"],
+            "due_date": row["due_date"],
+            "assignee": row["assignee"],
+            "description": row["description"],
+            "finding": row["finding"],
+            "action": row["action"],
+            "resolution": row["resolution"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "closed_at": row["closed_at"],
+        }
+        if "update_count" in row.keys():
+            result["update_count"] = row["update_count"]
+        return result
+
+    @staticmethod
+    def _public_case_update(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "case_id": row["case_id"],
+            "kind": row["kind"],
+            "body": row["body"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "observed_at": row["observed_at"],
+            "evidence": json.loads(row["evidence_json"]),
             "created_at": row["created_at"],
         }
 
@@ -903,6 +991,198 @@ class AccountStore:
             )
         return result.rowcount > 0
 
+    def list_cases(self, user_id: str, limit: int = 200) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT field_cases.*, "
+                "(SELECT COUNT(*) FROM field_case_updates "
+                " WHERE field_case_updates.case_id = field_cases.id) AS update_count "
+                "FROM field_cases WHERE user_id = ? "
+                "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 "
+                "WHEN 'waiting' THEN 2 ELSE 3 END, "
+                "CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date, updated_at DESC LIMIT ?",
+                (user_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return [self._public_case(row) for row in rows]
+
+    def get_case(self, user_id: str, case_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT field_cases.*, "
+                "(SELECT COUNT(*) FROM field_case_updates "
+                " WHERE field_case_updates.case_id = field_cases.id) AS update_count "
+                "FROM field_cases WHERE user_id = ? AND id = ?",
+                (user_id, case_id),
+            ).fetchone()
+            if not row:
+                return None
+            updates = connection.execute(
+                "SELECT * FROM field_case_updates WHERE user_id = ? AND case_id = ? "
+                "ORDER BY created_at DESC, rowid DESC",
+                (user_id, case_id),
+            ).fetchall()
+            source_alert = None
+            if row["source_alert_id"]:
+                alert_row = connection.execute(
+                    "SELECT * FROM alert_events WHERE user_id = ? AND id = ?",
+                    (user_id, row["source_alert_id"]),
+                ).fetchone()
+                if alert_row:
+                    source_alert = self._public_alert(alert_row)
+        result = self._public_case(row)
+        result["updates"] = [self._public_case_update(update) for update in updates]
+        result["source_alert"] = source_alert
+        return result
+
+    def create_case(self, user_id: str, case: dict) -> dict | None:
+        """Create an actionable case and snapshot its AOI for durable evidence."""
+        case_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as connection:
+            zone = connection.execute(
+                "SELECT * FROM zones WHERE user_id = ? AND id = ?",
+                (user_id, case["zone_id"]),
+            ).fetchone()
+            if not zone:
+                return None
+            source_alert_id = case.get("source_alert_id")
+            if source_alert_id:
+                alert = connection.execute(
+                    "SELECT id, zone_id FROM alert_events WHERE user_id = ? AND id = ?",
+                    (user_id, source_alert_id),
+                ).fetchone()
+                if not alert or alert["zone_id"] != zone["id"]:
+                    return None
+                existing = connection.execute(
+                    "SELECT id FROM field_cases WHERE user_id = ? AND source_alert_id = ?",
+                    (user_id, source_alert_id),
+                ).fetchone()
+                if existing:
+                    existing_case_id = existing["id"]
+                    # Finish the read transaction before opening the detailed view.
+                    connection.commit()
+                    return self.get_case(user_id, existing_case_id)
+            connection.execute(
+                "INSERT INTO field_cases "
+                "(id, user_id, zone_id, zone_name, zone_geometry_json, source_alert_id, "
+                "title, kind, priority, status, due_date, assignee, description, finding, "
+                "action, resolution, created_at, updated_at, closed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, '', '', '', ?, ?, NULL)",
+                (
+                    case_id,
+                    user_id,
+                    zone["id"],
+                    zone["name"],
+                    zone["geometry_json"],
+                    source_alert_id,
+                    case["title"].strip(),
+                    case["kind"],
+                    case["priority"],
+                    case.get("due_date"),
+                    case.get("assignee", "").strip(),
+                    case.get("description", "").strip(),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO field_case_updates "
+                "(id, case_id, user_id, kind, body, evidence_json, created_at) "
+                "VALUES (?, ?, ?, 'created', ?, '{}', ?)",
+                (str(uuid.uuid4()), case_id, user_id, case["title"].strip(), now),
+            )
+        return self.get_case(user_id, case_id)
+
+    def update_case(self, user_id: str, case_id: str, changes: dict) -> dict | None:
+        allowed_columns = {
+            "title", "kind", "priority", "status", "due_date", "assignee",
+            "description", "finding", "action", "resolution",
+        }
+        clean_changes = {key: value for key, value in changes.items() if key in allowed_columns}
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM field_cases WHERE user_id = ? AND id = ?",
+                (user_id, case_id),
+            ).fetchone()
+            if not current:
+                return None
+            if not clean_changes:
+                return self._public_case(current)
+
+            now = utc_now()
+            assignments = []
+            parameters = []
+            for key, value in clean_changes.items():
+                assignments.append(f"{key} = ?")
+                parameters.append(value.strip() if isinstance(value, str) and key != "due_date" else value)
+            next_status = clean_changes.get("status", current["status"])
+            closed_at = (current["closed_at"] or now) if next_status == "closed" else None
+            assignments.extend(["updated_at = ?", "closed_at = ?"])
+            parameters.extend([now, closed_at, user_id, case_id])
+            connection.execute(
+                f"UPDATE field_cases SET {', '.join(assignments)} WHERE user_id = ? AND id = ?",
+                parameters,
+            )
+            if next_status != current["status"]:
+                connection.execute(
+                    "INSERT INTO field_case_updates "
+                    "(id, case_id, user_id, kind, body, evidence_json, created_at) "
+                    "VALUES (?, ?, ?, 'status', ?, '{}', ?)",
+                    (
+                        str(uuid.uuid4()), case_id, user_id,
+                        f"{current['status']} -> {next_status}", now,
+                    ),
+                )
+        return self.get_case(user_id, case_id)
+
+    def add_case_update(self, user_id: str, case_id: str, update: dict) -> dict | None:
+        update_id = str(uuid.uuid4())
+        now = utc_now()
+        evidence_json = json.dumps(
+            update.get("evidence") or {}, ensure_ascii=False, separators=(",", ":")
+        )
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM field_cases WHERE user_id = ? AND id = ?",
+                (user_id, case_id),
+            ).fetchone()
+            if not exists:
+                return None
+            connection.execute(
+                "INSERT INTO field_case_updates "
+                "(id, case_id, user_id, kind, body, latitude, longitude, observed_at, "
+                "evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    update_id,
+                    case_id,
+                    user_id,
+                    update["kind"],
+                    update["body"].strip(),
+                    update.get("latitude"),
+                    update.get("longitude"),
+                    update.get("observed_at"),
+                    evidence_json,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE field_cases SET updated_at = ? WHERE user_id = ? AND id = ?",
+                (now, user_id, case_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM field_case_updates WHERE user_id = ? AND id = ?",
+                (user_id, update_id),
+            ).fetchone()
+        return self._public_case_update(row)
+
+    def delete_case(self, user_id: str, case_id: str) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                "DELETE FROM field_cases WHERE user_id = ? AND id = ?",
+                (user_id, case_id),
+            )
+        return result.rowcount > 0
+
     def monitoring_targets(self, user_id: str | None = None) -> list[dict]:
         """Return verified users, preferences and zones eligible for monitoring."""
         with self._connect() as connection:
@@ -1156,6 +1436,10 @@ class AccountStore:
             }
             for row in observation_rows
         ]
+        cases = [
+            self.get_case(user_id, item["id"])
+            for item in self.list_cases(user_id, limit=500)
+        ]
         return {
             "exported_at": utc_now(),
             "user": self.get_user(user_id),
@@ -1164,6 +1448,7 @@ class AccountStore:
             "analyses": self.list_analyses(user_id),
             "observations": observations,
             "alerts": self.list_alerts(user_id, limit=200),
+            "field_cases": [item for item in cases if item is not None],
             "latest_monitoring_run": self.latest_monitoring_run(user_id),
         }
 

@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import ProductHeader from '../components/ProductHeader.jsx'
 import {
   acknowledgeAlertEvent, fetchAlertEvents,
-  fetchAccountZones, fetchCurrentAccount, fetchPeriods, fetchSavedAnalyses,
+  fetchAccountZones, fetchCurrentAccount, fetchFieldCases, fetchPeriods,
   fetchMonitoringStatus, fetchZoneStats, fetchZoneTimeSeries, importAccountZones,
   runAccountMonitoring,
 } from '../api.js'
@@ -42,13 +42,19 @@ function ndviTone(value) {
   return 'watch'
 }
 
+function caseKindForAlert(index) {
+  if (index === 'ndwi' || index === 'ndmi') return 'irrigation'
+  if (index === 'nbr' || index === 'bsi') return 'land_change'
+  return 'vegetation'
+}
+
 export default function DashboardPage() {
   const { t, formatDate } = useI18n()
   const navigate = useNavigate()
   const fileInputRef = useRef(null)
   const [account, setAccount] = useState(null)
   const [zones, setZones] = useState([])
-  const [analyses, setAnalyses] = useState([])
+  const [cases, setCases] = useState([])
   const [periods, setPeriods] = useState([])
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(true)
@@ -71,16 +77,16 @@ export default function DashboardPage() {
       setAccount(session)
       setPeriods(periodItems || [])
       if (session?.user?.email_verified) {
-        const [zoneResult, historyResult, statusResult, alertResult] = await Promise.all([
-          fetchAccountZones(), fetchSavedAnalyses(), fetchMonitoringStatus(), fetchAlertEvents(),
+        const [zoneResult, caseResult, statusResult, alertResult] = await Promise.all([
+          fetchAccountZones(), fetchFieldCases(), fetchMonitoringStatus(), fetchAlertEvents(),
         ])
         setZones(zoneResult.zones || [])
-        setAnalyses(historyResult.analyses || [])
+        setCases(caseResult.cases || [])
         setMonitoringStatus(statusResult)
         setAlerts(alertResult.alerts || [])
       } else {
         setZones(readSavedZones())
-        setAnalyses([])
+        setCases([])
       }
     } catch (requestError) {
       setError(requestError.message || t('dashboard.loadError'))
@@ -242,7 +248,7 @@ export default function DashboardPage() {
           <article><span>{t('dashboard.savedZones')}</span><strong>{zones.length}</strong><small>{cloudMode ? t('common.cloud') : t('dashboard.local')}</small></article>
           <article><span>{t('dashboard.checked')}</span><strong>{monitoredCount}</strong><small>{t('dashboard.thisSession')}</small></article>
           <article><span>{t('dashboard.alertRules')}</span><strong>{monitoringStatus?.active_alerts ?? 0}</strong><small>{t('dashboard.activeOfRules', { count: alertCount })}</small></article>
-          <article><span>{t('dashboard.analyses')}</span><strong>{analyses.length}</strong><small><Link to="/history">{t('dashboard.openHistory')}</Link></small></article>
+          <article><span>{t('dashboard.workCases')}</span><strong>{cases.filter((item) => item.status !== 'closed').length}</strong><small><Link to="/work">{t('dashboard.openWork')}</Link></small></article>
         </section>
 
         <section className="dashboard-toolbar">
@@ -279,8 +285,11 @@ export default function DashboardPage() {
                     <p>{alert.index.toUpperCase()} {alert.operator === 'below' ? '<' : '>'} {Number(alert.threshold).toFixed(2)} · {t('dashboard.observed')} {Number(alert.observed_value).toFixed(3)}</p>
                     <small>{displayedDate(alert.last_observed_at)} · {t(`dashboard.alertStatus.${alert.status}`)}</small>
                   </div>
-                  {alert.status === 'open' && <button type="button" onClick={() => acknowledge(alert.id)}>{t('dashboard.acknowledge')}</button>}
-                  <Link to={`/map?zone=${encodeURIComponent(alert.zone_id)}&period=${encodeURIComponent(alert.period_id)}&layer=${encodeURIComponent(alert.index)}`}>{t('dashboard.open')}</Link>
+                  <div className="alert-event-actions">
+                    {alert.status === 'open' && <button type="button" onClick={() => acknowledge(alert.id)}>{t('dashboard.acknowledge')}</button>}
+                    <Link to={`/work?new=1&zone=${encodeURIComponent(alert.zone_id)}&alert=${encodeURIComponent(alert.id)}&kind=${caseKindForAlert(alert.index)}`}>{t('dashboard.createCase')}</Link>
+                    <Link to={`/map?zone=${encodeURIComponent(alert.zone_id)}&period=${encodeURIComponent(alert.period_id)}&layer=${encodeURIComponent(alert.index)}`}>{t('dashboard.open')}</Link>
+                  </div>
                 </article>
               ))}
             </div>
@@ -317,6 +326,7 @@ export default function DashboardPage() {
                   {snapshot?.checkedAt && <p className="zone-card-checked">{t('dashboard.checkedAt', { date: displayedDate(snapshot.checkedAt) })}</p>}
                   <div className="zone-card-actions">
                     <button type="button" onClick={() => refreshZone(zone)} disabled={snapshot?.status === 'loading'}>{snapshot?.status === 'loading' ? t('common.wait') : t('dashboard.checkNow')}</button>
+                    {cloudMode && <Link to={`/work?new=1&zone=${encodeURIComponent(zone.id)}`}>{t('dashboard.createCase')}</Link>}
                     <Link to={`/map?${params}`}>{t('dashboard.analyze')}</Link>
                     <button type="button" onClick={() => shareZone(zone)}>{t('dashboard.share')}</button>
                   </div>

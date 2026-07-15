@@ -10,6 +10,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -214,6 +215,133 @@ class AnalysisPayload(BaseModel):
     @classmethod
     def validate_title(cls, value: str) -> str:
         return " ".join(value.split())
+
+
+CaseKind = Literal["vegetation", "irrigation", "land_change", "field_check", "other"]
+CasePriority = Literal["low", "normal", "high", "urgent"]
+CaseStatus = Literal["open", "in_progress", "waiting", "closed"]
+
+
+def _clean_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return " ".join(value.split())
+
+
+def _clean_required_text(value: str) -> str:
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        raise ValueError("This field cannot be blank")
+    return cleaned
+
+
+def _validate_due_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        time.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("Use YYYY-MM-DD for the due date") from exc
+    return value
+
+
+class CaseCreateRequest(BaseModel):
+    zone_id: str = Field(min_length=1, max_length=120)
+    source_alert_id: str | None = Field(default=None, min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=140)
+    kind: CaseKind = "field_check"
+    priority: CasePriority = "normal"
+    due_date: str | None = Field(default=None, max_length=10)
+    assignee: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        return _clean_required_text(value)
+
+    @field_validator("assignee")
+    @classmethod
+    def clean_assignee(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("due_date")
+    @classmethod
+    def validate_due_date(cls, value: str | None) -> str | None:
+        return _validate_due_date(value)
+
+
+class CaseUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=140)
+    kind: CaseKind | None = None
+    priority: CasePriority | None = None
+    status: CaseStatus | None = None
+    due_date: str | None = Field(default=None, max_length=10)
+    assignee: str | None = Field(default=None, max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    finding: str | None = Field(default=None, max_length=4000)
+    action: str | None = Field(default=None, max_length=4000)
+    resolution: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str | None) -> str | None:
+        return _clean_required_text(value) if value is not None else None
+
+    @field_validator("assignee")
+    @classmethod
+    def clean_assignee(cls, value: str | None) -> str | None:
+        return _clean_optional_text(value)
+
+    @field_validator("description", "finding", "action", "resolution")
+    @classmethod
+    def clean_narrative(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @field_validator("due_date")
+    @classmethod
+    def validate_due_date(cls, value: str | None) -> str | None:
+        return _validate_due_date(value)
+
+
+class CaseTimelineUpdateRequest(BaseModel):
+    kind: Literal["note", "field_observation", "action", "decision"] = "note"
+    body: str = Field(min_length=1, max_length=4000)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    observed_at: str | None = Field(default=None, max_length=40)
+    evidence: dict = Field(default_factory=dict)
+
+    @field_validator("body")
+    @classmethod
+    def clean_body(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("The log entry cannot be blank")
+        return cleaned
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("Use an ISO 8601 observation date") from exc
+        return value
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: dict) -> dict:
+        if len(json.dumps(value, ensure_ascii=False)) > 16_000:
+            raise ValueError("Evidence metadata is too large")
+        return value
 
 
 class AttemptLimiter:
@@ -750,6 +878,91 @@ def create_account_router(
     ):
         if len(analysis_id) > 100 or not store.delete_analysis(user["id"], analysis_id):
             raise HTTPException(status_code=404, detail="Сохранённый анализ не найден")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.get("/cases")
+    def list_field_cases(
+        limit: int = 200,
+        user: dict = Depends(verified_user),
+    ):
+        return {"cases": store.list_cases(user["id"], limit=limit)}
+
+    @router.post("/cases", status_code=status.HTTP_201_CREATED)
+    def create_field_case(
+        payload: CaseCreateRequest,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        created = store.create_case(user["id"], payload.model_dump())
+        if not created:
+            raise HTTPException(
+                status_code=404,
+                detail="The saved zone or source alert was not found",
+            )
+        return created
+
+    @router.get("/cases/{case_id}")
+    def get_field_case(
+        case_id: str,
+        user: dict = Depends(verified_user),
+    ):
+        if len(case_id) > 120:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        item = store.get_case(user["id"], case_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        return item
+
+    @router.patch("/cases/{case_id}")
+    def update_field_case(
+        case_id: str,
+        payload: CaseUpdateRequest,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if len(case_id) > 120:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        changes = payload.model_dump(exclude_unset=True)
+        if not changes:
+            raise HTTPException(status_code=400, detail="No case changes supplied")
+        current = store.get_case(user["id"], case_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        next_status = changes.get("status", current.get("status"))
+        if next_status == "closed":
+            resolution = changes.get("resolution", current.get("resolution", ""))
+            if not resolution or not resolution.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Add a resolution before closing the field case",
+                )
+        updated = store.update_case(user["id"], case_id, changes)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        return updated
+
+    @router.post("/cases/{case_id}/updates", status_code=status.HTTP_201_CREATED)
+    def add_field_case_update(
+        case_id: str,
+        payload: CaseTimelineUpdateRequest,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if len(case_id) > 120:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        created = store.add_case_update(user["id"], case_id, payload.model_dump())
+        if not created:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        return created
+
+    @router.delete("/cases/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_field_case(
+        case_id: str,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if len(case_id) > 120 or not store.delete_case(user["id"], case_id):
+            raise HTTPException(status_code=404, detail="Field case not found")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.get("/monitoring/status")

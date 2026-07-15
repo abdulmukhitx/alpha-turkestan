@@ -215,6 +215,77 @@ class AccountStoreTests(unittest.TestCase):
         self.assertTrue(self.store.delete_analysis(user["id"], saved["id"]))
         self.assertEqual(self.store.list_analyses(user["id"]), [])
 
+    def test_field_case_lifecycle_keeps_aoi_evidence_snapshot(self):
+        user = self.store.create_user("field-work@example.com", "Field Lead", PASSWORD)
+        self.store.create_zone(user["id"], {
+            "id": "zone-work", "name": "North field", "geometry": POLYGON,
+        })
+        created = self.store.create_case(user["id"], {
+            "zone_id": "zone-work",
+            "title": "Inspect dry area",
+            "kind": "irrigation",
+            "priority": "high",
+            "due_date": "2026-07-20",
+            "assignee": "Aruzhan",
+            "description": "Confirm the moisture anomaly on site",
+        })
+        self.assertIsNotNone(created)
+        self.assertEqual(created["zone_name"], "North field")
+        self.assertEqual(created["zone_geometry"], POLYGON)
+        self.assertEqual(created["status"], "open")
+        self.assertEqual(created["updates"][0]["kind"], "created")
+
+        updated = self.store.update_case(user["id"], created["id"], {
+            "status": "in_progress",
+            "finding": "Canal gate was blocked",
+            "action": "Clear the gate and inspect again",
+        })
+        self.assertEqual(updated["status"], "in_progress")
+        self.assertEqual(updated["finding"], "Canal gate was blocked")
+        self.assertEqual(updated["updates"][0]["kind"], "status")
+
+        log_entry = self.store.add_case_update(user["id"], created["id"], {
+            "kind": "field_observation",
+            "body": "Low surface moisture confirmed",
+            "latitude": 43.05,
+            "longitude": 68.05,
+            "observed_at": "2026-07-16T09:30:00Z",
+            "evidence": {"layer": "ndmi", "period": "2025_summer"},
+        })
+        self.assertEqual(log_entry["evidence"]["layer"], "ndmi")
+        self.assertEqual(self.store.get_case(user["id"], created["id"])["update_count"], 3)
+
+        alert = self.store.create_alert(
+            user["id"], "zone-work",
+            {"id": "ndmi-low", "index": "ndmi", "operator": "below", "value": 0.2},
+            0.12, "2025_summer", "mosaic-v1",
+        )
+        alert_case = self.store.create_case(user["id"], {
+            "zone_id": "zone-work",
+            "source_alert_id": alert["id"],
+            "title": "Investigate monitoring signal",
+            "kind": "irrigation",
+            "priority": "urgent",
+        })
+        duplicate = self.store.create_case(user["id"], {
+            "zone_id": "zone-work",
+            "source_alert_id": alert["id"],
+            "title": "Duplicate work item",
+            "kind": "irrigation",
+            "priority": "normal",
+        })
+        self.assertEqual(duplicate["id"], alert_case["id"])
+        self.assertEqual(alert_case["source_alert"]["observed_value"], 0.12)
+
+        # A completed investigation remains auditable if its source AOI is later removed.
+        self.assertTrue(self.store.delete_zone(user["id"], "zone-work"))
+        preserved = self.store.get_case(user["id"], created["id"])
+        self.assertEqual(preserved["zone_name"], "North field")
+        self.assertEqual(preserved["zone_geometry"], POLYGON)
+        self.assertEqual(len(self.store.export_account(user["id"])["field_cases"]), 2)
+        self.assertTrue(self.store.delete_case(user["id"], created["id"]))
+        self.assertIsNone(self.store.get_case(user["id"], created["id"]))
+
 
 class AccountApiTests(unittest.TestCase):
     def setUp(self):
@@ -561,6 +632,106 @@ class AccountApiTests(unittest.TestCase):
             f"/api/account/analyses/{saved.json()['id']}", headers=self.headers
         )
         self.assertEqual(deleted.status_code, 204, deleted.text)
+
+    def test_field_case_api_turns_a_zone_into_completed_work(self):
+        registration = self.client.post("/api/account/register", headers=self.headers, json={
+            "display_name": "Field Manager", "email": "work@example.com", "password": PASSWORD,
+        })
+        self.assertEqual(registration.status_code, 201, registration.text)
+        verification_token = parse_qs(
+            urlparse(self.mailer.verification_url).query
+        )["verify_email"][0]
+        self.assertEqual(self.client.post(
+            "/api/account/verification/confirm",
+            headers=self.headers,
+            json={"token": verification_token},
+        ).status_code, 200)
+        self.assertEqual(self.client.post("/api/account/zones", headers=self.headers, json={
+            "id": "zone-case", "name": "Irrigated block", "geometry": POLYGON,
+        }).status_code, 201)
+        alert = self.store.create_alert(
+            registration.json()["user"]["id"], "zone-case",
+            {"id": "ndmi-low", "index": "ndmi", "operator": "below", "value": 0.2},
+            0.11, "2025_summer", "mosaic-v1",
+        )
+
+        created = self.client.post("/api/account/cases", headers=self.headers, json={
+            "zone_id": "zone-case",
+            "source_alert_id": alert["id"],
+            "title": "Inspect irrigation anomaly",
+            "kind": "irrigation",
+            "priority": "high",
+            "due_date": "2026-07-20",
+            "assignee": "Field Manager",
+            "description": "Verify the low-moisture signal",
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+        case_id = created.json()["id"]
+        self.assertEqual(created.json()["status"], "open")
+        self.assertEqual(created.json()["source_alert"]["index"], "ndmi")
+        self.assertEqual(self.client.get("/api/account/cases").json()["cases"][0]["id"], case_id)
+
+        duplicate = self.client.post("/api/account/cases", headers=self.headers, json={
+            "zone_id": "zone-case",
+            "source_alert_id": alert["id"],
+            "title": "Duplicate alert task",
+            "kind": "irrigation",
+            "priority": "normal",
+        })
+        self.assertEqual(duplicate.status_code, 201, duplicate.text)
+        self.assertEqual(duplicate.json()["id"], case_id)
+
+        observation = self.client.post(
+            f"/api/account/cases/{case_id}/updates",
+            headers=self.headers,
+            json={
+                "kind": "field_observation",
+                "body": "Blocked gate confirmed",
+                "latitude": 43.05,
+                "longitude": 68.05,
+            },
+        )
+        self.assertEqual(observation.status_code, 201, observation.text)
+
+        rejected_close = self.client.patch(
+            f"/api/account/cases/{case_id}",
+            headers=self.headers,
+            json={"status": "closed"},
+        )
+        self.assertEqual(rejected_close.status_code, 400, rejected_close.text)
+
+        completed = self.client.patch(
+            f"/api/account/cases/{case_id}",
+            headers=self.headers,
+            json={
+                "status": "closed",
+                "finding": "Irrigation gate was blocked",
+                "action": "Gate cleared",
+                "resolution": "Moisture restored and follow-up scheduled",
+            },
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "closed")
+        self.assertIsNotNone(completed.json()["closed_at"])
+        closed_at = completed.json()["closed_at"]
+        self.assertGreaterEqual(completed.json()["update_count"], 3)
+        edited_closed = self.client.patch(
+            f"/api/account/cases/{case_id}",
+            headers=self.headers,
+            json={"action": "Gate cleared and photographed"},
+        )
+        self.assertEqual(edited_closed.status_code, 200, edited_closed.text)
+        self.assertEqual(edited_closed.json()["closed_at"], closed_at)
+        rejected_resolution_removal = self.client.patch(
+            f"/api/account/cases/{case_id}",
+            headers=self.headers,
+            json={"resolution": ""},
+        )
+        self.assertEqual(rejected_resolution_removal.status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/account/export").json()["field_cases"][0]["id"],
+            case_id,
+        )
 
 
 if __name__ == "__main__":
