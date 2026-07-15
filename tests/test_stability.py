@@ -32,6 +32,22 @@ class StabilityContractTests(unittest.TestCase):
             ("analysis", main.ANALYSIS_RATE_LIMIT),
         )
 
+    def test_rate_limit_response_preserves_production_cors_headers(self):
+        origin = "https://www.geo-tko.online"
+        self.assertIn(origin, main.CORS_ORIGINS)
+        main._API_RATE_LIMITER.clear()
+        try:
+            with patch.object(main, "ANALYSIS_RATE_LIMIT", 1), TestClient(main.app) as client:
+                headers = {"Origin": origin}
+                client.post("/api/zone_stats", json={}, headers=headers)
+                limited = client.post("/api/zone_stats", json={}, headers=headers)
+            self.assertEqual(limited.status_code, 429)
+            self.assertEqual(limited.headers["access-control-allow-origin"], origin)
+            self.assertEqual(limited.headers["access-control-allow-credentials"], "true")
+            self.assertIn("retry-after", limited.headers)
+        finally:
+            main._API_RATE_LIMITER.clear()
+
     def test_scene_search_rejects_invalid_bounds_before_network_access(self):
         request = main.TimelapseSceneSearchReq(
             bbox=[70, 42, 68, 43],

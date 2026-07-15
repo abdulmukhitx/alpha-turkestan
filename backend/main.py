@@ -871,15 +871,9 @@ CORS_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins  = CORS_ORIGINS,
-    allow_credentials = True,
-    allow_methods  = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers  = ["Content-Type", "X-Requested-With"],
-    expose_headers = ["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"],
-)
+for production_origin in ("https://geo-tko.online", "https://www.geo-tko.online"):
+    if production_origin not in CORS_ORIGINS:
+        CORS_ORIGINS.append(production_origin)
 
 
 _EXPENSIVE_API_PATHS = {
@@ -2971,6 +2965,19 @@ async def metadata():
         "timelapse": CDSE_SCENE_CATALOG.capabilities(),
         "forecast": forecast_config(),
     }
+
+
+# Register CORS after the function-based middleware so it becomes the
+# outermost layer. Early 413/429 responses must expose their real HTTP status
+# and retry headers to the browser instead of being hidden as a CORS failure.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Requested-With"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"],
+)
 
 
 # ── Static data files ─────────────────────────────────────────────

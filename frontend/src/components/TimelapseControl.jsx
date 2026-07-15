@@ -16,6 +16,7 @@ export default function TimelapseControl({
   const { t, periodLabel, formatDate } = useI18n()
   const [playing, setPlaying] = useState(false)
   const [studioOpen, setStudioOpen] = useState(false)
+  const [playheadId, setPlayheadId] = useState(period)
   const [studioMode, setStudioMode] = useState('mosaics')
   const [fps, setFps] = useState(1)
   const [loop, setLoop] = useState(true)
@@ -45,7 +46,7 @@ export default function TimelapseControl({
     () => available.filter((item) => selectedIds.includes(item.period_id)),
     [available, selectedIds],
   )
-  const frameIndex = Math.max(0, frames.findIndex((item) => item.period_id === period))
+  const frameIndex = Math.max(0, frames.findIndex((item) => item.period_id === playheadId))
   const current = frames[frameIndex] || available[0]
   const displayLayer = activeLayer === 'satellite' ? 'rgb' : activeLayer
   const geometryKey = useMemo(() => JSON.stringify(zoneGeometry || null), [zoneGeometry])
@@ -60,9 +61,17 @@ export default function TimelapseControl({
     return previewTileUrl(tileUrl(displayLayer, frame.period_id, frame.data_version || ''), center, 8)
   }
 
-  function goToFrame(index) {
+  function goToFrame(index, syncMap = false) {
     const next = frames[index]
-    if (next) onPeriodChange(next.period_id)
+    if (!next) return
+    setPlayheadId(next.period_id)
+    if (syncMap && next.period_id !== period) onPeriodChange(next.period_id)
+  }
+
+  function closeStudio() {
+    setPlaying(false)
+    setStudioOpen(false)
+    if (current?.period_id && current.period_id !== period) onPeriodChange(current.period_id)
   }
 
   function openStudio() {
@@ -92,9 +101,9 @@ export default function TimelapseControl({
       ? selectedIds.filter((id) => id !== periodId)
       : [...selectedIds, periodId]
     setSelectedIds(next)
-    if (isSelected && periodId === period) {
+    if (isSelected && periodId === current?.period_id) {
       const fallback = available.find((item) => next.includes(item.period_id))
-      if (fallback) onPeriodChange(fallback.period_id)
+      if (fallback) setPlayheadId(fallback.period_id)
     }
   }
 
@@ -172,20 +181,24 @@ export default function TimelapseControl({
   }, [open, frames.length])
 
   useEffect(() => {
+    if (frames.some((frame) => frame.period_id === period)) setPlayheadId(period)
+  }, [period, frameSetKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     if (!playing || !preloadReady || frames.length < 2) return undefined
     const timer = window.setTimeout(() => {
-      const currentIndex = frames.findIndex((item) => item.period_id === period)
+      const currentIndex = frames.findIndex((item) => item.period_id === playheadId)
       const nextIndex = nextFrameIndex(currentIndex, frames.length, loop)
       if (nextIndex < 0) setPlaying(false)
       else goToFrame(nextIndex)
     }, 1000 / fps)
     return () => window.clearTimeout(timer)
-  }, [playing, preloadReady, frames, period, fps, loop]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [playing, preloadReady, frames, playheadId, fps, loop]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!studioOpen) return undefined
     const handleKey = (event) => {
-      if (event.key === 'Escape') setStudioOpen(false)
+      if (event.key === 'Escape') closeStudio()
       if (event.key === 'ArrowLeft' && preloadReady) step(-1)
       if (event.key === 'ArrowRight' && preloadReady) step(1)
       if (event.key === ' ') {
@@ -210,7 +223,7 @@ export default function TimelapseControl({
           <span>{periodLabel(current)}</span>
           <input
             type="range" min="0" max={frames.length - 1} step="1" value={frameIndex}
-            onChange={(event) => { setPlaying(false); goToFrame(Number(event.target.value)) }}
+            onChange={(event) => { setPlaying(false); goToFrame(Number(event.target.value), !studioOpen) }}
             aria-label={t('timelapse.period')}
           />
         </label>
@@ -219,7 +232,7 @@ export default function TimelapseControl({
       </section>
 
       {studioOpen && (
-        <div className="timelapse-studio-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setStudioOpen(false) }}>
+        <div className="timelapse-studio-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeStudio() }}>
           <section className="timelapse-studio" role="dialog" aria-modal="true" aria-labelledby="timelapse-title">
             <header className="timelapse-studio-header">
               <div>
@@ -227,7 +240,7 @@ export default function TimelapseControl({
                 <h2 id="timelapse-title">{t('timelapse.title')}</h2>
                 <p>{selectedAoiBounds ? t('timelapse.aoiSubtitle', { count: frames.length }) : t('timelapse.subtitle', { count: frames.length })}</p>
               </div>
-              <button type="button" onClick={() => setStudioOpen(false)} aria-label={t('common.close')}>×</button>
+              <button type="button" onClick={closeStudio} aria-label={t('common.close')}>×</button>
             </header>
 
             <div className="timelapse-studio-grid">

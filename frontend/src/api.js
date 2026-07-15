@@ -8,6 +8,8 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\
 export const apiUrl = (path) => `${API_BASE_URL}${path}`
 
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 30_000)
+const zoneStatsInFlight = new Map()
+const zoneTimeSeriesInFlight = new Map()
 
 const apiFetch = async (path, options = {}) => {
   const { signal, timeoutMs = API_TIMEOUT_MS, ...fetchOptions } = options
@@ -22,6 +24,16 @@ const apiFetch = async (path, options = {}) => {
     clearTimeout(timer)
     signal?.removeEventListener('abort', abortFromCaller)
   }
+}
+
+function singleFlight(store, key, request) {
+  const existing = store.get(key)
+  if (existing) return existing
+  const promise = request().finally(() => {
+    if (store.get(key) === promise) store.delete(key)
+  })
+  store.set(key, promise)
+  return promise
 }
 
 const ACCOUNT_MUTATION_HEADERS = {
@@ -266,29 +278,35 @@ export async function fetchPointForecast(lat, lon, index, targetYear) {
 }
 
 export async function fetchZoneStats(geometry, period) {
-  const r = await apiFetch('/api/zone_stats', {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ geometry, period }),
+  const body = JSON.stringify({ geometry, period })
+  return singleFlight(zoneStatsInFlight, body, async () => {
+    const r = await apiFetch('/api/zone_stats', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    if (!r.ok) {
+      const detail = await r.json().catch(() => null)
+      throw new Error(detail?.detail || `Zone stats failed: ${r.status}`)
+    }
+    return r.json()
   })
-  if (!r.ok) {
-    const detail = await r.json().catch(() => null)
-    throw new Error(detail?.detail || `Zone stats failed: ${r.status}`)
-  }
-  return r.json()
 }
 
 export async function fetchZoneTimeSeries(geometry) {
-  const r = await apiFetch('/api/zone_timeseries', {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ geometry }),
+  const body = JSON.stringify({ geometry })
+  return singleFlight(zoneTimeSeriesInFlight, body, async () => {
+    const r = await apiFetch('/api/zone_timeseries', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    })
+    if (!r.ok) {
+      const detail = await r.json().catch(() => null)
+      throw new Error(detail?.detail || `Zone time series failed: ${r.status}`)
+    }
+    return r.json()
   })
-  if (!r.ok) {
-    const detail = await r.json().catch(() => null)
-    throw new Error(detail?.detail || `Zone time series failed: ${r.status}`)
-  }
-  return r.json()
 }
 
 export async function fetchTransect(geometry, layer, period) {
