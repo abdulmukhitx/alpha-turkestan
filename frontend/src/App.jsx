@@ -1390,6 +1390,7 @@ export default function App() {
         activeLayer={activeLayer}
         center={meta?.region?.center || FALLBACK_CENTER}
         bounds={meta?.region?.bounds}
+        zoneGeometry={zonePolygon}
       />
 
       <ChangeDetectionBar

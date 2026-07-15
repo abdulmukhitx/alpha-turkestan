@@ -69,6 +69,13 @@ controls. The studio's **Scene catalogue** tab performs a bounded search of the
 public Copernicus Data Space STAC `sentinel-2-l2a` collection for the current
 region, date range and maximum product cloud cover.
 
+When a polygon AOI is active, the studio selects a bounded high-resolution tile
+grid, downloads and decodes every selected annual frame, composites the tiles,
+and masks the result to the polygon before enabling playback. Prepared WebP
+frames remain in memory for the player and use a short 160 ms crossfade, so no
+network request or image decode is performed during frame changes. The grid is
+limited to 16 tiles per period and six concurrent downloads.
+
 Catalogue scenes are intentionally metadata-only and carry `renderable: false`.
 Product cloud cover describes the full Sentinel source tile, not cloud cover
 inside the selected AOI. Scene rendering/export will require a separate CDSE
