@@ -70,6 +70,11 @@ Redis/reverse-proxy layer. Historical tile URLs include a source-data version
 and may be cached by browsers or a CDN. See `docs/account-production.md` for
 account backup and email configuration.
 
+For the Vercel frontend project, set **Root Directory** to `frontend`. The
+included `frontend/vercel.json` rewrites direct SPA routes such as `/map`,
+`/dashboard` and `/history` to `index.html`, allowing React Router to handle
+refreshes and shared links. Commit the file and redeploy after changing it.
+
 ## Project direction
 
 The planned release sequence is stability, Field Monitor pages, scheduled
