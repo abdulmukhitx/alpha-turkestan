@@ -1387,6 +1387,9 @@ export default function App() {
         periods={periods}
         period={period}
         onPeriodChange={setPeriod}
+        activeLayer={activeLayer}
+        center={meta?.region?.center || FALLBACK_CENTER}
+        bounds={meta?.region?.bounds}
       />
 
       <ChangeDetectionBar

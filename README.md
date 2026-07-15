@@ -61,6 +61,29 @@ screening cannot be independently verified and is labelled as limited in every
 evidence record. Retain SCL and original scene identifiers in the future
 ingestion manifest before treating observations as fully quality-screened.
 
+## Timelapse and scene discovery
+
+The map timelapse plays the locally available annual summer mosaics and can be
+opened as a larger studio with frame selection, speed, looping and transition
+controls. The studio's **Scene catalogue** tab performs a bounded search of the
+public Copernicus Data Space STAC `sentinel-2-l2a` collection for the current
+region, date range and maximum product cloud cover.
+
+Catalogue scenes are intentionally metadata-only and carry `renderable: false`.
+Product cloud cover describes the full Sentinel source tile, not cloud cover
+inside the selected AOI. Scene rendering/export will require a separate CDSE
+Process API OAuth integration and retained quality masks; until that is added,
+the player continues to use the verified local mosaics. Configure discovery
+with `CDSE_CATALOG_ENABLED`, `CDSE_CATALOG_TIMEOUT_SECONDS`,
+`CDSE_CATALOG_CACHE_SECONDS` and `MAX_CONCURRENT_CATALOG_SEARCHES`. No CDSE
+credential is required for this public catalogue stage.
+
+API contracts:
+
+- `GET /api/timelapse/capabilities` reports discovery and rendering support.
+- `POST /api/timelapse/scenes` accepts a WGS84 bounding box, date range, cloud
+  threshold and a bounded result limit.
+
 ## Deployment notes
 
 The current SQLite, scheduler and in-process rate-limiter design supports one

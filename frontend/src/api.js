@@ -199,6 +199,25 @@ export async function fetchPeriods() {
   return r.json()
 }
 
+export async function searchTimelapseScenes({ bbox, startDate, endDate, maxCloudCover = 30, limit = 30 }) {
+  const r = await apiFetch('/api/timelapse/scenes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      bbox,
+      start_date: startDate,
+      end_date: endDate,
+      max_cloud_cover: maxCloudCover,
+      limit,
+    }),
+  })
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Scene search failed: ${r.status}`)
+  }
+  return r.json()
+}
+
 export async function fetchPixel(lat, lon, period) {
   const r = await apiFetch(`/api/pixel?lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}&period=${period}`)
   if (!r.ok) {

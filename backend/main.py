@@ -28,6 +28,7 @@ Run:
 """
 
 import asyncio, functools, io, json, logging, math, os, threading, time, traceback, uuid
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,6 +49,7 @@ try:
     from .account_store import AccountStore
     from .rate_limit import SlidingWindowRateLimiter
     from .monitoring import MonitoringService
+    from .cdse_catalog import CdseSceneCatalog, SceneSearchError
 except ImportError:  # supports `python backend/main.py`
     from account_api import create_account_router
     from backup_accounts import backup_status
@@ -55,6 +57,7 @@ except ImportError:  # supports `python backend/main.py`
     from account_store import AccountStore
     from rate_limit import SlidingWindowRateLimiter
     from monitoring import MonitoringService
+    from cdse_catalog import CdseSceneCatalog, SceneSearchError
 
 # ── Optional geo libs ─────────────────────────────────────────────
 try:
@@ -185,6 +188,10 @@ API_RATE_LIMIT = max(1, int(os.getenv("API_RATE_LIMIT", "120")))
 ANALYSIS_RATE_LIMIT = max(1, int(os.getenv("ANALYSIS_RATE_LIMIT", "20")))
 TILE_RATE_LIMIT = max(1, int(os.getenv("TILE_RATE_LIMIT", "600")))
 TILE_CACHE_SECONDS = max(60, int(os.getenv("TILE_CACHE_SECONDS", "86400")))
+CDSE_CATALOG_ENABLED = os.getenv("CDSE_CATALOG_ENABLED", "true").lower() in {"1", "true", "yes"}
+CDSE_CATALOG_TIMEOUT_SECONDS = max(1.0, min(30.0, float(os.getenv("CDSE_CATALOG_TIMEOUT_SECONDS", "12"))))
+CDSE_CATALOG_CACHE_SECONDS = max(0, min(3600, int(os.getenv("CDSE_CATALOG_CACHE_SECONDS", "300"))))
+MAX_CONCURRENT_CATALOG_SEARCHES = max(1, min(16, int(os.getenv("MAX_CONCURRENT_CATALOG_SEARCHES", "4"))))
 AI_TIMEOUT_SECONDS = max(1.0, float(os.getenv("AI_TIMEOUT_SECONDS", "15")))
 AI_MAX_RETRIES = max(0, min(2, int(os.getenv("AI_MAX_RETRIES", "0"))))
 MONITORING_SCHEDULER_ENABLED = os.getenv("MONITORING_SCHEDULER_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -192,7 +199,13 @@ MONITORING_INTERVAL_SECONDS = max(60, int(os.getenv("MONITORING_INTERVAL_SECONDS
 ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"}
 ENABLE_CHANGE_OVERVIEW = os.getenv("ENABLE_CHANGE_OVERVIEW", "false").lower() in {"1", "true", "yes"}
 _ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+_CATALOG_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_CATALOG_SEARCHES)
 _API_RATE_LIMITER = SlidingWindowRateLimiter()
+CDSE_SCENE_CATALOG = CdseSceneCatalog(
+    enabled=CDSE_CATALOG_ENABLED,
+    timeout_seconds=CDSE_CATALOG_TIMEOUT_SECONDS,
+    cache_seconds=CDSE_CATALOG_CACHE_SECONDS,
+)
 
 REGION_FALLBACK_BOUNDS = [40.31, 65.36, 46.46, 71.36]  # south, west, north, east
 
@@ -877,6 +890,7 @@ _EXPENSIVE_API_PATHS = {
     "/api/zone_report",
     "/api/zone_stats",
     "/api/zone_timeseries",
+    "/api/timelapse/scenes",
 }
 
 
@@ -995,6 +1009,7 @@ def health_payload() -> dict:
         "lulc_classifier_v2_loaded": CLASSIFIER_V2 is not None,
         "linear_forecast": forecast["enabled"],
         "linear_forecast_source_years": forecast["source_years"],
+        "scene_catalogue": CDSE_SCENE_CATALOG.capabilities(),
         "monitoring": monitoring_service_status(),
         "accounts": {
             "database": account_database,
@@ -1044,6 +1059,71 @@ async def periods():
         }
         for k, v in PERIODS.items()
     ]
+
+
+class TimelapseSceneSearchReq(BaseModel):
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    start_date: date
+    end_date: date
+    max_cloud_cover: float = Field(default=30.0, ge=0.0, le=100.0)
+    limit: int = Field(default=30, ge=1, le=100)
+
+
+def validate_scene_search(req: TimelapseSceneSearchReq) -> list[float]:
+    west, south, east, north = (float(value) for value in req.bbox)
+    if not all(math.isfinite(value) for value in (west, south, east, north)):
+        raise HTTPException(status_code=400, detail="AOI bounds must contain finite coordinates")
+    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        raise HTTPException(status_code=400, detail="AOI bounds are invalid or reversed")
+    if (east - west) * (north - south) > 100:
+        raise HTTPException(status_code=400, detail="AOI is too large for interactive scene search")
+    if req.end_date < req.start_date:
+        raise HTTPException(status_code=400, detail="End date must not be before start date")
+    if (req.end_date - req.start_date).days > 3660:
+        raise HTTPException(status_code=400, detail="Scene-search date range cannot exceed ten years")
+    return [west, south, east, north]
+
+
+@app.get("/api/timelapse/capabilities")
+async def timelapse_capabilities():
+    return CDSE_SCENE_CATALOG.capabilities()
+
+
+@app.post("/api/timelapse/scenes")
+async def timelapse_scenes(req: TimelapseSceneSearchReq):
+    if not CDSE_CATALOG_ENABLED:
+        raise HTTPException(status_code=503, detail="CDSE scene catalogue is disabled")
+    bbox = validate_scene_search(req)
+    if not _CATALOG_SEMAPHORE.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Scene catalogue is busy; retry shortly")
+    try:
+        try:
+            result = await run_in_threadpool(
+                CDSE_SCENE_CATALOG.search,
+                bbox=bbox,
+                start_date=req.start_date.isoformat(),
+                end_date=req.end_date.isoformat(),
+                max_cloud_cover=req.max_cloud_cover,
+                limit=req.limit,
+            )
+        except SceneSearchError as exc:
+            log_event(logging.WARNING, "cdse_scene_search_failed", error=type(exc).__name__)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        _CATALOG_SEMAPHORE.release()
+
+    return {
+        **result,
+        "capabilities": CDSE_SCENE_CATALOG.capabilities(),
+        "query": {
+            "bbox": bbox,
+            "start_date": req.start_date.isoformat(),
+            "end_date": req.end_date.isoformat(),
+            "max_cloud_cover": req.max_cloud_cover,
+            "limit": req.limit,
+        },
+        "disclaimer": "Cloud cover is product metadata for the source tile, not an AOI-specific cloud measurement.",
+    }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2888,6 +2968,7 @@ async def metadata():
         "imagery": {
             "true_color": {"available": cog_available(), "bands": ["B04", "B03", "B02"], "stretch": "2.5x reflectance + gamma 2.2"},
         },
+        "timelapse": CDSE_SCENE_CATALOG.capabilities(),
         "forecast": forecast_config(),
     }
 
