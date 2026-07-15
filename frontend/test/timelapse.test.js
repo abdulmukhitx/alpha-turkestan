@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { geometryBounds, lonLatToTile, nextFrameIndex, padBounds, previewTileUrl, tileGridForBounds } from '../src/timelapse.js'
+import { geometryBounds, lonLatToTile, nextFrameIndex, padBounds, previewTileUrl, tileGridForBounds, uniqueSceneAcquisitions } from '../src/timelapse.js'
 
 test('creates a concrete preview URL for the map center', () => {
   const coords = lonLatToTile([43.3, 68.25], 8)
@@ -35,4 +35,13 @@ test('selects the highest tile grid that stays within the preload budget', () =>
   assert.ok(grid.tiles.length > 0)
   assert.ok(grid.tiles.length <= 16)
   assert.ok(grid.zoom >= 5 && grid.zoom <= 18)
+})
+
+test('deduplicates overlapping catalogue tiles into chronological acquisitions', () => {
+  const scenes = [
+    { scene_id: 'tile-a', acquired_at: '2025-06-03T06:12:01Z', platform: 'sentinel-2b', cloud_cover: 20 },
+    { scene_id: 'tile-b', acquired_at: '2025-06-03T06:12:40Z', platform: 'sentinel-2b', cloud_cover: 4 },
+    { scene_id: 'tile-c', acquired_at: '2025-06-13T06:14:00Z', platform: 'sentinel-2c', cloud_cover: 8 },
+  ]
+  assert.deepEqual(uniqueSceneAcquisitions(scenes).map((scene) => scene.scene_id), ['tile-b', 'tile-c'])
 })

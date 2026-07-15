@@ -46,7 +46,23 @@ class CdseSceneCatalogTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "https://stac.dataspace.copernicus.eu/v1/search")
         self.assertEqual(calls[0][1]["collections"], ["sentinel-2-l2a"])
         self.assertEqual(calls[0][1]["query"], {"eo:cloud_cover": {"lte": 20}})
+        self.assertEqual(calls[0][1]["bbox"], [68.0, 42.0, 69.0, 43.0])
         self.assertEqual(calls[0][2], 7)
+
+    def test_exact_geometry_search_uses_intersects_instead_of_bbox(self):
+        calls = []
+        geometry = {
+            "type": "Polygon",
+            "coordinates": [[[68.0, 42.0], [68.2, 42.0], [68.2, 42.2], [68.0, 42.0]]],
+        }
+        catalog = CdseSceneCatalog(fetcher=lambda url, payload, timeout: calls.append(payload) or {"features": []})
+        catalog.search(
+            bbox=[68.0, 42.0, 68.2, 42.2], geometry=geometry,
+            start_date="2025-01-01", end_date="2025-12-31",
+            max_cloud_cover=30, limit=20,
+        )
+        self.assertEqual(calls[0]["intersects"], geometry)
+        self.assertNotIn("bbox", calls[0])
 
     def test_identical_search_uses_cache(self):
         calls = 0

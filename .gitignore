@@ -57,4 +57,5 @@ build/
 dist/
 *.log
 data/account_mailbox/
+data/cdse_timelapse_cache/
 backups/

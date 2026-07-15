@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { searchTimelapseScenes, tileUrl } from '../api.js'
+import { fetchTimelapseSceneFrame, searchTimelapseScenes, tileUrl } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 import {
   geometryBounds, nextFrameIndex, padBounds, prepareAoiFrame, prepareCenterFrame,
-  previewTileUrl, tileGridForBounds,
+  prepareSceneFrameBlob, previewTileUrl, tileGridForBounds, uniqueSceneAcquisitions,
 } from '../timelapse.js'
 
 const SPEED_OPTIONS = [0.5, 1, 2, 4]
@@ -27,6 +27,8 @@ export default function TimelapseControl({
   const [sceneEndDate, setSceneEndDate] = useState(`${initialSceneYear}-08-31`)
   const [maxCloudCover, setMaxCloudCover] = useState(30)
   const [sceneResult, setSceneResult] = useState(null)
+  const [selectedSceneIds, setSelectedSceneIds] = useState([])
+  const [scenePlaybackIds, setScenePlaybackIds] = useState([])
   const [sceneLoading, setSceneLoading] = useState(false)
   const [sceneError, setSceneError] = useState('')
   const [preloadRequested, setPreloadRequested] = useState(false)
@@ -42,18 +44,26 @@ export default function TimelapseControl({
     })
   }, [availableKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const frames = useMemo(
+  const mosaicFrames = useMemo(
     () => available.filter((item) => selectedIds.includes(item.period_id)),
     [available, selectedIds],
   )
+  const sceneFrames = useMemo(
+    () => (sceneResult?.scenes || [])
+      .filter((scene) => scenePlaybackIds.includes(scene.scene_id))
+      .map((scene) => ({ ...scene, period_id: scene.scene_id, source: 'cdse' })),
+    [sceneResult, scenePlaybackIds],
+  )
+  const usingSceneFrames = studioMode === 'scenes' && sceneFrames.length > 0
+  const frames = usingSceneFrames ? sceneFrames : mosaicFrames
   const frameIndex = Math.max(0, frames.findIndex((item) => item.period_id === playheadId))
-  const current = frames[frameIndex] || available[0]
+  const current = frames[frameIndex] || mosaicFrames[0] || available[0]
   const displayLayer = activeLayer === 'satellite' ? 'rgb' : activeLayer
   const geometryKey = useMemo(() => JSON.stringify(zoneGeometry || null), [zoneGeometry])
   const selectedAoiBounds = useMemo(() => geometryBounds(zoneGeometry), [geometryKey]) // eslint-disable-line react-hooks/exhaustive-deps
-  const frameSetKey = frames.map((frame) => `${frame.period_id}:${frame.data_version || ''}`).join('|')
+  const frameSetKey = frames.map((frame) => `${frame.period_id}:${frame.data_version || frame.acquired_at || ''}`).join('|')
   const centerKey = center.map((value) => Number(value).toFixed(5)).join('|')
-  const preparationKey = `${frameSetKey}::${displayLayer}::${geometryKey}::${centerKey}`
+  const preparationKey = `${usingSceneFrames ? 'cdse' : 'mosaic'}::${frameSetKey}::${displayLayer}::${geometryKey}::${centerKey}`
   const preloadReady = preload.status === 'ready' && preload.key === preparationKey
 
   function frameUrl(frame) {
@@ -61,17 +71,28 @@ export default function TimelapseControl({
     return previewTileUrl(tileUrl(displayLayer, frame.period_id, frame.data_version || ''), center, 8)
   }
 
+  function frameLabel(frame) {
+    if (frame?.source === 'cdse') {
+      return formatDate(new Date(frame.acquired_at), { dateStyle: 'medium', timeStyle: 'short' })
+    }
+    return periodLabel(frame)
+  }
+
+  function frameYear(frame) {
+    return String(frame?.acquired_at || frame?.period_id || '').slice(0, 4)
+  }
+
   function goToFrame(index, syncMap = false) {
     const next = frames[index]
     if (!next) return
     setPlayheadId(next.period_id)
-    if (syncMap && next.period_id !== period) onPeriodChange(next.period_id)
+    if (syncMap && next.source !== 'cdse' && next.period_id !== period) onPeriodChange(next.period_id)
   }
 
   function closeStudio() {
     setPlaying(false)
     setStudioOpen(false)
-    if (current?.period_id && current.period_id !== period) onPeriodChange(current.period_id)
+    if (current?.source !== 'cdse' && current?.period_id && current.period_id !== period) onPeriodChange(current.period_id)
   }
 
   function openStudio() {
@@ -112,20 +133,48 @@ export default function TimelapseControl({
     setSceneLoading(true)
     setSceneError('')
     try {
-      const [south, west, north, east] = bounds.map(Number)
+      const [south, west, north, east] = (selectedAoiBounds || bounds).map(Number)
       const result = await searchTimelapseScenes({
         bbox: [west, south, east, north],
+        geometry: zoneGeometry,
         startDate: sceneStartDate,
         endDate: sceneEndDate,
         maxCloudCover,
         limit: 30,
       })
-      setSceneResult(result)
+      const scenes = uniqueSceneAcquisitions(result.scenes, 12)
+      setSceneResult({ ...result, scenes, returned: scenes.length, catalogueReturned: result.returned })
+      setSelectedSceneIds(scenes.map((scene) => scene.scene_id))
+      setScenePlaybackIds([])
     } catch (error) {
       setSceneError(error.message || t('timelapse.sceneError'))
     } finally {
       setSceneLoading(false)
     }
+  }
+
+  function toggleScene(sceneId) {
+    setPlaying(false)
+    setSelectedSceneIds((currentIds) => currentIds.includes(sceneId)
+      ? currentIds.filter((id) => id !== sceneId)
+      : [...currentIds, sceneId])
+  }
+
+  function prepareSelectedScenes() {
+    if (!selectedAoiBounds || !zoneGeometry) {
+      setSceneError(t('timelapse.drawAoi'))
+      return
+    }
+    const selectedScenes = (sceneResult?.scenes || []).filter((scene) => selectedSceneIds.includes(scene.scene_id))
+    if (selectedScenes.length < 2) {
+      setSceneError(t('timelapse.selectTwoScenes'))
+      return
+    }
+    setSceneError('')
+    setPlaying(false)
+    setScenePlaybackIds(selectedScenes.map((scene) => scene.scene_id))
+    setPlayheadId(selectedScenes[0].scene_id)
+    setPreloadRequested(true)
   }
 
   useEffect(() => {
@@ -134,12 +183,14 @@ export default function TimelapseControl({
     const preparedUrls = []
     let disposed = false
     let loaded = 0
+    const sceneSource = frames.every((frame) => frame.source === 'cdse')
     let total = frames.length
-    if (selectedAoiBounds) {
+    if (!sceneSource && selectedAoiBounds) {
       total = frames.length * tileGridForBounds(padBounds(selectedAoiBounds)).tiles.length
     }
+    const preloadScope = sceneSource ? 'cdse' : (selectedAoiBounds ? 'aoi' : 'center')
     setPlaying(false)
-    setPreload({ status: 'loading', loaded: 0, total, frames: {}, scope: selectedAoiBounds ? 'aoi' : 'center', error: '', key: preparationKey })
+    setPreload({ status: 'loading', loaded: 0, total, frames: {}, scope: preloadScope, error: '', key: preparationKey })
 
     const onAssetLoaded = () => {
       loaded += 1
@@ -148,23 +199,44 @@ export default function TimelapseControl({
 
     ;(async () => {
       const preparedFrames = {}
-      for (const frame of frames) {
-        const template = tileUrl(displayLayer, frame.period_id, frame.data_version || '')
-        const prepared = selectedAoiBounds
-          ? await prepareAoiFrame(template, zoneGeometry, { signal: controller.signal, onAssetLoaded })
-          : await prepareCenterFrame(template, center, { signal: controller.signal, onAssetLoaded })
-        preparedUrls.push(prepared.url)
-        preparedFrames[frame.period_id] = prepared
+      if (sceneSource) {
+        let cursor = 0
+        async function worker() {
+          while (cursor < frames.length) {
+            const frame = frames[cursor]
+            cursor += 1
+            const response = await fetchTimelapseSceneFrame({
+              geometry: zoneGeometry,
+              sceneId: frame.scene_id,
+              acquiredAt: frame.acquired_at,
+              layer: displayLayer,
+            }, { signal: controller.signal })
+            const prepared = await prepareSceneFrameBlob(response.blob, { onAssetLoaded })
+            prepared.cached = response.cached
+            preparedUrls.push(prepared.url)
+            preparedFrames[frame.period_id] = prepared
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(2, frames.length) }, worker))
+      } else {
+        for (const frame of frames) {
+          const template = tileUrl(displayLayer, frame.period_id, frame.data_version || '')
+          const prepared = selectedAoiBounds
+            ? await prepareAoiFrame(template, zoneGeometry, { signal: controller.signal, onAssetLoaded })
+            : await prepareCenterFrame(template, center, { signal: controller.signal, onAssetLoaded })
+          preparedUrls.push(prepared.url)
+          preparedFrames[frame.period_id] = prepared
+        }
       }
       if (!disposed) {
-        setPreload({ status: 'ready', loaded: total, total, frames: preparedFrames, scope: selectedAoiBounds ? 'aoi' : 'center', error: '', key: preparationKey })
+        setPreload({ status: 'ready', loaded: total, total, frames: preparedFrames, scope: preloadScope, error: '', key: preparationKey })
       }
     })().catch((error) => {
       if (disposed || error.name === 'AbortError') return
       preparedUrls.forEach((url) => URL.revokeObjectURL(url))
       preparedUrls.length = 0
       setPreload({
-        status: 'error', loaded, total, frames: {}, scope: selectedAoiBounds ? 'aoi' : 'center',
+        status: 'error', loaded, total, frames: {}, scope: preloadScope,
         error: error.message || t('timelapse.preloadError'), key: preparationKey,
       })
     })
@@ -181,8 +253,8 @@ export default function TimelapseControl({
   }, [open, frames.length])
 
   useEffect(() => {
-    if (frames.some((frame) => frame.period_id === period)) setPlayheadId(period)
-  }, [period, frameSetKey]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (!usingSceneFrames && frames.some((frame) => frame.period_id === period)) setPlayheadId(period)
+  }, [period, frameSetKey, usingSceneFrames]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!playing || !preloadReady || frames.length < 2) return undefined
@@ -220,14 +292,14 @@ export default function TimelapseControl({
           {playing ? t('timelapse.pause') : t('timelapse.play')}
         </button>
         <label>
-          <span>{periodLabel(current)}</span>
+          <span>{frameLabel(current)}</span>
           <input
             type="range" min="0" max={frames.length - 1} step="1" value={frameIndex}
             onChange={(event) => { setPlaying(false); goToFrame(Number(event.target.value), !studioOpen) }}
             aria-label={t('timelapse.period')}
           />
         </label>
-        <small>{selectedAoiBounds ? `${t('timelapse.aoiShort')} · ` : ''}{frames[0]?.period_id.slice(0, 4)}–{frames.at(-1)?.period_id.slice(0, 4)}</small>
+        <small>{selectedAoiBounds ? `${t('timelapse.aoiShort')} · ` : ''}{frameYear(frames[0])}–{frameYear(frames.at(-1))}</small>
         <button type="button" className="timelapse-expand" onClick={openStudio}>{t('timelapse.studio')}</button>
       </section>
 
@@ -238,7 +310,7 @@ export default function TimelapseControl({
               <div>
                 <span className="panel-eyebrow">TIMELAPSE</span>
                 <h2 id="timelapse-title">{t('timelapse.title')}</h2>
-                <p>{selectedAoiBounds ? t('timelapse.aoiSubtitle', { count: frames.length }) : t('timelapse.subtitle', { count: frames.length })}</p>
+                <p>{usingSceneFrames ? t('timelapse.cdseSubtitle', { count: frames.length }) : (selectedAoiBounds ? t('timelapse.aoiSubtitle', { count: frames.length }) : t('timelapse.subtitle', { count: frames.length }))}</p>
               </div>
               <button type="button" onClick={closeStudio} aria-label={t('common.close')}>×</button>
             </header>
@@ -246,12 +318,12 @@ export default function TimelapseControl({
             <div className="timelapse-studio-grid">
               <aside className="timelapse-frame-panel">
                 <div className="timelapse-period-summary">
-                  <div><span>{t('timelapse.from')}</span><strong>{available[0]?.period_id.slice(0, 4)}</strong></div>
-                  <div><span>{t('timelapse.to')}</span><strong>{available.at(-1)?.period_id.slice(0, 4)}</strong></div>
+                  <div><span>{t('timelapse.from')}</span><strong>{frameYear(frames[0])}</strong></div>
+                  <div><span>{t('timelapse.to')}</span><strong>{frameYear(frames.at(-1))}</strong></div>
                 </div>
-                <p className="timelapse-data-note">{t('timelapse.annualNote')}</p>
+                <p className="timelapse-data-note">{usingSceneFrames ? t('timelapse.cdseNote') : t('timelapse.annualNote')}</p>
                 <div className="timelapse-source-tabs" role="tablist" aria-label={t('timelapse.sourceMode')}>
-                  <button type="button" role="tab" aria-selected={studioMode === 'mosaics'} className={studioMode === 'mosaics' ? 'active' : ''} onClick={() => setStudioMode('mosaics')}>{t('timelapse.mosaics')}</button>
+                  <button type="button" role="tab" aria-selected={studioMode === 'mosaics'} className={studioMode === 'mosaics' ? 'active' : ''} onClick={() => { setPlaying(false); setStudioMode('mosaics') }}>{t('timelapse.mosaics')}</button>
                   <button type="button" role="tab" aria-selected={studioMode === 'scenes'} className={studioMode === 'scenes' ? 'active' : ''} onClick={() => { setPlaying(false); setStudioMode('scenes') }}>{t('timelapse.sceneCatalog')}</button>
                 </div>
                 {studioMode === 'mosaics' ? (
@@ -293,16 +365,25 @@ export default function TimelapseControl({
                         </div>
                         <div className="timelapse-scene-list">
                           {sceneResult.scenes.map((scene) => (
-                            <article key={scene.scene_id} className="timelapse-scene-card">
+                            <label key={scene.scene_id} className={`timelapse-scene-card ${selectedSceneIds.includes(scene.scene_id) ? '' : 'excluded'}`}>
+                              <input type="checkbox" checked={selectedSceneIds.includes(scene.scene_id)} onChange={() => toggleScene(scene.scene_id)} />
                               <div><strong>{formatDate(new Date(scene.acquired_at), { dateStyle: 'medium', timeStyle: 'short' })}</strong><span>{scene.platform}</span></div>
                               <small>{scene.cloud_cover == null ? t('timelapse.cloudUnknown') : t('timelapse.cloudValue', { value: scene.cloud_cover })}</small>
                               <code title={scene.scene_id}>{scene.mgrs_tile || scene.scene_id}</code>
-                              <em>{t('timelapse.catalogOnly')}</em>
-                            </article>
+                              <em>{scene.renderable ? t('timelapse.renderable') : t('timelapse.catalogOnly')}</em>
+                            </label>
                           ))}
                           {sceneResult.scenes.length === 0 && <p className="timelapse-scene-empty">{t('timelapse.noScenes')}</p>}
                         </div>
-                        <p className="timelapse-catalog-note">{t('timelapse.catalogNote')}</p>
+                        <button
+                          type="button"
+                          className="timelapse-prepare-scenes"
+                          disabled={!selectedAoiBounds || selectedSceneIds.length < 2 || !sceneResult.capabilities?.scene_rendering}
+                          onClick={prepareSelectedScenes}
+                        >
+                          {t('timelapse.prepareScenes', { count: selectedSceneIds.length })}
+                        </button>
+                        <p className="timelapse-catalog-note">{!selectedAoiBounds ? t('timelapse.drawAoi') : (sceneResult.capabilities?.scene_rendering ? t('timelapse.cdseCatalogNote') : t('timelapse.catalogNote'))}</p>
                       </>
                     )}
                   </form>
@@ -310,13 +391,13 @@ export default function TimelapseControl({
               </aside>
 
               <div className="timelapse-preview-panel">
-                <div className={`timelapse-preview ${transition === 'fade' ? 'fade' : 'no-transition'} ${preload.scope === 'aoi' ? 'aoi' : ''}`}>
+                <div className={`timelapse-preview ${transition === 'fade' ? 'fade' : 'no-transition'} ${preload.scope !== 'center' ? 'aoi' : ''}`}>
                   {preloadReady && frames.map((frame) => (
                     <img
                       key={frame.period_id}
                       className={`timelapse-prepared-frame ${frame.period_id === current.period_id ? 'active' : ''}`}
                       src={preload.frames[frame.period_id]?.url}
-                      alt={frame.period_id === current.period_id ? periodLabel(frame) : ''}
+                      alt={frame.period_id === current.period_id ? frameLabel(frame) : ''}
                     />
                   ))}
                   {!preloadReady && preload.status !== 'error' && (
@@ -334,13 +415,13 @@ export default function TimelapseControl({
                     </div>
                   )}
                   <span className="timelapse-preview-layer">{selectedAoiBounds ? t('timelapse.aoiShort') : displayLayer.toUpperCase()}</span>
-                  <strong>{periodLabel(current)}</strong>
+                  <strong>{frameLabel(current)}</strong>
                 </div>
                 {preloadReady && (
                   <div className="timelapse-ready-note"><span aria-hidden="true">✓</span>{t('timelapse.ready', { count: frames.length })}</div>
                 )}
                 <div className="timelapse-quality-note">
-                  <span aria-hidden="true">!</span><p><strong>{t('timelapse.qualityTitle')}</strong>{t('timelapse.qualityNote')}</p>
+                    <span aria-hidden="true">!</span><p><strong>{t('timelapse.qualityTitle')}</strong>{usingSceneFrames ? t('timelapse.cdseQualityNote') : t('timelapse.qualityNote')}</p>
                 </div>
               </div>
             </div>

@@ -59,6 +59,21 @@ export function geometryBounds(geometry) {
   return [south, west, north, east]
 }
 
+export function uniqueSceneAcquisitions(scenes = [], limit = 12) {
+  const acquisitions = new Map()
+  scenes.forEach((scene) => {
+    if (!scene?.scene_id || !scene?.acquired_at) return
+    const key = `${String(scene.acquired_at).slice(0, 16)}|${scene.platform || ''}`
+    const current = acquisitions.get(key)
+    const cloud = Number.isFinite(Number(scene.cloud_cover)) ? Number(scene.cloud_cover) : Infinity
+    const currentCloud = Number.isFinite(Number(current?.cloud_cover)) ? Number(current.cloud_cover) : Infinity
+    if (!current || cloud < currentCloud) acquisitions.set(key, scene)
+  })
+  return [...acquisitions.values()]
+    .sort((left, right) => String(left.acquired_at).localeCompare(String(right.acquired_at)))
+    .slice(0, Math.max(1, limit))
+}
+
 export function padBounds(bounds, ratio = 0.08) {
   const [south, west, north, east] = bounds
   const latPadding = Math.max((north - south) * ratio, 0.00005)
@@ -219,6 +234,27 @@ export async function prepareCenterFrame(template, center, { signal, onAssetLoad
   }
   onAssetLoaded?.()
   return { url, width: image.naturalWidth, height: image.naturalHeight, tileCount: 1, scope: 'center', decodedImage: image }
+}
+
+export async function prepareSceneFrameBlob(blob, { onAssetLoaded } = {}) {
+  const url = URL.createObjectURL(blob)
+  const image = new Image()
+  image.src = url
+  try {
+    await image.decode()
+  } catch (error) {
+    URL.revokeObjectURL(url)
+    throw error
+  }
+  onAssetLoaded?.()
+  return {
+    url,
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+    tileCount: 1,
+    scope: 'cdse',
+    decodedImage: image,
+  }
 }
 
 export function nextFrameIndex(currentIndex, frameCount, loop = true) {

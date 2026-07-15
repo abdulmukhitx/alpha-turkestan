@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -145,6 +146,7 @@ class CdseSceneCatalog:
         end_date: str,
         max_cloud_cover: float,
         limit: int,
+        geometry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise SceneSearchError("CDSE scene catalogue is disabled")
@@ -155,6 +157,7 @@ class CdseSceneCatalog:
             end_date,
             round(max_cloud_cover, 1),
             limit,
+            json.dumps(geometry, sort_keys=True, separators=(",", ":")) if geometry else "",
         )
         now = time.monotonic()
         with self._lock:
@@ -164,14 +167,17 @@ class CdseSceneCatalog:
                 result["cached"] = True
                 return result
 
-        payload = {
+        payload: dict[str, Any] = {
             "collections": [CDSE_COLLECTION],
-            "bbox": bbox,
             "datetime": f"{start_date}T00:00:00Z/{end_date}T23:59:59Z",
             "query": {"eo:cloud_cover": {"lte": max_cloud_cover}},
             "sortby": [{"field": "properties.datetime", "direction": "asc"}],
             "limit": limit,
         }
+        if geometry:
+            payload["intersects"] = copy.deepcopy(geometry)
+        else:
+            payload["bbox"] = bbox
         data = self._fetcher(f"{CDSE_STAC_URL}/search", payload, self.timeout_seconds)
         features = data.get("features")
         if not isinstance(features, list):

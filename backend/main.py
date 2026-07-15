@@ -27,8 +27,8 @@ Run:
   uvicorn backend.main:app --reload --port 8000
 """
 
-import asyncio, functools, io, json, logging, math, os, threading, time, traceback, uuid
-from datetime import date
+import asyncio, functools, hashlib, io, json, logging, math, os, threading, time, traceback, uuid
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -50,6 +50,10 @@ try:
     from .rate_limit import SlidingWindowRateLimiter
     from .monitoring import MonitoringService
     from .cdse_catalog import CdseSceneCatalog, SceneSearchError
+    from .cdse_process import (
+        CdseSceneRenderer, SceneRenderError, approximate_bbox_area_km2,
+        geometry_bounds as cdse_geometry_bounds,
+    )
 except ImportError:  # supports `python backend/main.py`
     from account_api import create_account_router
     from backup_accounts import backup_status
@@ -58,6 +62,10 @@ except ImportError:  # supports `python backend/main.py`
     from rate_limit import SlidingWindowRateLimiter
     from monitoring import MonitoringService
     from cdse_catalog import CdseSceneCatalog, SceneSearchError
+    from cdse_process import (
+        CdseSceneRenderer, SceneRenderError, approximate_bbox_area_km2,
+        geometry_bounds as cdse_geometry_bounds,
+    )
 
 # ── Optional geo libs ─────────────────────────────────────────────
 try:
@@ -187,11 +195,20 @@ RATE_LIMIT_WINDOW_SECONDS = max(1, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "6
 API_RATE_LIMIT = max(1, int(os.getenv("API_RATE_LIMIT", "120")))
 ANALYSIS_RATE_LIMIT = max(1, int(os.getenv("ANALYSIS_RATE_LIMIT", "20")))
 TILE_RATE_LIMIT = max(1, int(os.getenv("TILE_RATE_LIMIT", "600")))
+CDSE_FRAME_RATE_LIMIT = max(2, int(os.getenv("CDSE_FRAME_RATE_LIMIT", "30")))
 TILE_CACHE_SECONDS = max(60, int(os.getenv("TILE_CACHE_SECONDS", "86400")))
 CDSE_CATALOG_ENABLED = os.getenv("CDSE_CATALOG_ENABLED", "true").lower() in {"1", "true", "yes"}
 CDSE_CATALOG_TIMEOUT_SECONDS = max(1.0, min(30.0, float(os.getenv("CDSE_CATALOG_TIMEOUT_SECONDS", "12"))))
 CDSE_CATALOG_CACHE_SECONDS = max(0, min(3600, int(os.getenv("CDSE_CATALOG_CACHE_SECONDS", "300"))))
 MAX_CONCURRENT_CATALOG_SEARCHES = max(1, min(16, int(os.getenv("MAX_CONCURRENT_CATALOG_SEARCHES", "4"))))
+CDSE_PROCESS_TIMEOUT_SECONDS = max(5.0, min(120.0, float(os.getenv("CDSE_PROCESS_TIMEOUT_SECONDS", "45"))))
+CDSE_FRAME_CACHE_MAX_BYTES = max(16_000_000, int(os.getenv("CDSE_FRAME_CACHE_MAX_BYTES", "1073741824")))
+CDSE_FRAME_MAX_DIMENSION = max(256, min(1024, int(os.getenv("CDSE_FRAME_MAX_DIMENSION", "768"))))
+CDSE_MAX_AOI_KM2 = max(1.0, min(10_000.0, float(os.getenv("CDSE_MAX_AOI_KM2", "2500"))))
+MAX_CONCURRENT_CDSE_RENDERS = max(1, min(8, int(os.getenv("MAX_CONCURRENT_CDSE_RENDERS", "2"))))
+CDSE_FRAME_CACHE_DIR = Path(os.getenv("CDSE_FRAME_CACHE_DIR", "data/cdse_timelapse_cache"))
+if not CDSE_FRAME_CACHE_DIR.is_absolute():
+    CDSE_FRAME_CACHE_DIR = BASE_DIR / CDSE_FRAME_CACHE_DIR
 AI_TIMEOUT_SECONDS = max(1.0, float(os.getenv("AI_TIMEOUT_SECONDS", "15")))
 AI_MAX_RETRIES = max(0, min(2, int(os.getenv("AI_MAX_RETRIES", "0"))))
 MONITORING_SCHEDULER_ENABLED = os.getenv("MONITORING_SCHEDULER_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -200,12 +217,25 @@ ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true
 ENABLE_CHANGE_OVERVIEW = os.getenv("ENABLE_CHANGE_OVERVIEW", "false").lower() in {"1", "true", "yes"}
 _ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
 _CATALOG_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_CATALOG_SEARCHES)
+_CDSE_RENDER_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_CDSE_RENDERS)
 _API_RATE_LIMITER = SlidingWindowRateLimiter()
 CDSE_SCENE_CATALOG = CdseSceneCatalog(
     enabled=CDSE_CATALOG_ENABLED,
     timeout_seconds=CDSE_CATALOG_TIMEOUT_SECONDS,
     cache_seconds=CDSE_CATALOG_CACHE_SECONDS,
 )
+CDSE_SCENE_RENDERER = CdseSceneRenderer(
+    client_id=os.getenv("CDSE_CLIENT_ID", ""),
+    client_secret=os.getenv("CDSE_CLIENT_SECRET", ""),
+    cache_dir=CDSE_FRAME_CACHE_DIR,
+    timeout_seconds=CDSE_PROCESS_TIMEOUT_SECONDS,
+    cache_max_bytes=CDSE_FRAME_CACHE_MAX_BYTES,
+    max_dimension=CDSE_FRAME_MAX_DIMENSION,
+)
+
+
+def timelapse_capabilities_payload() -> dict:
+    return {**CDSE_SCENE_CATALOG.capabilities(), **CDSE_SCENE_RENDERER.capabilities()}
 
 REGION_FALLBACK_BOUNDS = [40.31, 65.36, 46.46, 71.36]  # south, west, north, east
 
@@ -885,12 +915,15 @@ _EXPENSIVE_API_PATHS = {
     "/api/zone_stats",
     "/api/zone_timeseries",
     "/api/timelapse/scenes",
+    "/api/timelapse/frame",
 }
 
 
 def _rate_limit_policy(path: str) -> tuple[str, int] | None:
     if path.startswith("/tiles/"):
         return "tiles", TILE_RATE_LIMIT
+    if path == "/api/timelapse/frame":
+        return "timelapse", CDSE_FRAME_RATE_LIMIT
     if path in _EXPENSIVE_API_PATHS:
         return "analysis", ANALYSIS_RATE_LIMIT
     if path.startswith("/api/"):
@@ -1003,7 +1036,7 @@ def health_payload() -> dict:
         "lulc_classifier_v2_loaded": CLASSIFIER_V2 is not None,
         "linear_forecast": forecast["enabled"],
         "linear_forecast_source_years": forecast["source_years"],
-        "scene_catalogue": CDSE_SCENE_CATALOG.capabilities(),
+        "scene_catalogue": timelapse_capabilities_payload(),
         "monitoring": monitoring_service_status(),
         "accounts": {
             "database": account_database,
@@ -1057,6 +1090,7 @@ async def periods():
 
 class TimelapseSceneSearchReq(BaseModel):
     bbox: list[float] = Field(min_length=4, max_length=4)
+    geometry: dict | None = None
     start_date: date
     end_date: date
     max_cloud_cover: float = Field(default=30.0, ge=0.0, le=100.0)
@@ -1080,7 +1114,7 @@ def validate_scene_search(req: TimelapseSceneSearchReq) -> list[float]:
 
 @app.get("/api/timelapse/capabilities")
 async def timelapse_capabilities():
-    return CDSE_SCENE_CATALOG.capabilities()
+    return timelapse_capabilities_payload()
 
 
 @app.post("/api/timelapse/scenes")
@@ -1088,6 +1122,14 @@ async def timelapse_scenes(req: TimelapseSceneSearchReq):
     if not CDSE_CATALOG_ENABLED:
         raise HTTPException(status_code=503, detail="CDSE scene catalogue is disabled")
     bbox = validate_scene_search(req)
+    geometry = None
+    if req.geometry is not None:
+        _validate_polygon_geometry(req.geometry, allow_multi=True)
+        try:
+            bbox = cdse_geometry_bounds(req.geometry)
+        except SceneRenderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        geometry = req.geometry
     if not _CATALOG_SEMAPHORE.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Scene catalogue is busy; retry shortly")
     try:
@@ -1099,6 +1141,7 @@ async def timelapse_scenes(req: TimelapseSceneSearchReq):
                 end_date=req.end_date.isoformat(),
                 max_cloud_cover=req.max_cloud_cover,
                 limit=req.limit,
+                geometry=geometry,
             )
         except SceneSearchError as exc:
             log_event(logging.WARNING, "cdse_scene_search_failed", error=type(exc).__name__)
@@ -1106,11 +1149,15 @@ async def timelapse_scenes(req: TimelapseSceneSearchReq):
     finally:
         _CATALOG_SEMAPHORE.release()
 
+    capabilities = timelapse_capabilities_payload()
+    for scene in result["scenes"]:
+        scene["renderable"] = capabilities["scene_rendering"]
     return {
         **result,
-        "capabilities": CDSE_SCENE_CATALOG.capabilities(),
+        "capabilities": capabilities,
         "query": {
             "bbox": bbox,
+            "geometry": geometry,
             "start_date": req.start_date.isoformat(),
             "end_date": req.end_date.isoformat(),
             "max_cloud_cover": req.max_cloud_cover,
@@ -1118,6 +1165,69 @@ async def timelapse_scenes(req: TimelapseSceneSearchReq):
         },
         "disclaimer": "Cloud cover is product metadata for the source tile, not an AOI-specific cloud measurement.",
     }
+
+
+class TimelapseSceneFrameReq(BaseModel):
+    geometry: dict
+    scene_id: str = Field(min_length=1, max_length=240)
+    acquired_at: datetime
+    layer: str = Field(default="rgb", pattern="^(rgb|ndvi|ndwi|ndre|ndmi|bsi|savi|nbr)$")
+
+
+def validate_timelapse_frame_aoi(geometry: dict) -> tuple[list[float], float]:
+    _validate_polygon_geometry(geometry, allow_multi=True)
+    try:
+        bbox = cdse_geometry_bounds(geometry)
+    except SceneRenderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    area_km2 = approximate_bbox_area_km2(bbox)
+    if area_km2 > CDSE_MAX_AOI_KM2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"AOI is too large for live CDSE rendering (maximum {CDSE_MAX_AOI_KM2:g} km²)",
+        )
+    return bbox, area_km2
+
+
+@app.post("/api/timelapse/frame")
+async def timelapse_scene_frame(req: TimelapseSceneFrameReq):
+    if not CDSE_SCENE_RENDERER.enabled:
+        raise HTTPException(status_code=503, detail="CDSE scene rendering is not configured")
+    _bbox, area_km2 = validate_timelapse_frame_aoi(req.geometry)
+    if not _CDSE_RENDER_SEMAPHORE.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="CDSE frame renderer is busy; retry shortly")
+    try:
+        try:
+            rendered = await run_in_threadpool(
+                CDSE_SCENE_RENDERER.render,
+                geometry=req.geometry,
+                acquired_at=req.acquired_at,
+                layer=req.layer,
+            )
+        except SceneRenderError as exc:
+            log_event(
+                logging.WARNING,
+                "cdse_scene_render_failed",
+                scene_id=req.scene_id[:80],
+                layer=req.layer,
+                area_km2=round(area_km2, 2),
+                error=type(exc).__name__,
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        _CDSE_RENDER_SEMAPHORE.release()
+
+    etag = hashlib.sha256(rendered["content"]).hexdigest()[:24]
+    return Response(
+        content=rendered["content"],
+        media_type="image/png",
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "ETag": f'"{etag}"',
+            "X-Timelapse-Cache": "hit" if rendered["cached"] else "miss",
+            "X-CDSE-Scene": req.scene_id[:160],
+        },
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2962,7 +3072,7 @@ async def metadata():
         "imagery": {
             "true_color": {"available": cog_available(), "bands": ["B04", "B03", "B02"], "stretch": "2.5x reflectance + gamma 2.2"},
         },
-        "timelapse": CDSE_SCENE_CATALOG.capabilities(),
+        "timelapse": timelapse_capabilities_payload(),
         "forecast": forecast_config(),
     }
 
@@ -2976,7 +3086,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-Requested-With"],
-    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"],
+    expose_headers=[
+        "X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After",
+        "X-Timelapse-Cache", "X-CDSE-Scene",
+    ],
 )
 
 

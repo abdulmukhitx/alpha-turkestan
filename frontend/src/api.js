@@ -211,12 +211,13 @@ export async function fetchPeriods() {
   return r.json()
 }
 
-export async function searchTimelapseScenes({ bbox, startDate, endDate, maxCloudCover = 30, limit = 30 }) {
+export async function searchTimelapseScenes({ bbox, geometry = null, startDate, endDate, maxCloudCover = 30, limit = 30 }) {
   const r = await apiFetch('/api/timelapse/scenes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       bbox,
+      geometry,
       start_date: startDate,
       end_date: endDate,
       max_cloud_cover: maxCloudCover,
@@ -228,6 +229,29 @@ export async function searchTimelapseScenes({ bbox, startDate, endDate, maxCloud
     throw new Error(detail?.detail || `Scene search failed: ${r.status}`)
   }
   return r.json()
+}
+
+export async function fetchTimelapseSceneFrame({ geometry, sceneId, acquiredAt, layer = 'rgb' }, { signal } = {}) {
+  const r = await apiFetch('/api/timelapse/frame', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      geometry,
+      scene_id: sceneId,
+      acquired_at: acquiredAt,
+      layer,
+    }),
+    signal,
+    timeoutMs: 90_000,
+  })
+  if (!r.ok) {
+    const detail = await r.json().catch(() => null)
+    throw new Error(detail?.detail || `Scene frame failed: ${r.status}`)
+  }
+  return {
+    blob: await r.blob(),
+    cached: r.headers.get('X-Timelapse-Cache') === 'hit',
+  }
 }
 
 export async function fetchPixel(lat, lon, period) {
