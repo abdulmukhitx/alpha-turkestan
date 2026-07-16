@@ -294,6 +294,7 @@ class AccountApiTests(unittest.TestCase):
         app = FastAPI()
         self.mailer = FakeMailer()
         self.google_identities = {}
+        self.ground_truth_calls = []
 
         def verify_google(credential, client_id):
             self.assertEqual(client_id, "test-client.apps.googleusercontent.com")
@@ -301,6 +302,27 @@ class AccountApiTests(unittest.TestCase):
                 return self.google_identities[credential]
             except KeyError as exc:
                 raise ValueError("invalid Google token") from exc
+
+        def sample_ground_truth(latitude, longitude, period_id):
+            self.ground_truth_calls.append((latitude, longitude, period_id))
+            return {
+                "lat": latitude,
+                "lon": longitude,
+                "ndvi": 0.61,
+                "ndwi": -0.22,
+                "ndre": 0.31,
+                "ndmi": 0.18,
+                "bsi": -0.08,
+                "savi": 0.52,
+                "nbr": 0.27,
+                "ml_class": "agriculture",
+                "ml_confidence": 0.86,
+                "evidence": {
+                    "kind": "derived_observation",
+                    "period_id": period_id,
+                    "data_version": "test-mosaic-v1",
+                },
+            }
 
         app.include_router(create_account_router(
             self.store,
@@ -310,6 +332,7 @@ class AccountApiTests(unittest.TestCase):
             mailer=self.mailer,
             google_client_id="test-client.apps.googleusercontent.com",
             google_token_verifier=verify_google,
+            ground_truth_sampler=sample_ground_truth,
         ))
         self.client = TestClient(app)
         self.headers = {"X-Requested-With": "GeoAI-TKO"}
@@ -692,6 +715,46 @@ class AccountApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(observation.status_code, 201, observation.text)
+
+        validation = self.client.post(
+            f"/api/account/cases/{case_id}/validations",
+            headers=self.headers,
+            json={
+                "latitude": 43.02,
+                "longitude": 68.07,
+                "observed_at": "2025-07-16T09:30:00Z",
+                "period_id": "2025_summer",
+                "observed_class": "agriculture",
+                "observer_confidence": "high",
+                "note": "Wheat cover confirmed in the field",
+            },
+        )
+        self.assertEqual(validation.status_code, 201, validation.text)
+        self.assertEqual(validation.json()["sample"]["comparison"], "match")
+        self.assertEqual(validation.json()["sample"]["indices"]["ndvi"], 0.61)
+        self.assertEqual(
+            self.ground_truth_calls[-1], (43.02, 68.07, "2025_summer")
+        )
+
+        stale_validation = self.client.post(
+            f"/api/account/cases/{case_id}/validations",
+            headers=self.headers,
+            json={
+                "latitude": 43.02,
+                "longitude": 68.07,
+                "observed_at": "2026-07-16T09:30:00Z",
+                "period_id": "2025_summer",
+                "observed_class": "agriculture",
+                "observer_confidence": "medium",
+            },
+        )
+        self.assertEqual(stale_validation.status_code, 201, stale_validation.text)
+        self.assertEqual(stale_validation.json()["sample"]["comparison"], "out_of_period")
+        dataset = self.client.get("/api/account/ground-truth")
+        self.assertEqual(dataset.status_code, 200, dataset.text)
+        self.assertEqual(dataset.json()["summary"]["total"], 2)
+        self.assertEqual(dataset.json()["summary"]["comparable"], 1)
+        self.assertEqual(dataset.json()["summary"]["agreement_percent"], 100.0)
 
         rejected_close = self.client.patch(
             f"/api/account/cases/{case_id}",

@@ -137,7 +137,16 @@ Personal accounts support:
 - persisted language, time zone, layer, basemap, period, opacity, and panel preferences;
 - synchronized threshold-alert rules;
 - saved zones and saved analysis snapshots;
+- operational field cases with structured satellite-to-ground validation samples;
 - account export and permanent deletion.
+
+The `/work` ground-truth workflow is part of the evidence model, not a generic
+CRM. A validation record pairs a field-observed land-cover class, GPS position,
+timestamp and observer confidence with a server-sampled Sentinel-2 pixel, its
+indices, optional ML class/confidence and source data version. Only samples
+inside the snapshotted case AOI and from the same image year count toward model
+agreement; excluded samples remain in the audit trail. CSV and point-GeoJSON
+exports are intended for GIS review and later training/validation work.
 
 The current SQLite account store assumes one backend instance. This is a personal-account product, not an organization/roles product.
 

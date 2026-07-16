@@ -1753,6 +1753,7 @@ app.include_router(create_account_router(
     google_client_id=GOOGLE_CLIENT_ID,
     monitoring_runner=run_monitoring_for_user,
     monitoring_status=monitoring_service_status,
+    ground_truth_sampler=pixel,
 ))
 
 

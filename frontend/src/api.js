@@ -197,6 +197,12 @@ export const addFieldCaseUpdate = (caseId, update) => accountRequest(`/api/accou
   method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(update),
 })
 
+export const createFieldValidation = (caseId, validation) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}/validations`, {
+  method: 'POST', headers: ACCOUNT_MUTATION_HEADERS, body: JSON.stringify(validation),
+})
+
+export const fetchGroundTruthDataset = () => accountRequest('/api/account/ground-truth')
+
 export const deleteFieldCase = (caseId) => accountRequest(`/api/account/cases/${encodeURIComponent(caseId)}`, {
   method: 'DELETE', headers: ACCOUNT_MUTATION_HEADERS,
 })

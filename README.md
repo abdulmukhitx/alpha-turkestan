@@ -53,6 +53,15 @@ priority, responsible person and due date, and then record:
 - findings, the action taken and the verified outcome;
 - progress through `open`, `in_progress`, `waiting` and `closed` states.
 
+The workbench is also a ground-truth instrument for the land-cover model. A
+field operator records an observed land-cover class, confidence, GPS position
+and observation time. The backend samples the selected Sentinel-2 mosaic at
+that point and stores the spectral indices, ML class, confidence and evidence
+version beside the field label. The resulting validation dataset reports model
+agreement and conflicts and exports as CSV or point GeoJSON for QGIS, accuracy
+review or a future retraining pipeline. Samples outside the task AOI or from a
+different image year remain auditable but are excluded from agreement metrics.
+
 Closing a task requires an outcome. The task snapshots its AOI name and geometry
 when it is created, so account export retains the investigation boundary even
 if the original saved zone is later removed. A print stylesheet turns the task
@@ -63,6 +72,10 @@ Field-work API contracts:
 - `GET/POST /api/account/cases` lists or creates account-owned field tasks.
 - `GET/PATCH/DELETE /api/account/cases/{id}` reads or changes one task.
 - `POST /api/account/cases/{id}/updates` appends an auditable logbook entry.
+- `POST /api/account/cases/{id}/validations` captures a server-sampled
+  satellite-to-ground comparison.
+- `GET /api/account/ground-truth` returns the account validation dataset and
+  model-agreement summary.
 
 Set `MONITORING_SCHEDULER_ENABLED=true` on exactly one backend process to poll
 the newest configured raster every `MONITORING_INTERVAL_SECONDS`. The scheduler
@@ -129,9 +142,10 @@ refreshes and shared links. Commit the file and redeploy after changing it.
 
 ## Project direction
 
-The platform now covers the first operational loop: observe, open a field task,
-investigate, act, verify and report. The next product increments are geotagged
-photo attachments/offline field capture, team membership and real assignees,
-per-AOI monitoring plans, and automatic follow-up checks against new scenes.
-The eight-year ML prediction release remains intentionally deferred until the
-full temporal dataset is available and validated.
+The platform now covers two operational loops: observe, investigate, act and
+report; and sample, compare, review and export ground truth. The next product
+increments are geotagged photo attachments/offline field capture, team
+membership and real assignees, stratified sampling-point generation, per-AOI
+monitoring plans, and automatic follow-up checks against new scenes. The
+eight-year ML prediction release remains intentionally deferred until the full
+temporal dataset is available and validated.

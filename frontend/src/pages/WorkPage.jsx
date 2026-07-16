@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import ProductHeader from '../components/ProductHeader.jsx'
 import {
-  addFieldCaseUpdate, createFieldCase, deleteFieldCase, fetchAccountZones,
-  fetchCurrentAccount, fetchFieldCase, fetchFieldCases, updateFieldCase,
+  addFieldCaseUpdate, createFieldCase, createFieldValidation, deleteFieldCase,
+  fetchAccountZones, fetchCurrentAccount, fetchFieldCase, fetchFieldCases,
+  fetchGroundTruthDataset, fetchPeriods, updateFieldCase,
 } from '../api.js'
 import { useI18n } from '../i18n.jsx'
 
@@ -17,6 +18,12 @@ const EMPTY_UPDATE = { kind: 'note', body: '' }
 const KIND_OPTIONS = ['field_check', 'vegetation', 'irrigation', 'land_change', 'other']
 const PRIORITY_OPTIONS = ['low', 'normal', 'high', 'urgent']
 const STATUS_OPTIONS = ['open', 'in_progress', 'waiting', 'closed']
+const LAND_COVER_OPTIONS = ['agriculture', 'dense_vegetation', 'sparse_vegetation', 'bare_soil', 'urban', 'water']
+
+const EMPTY_GROUND_TRUTH = {
+  samples: [],
+  summary: { total: 0, comparable: 0, matches: 0, conflicts: 0, excluded: 0, agreement_percent: null },
+}
 
 function mapLayerForCase(kind) {
   if (kind === 'irrigation') return 'ndmi'
@@ -28,12 +35,49 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10)
 }
 
+function localDateTimeValue(date = new Date()) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 16)
+}
+
+function geometryCenter(geometry) {
+  const ring = geometry?.type === 'Polygon' ? geometry.coordinates?.[0] : null
+  if (!Array.isArray(ring) || !ring.length) return null
+  const points = ring.length > 1 && ring[0][0] === ring.at(-1)[0] && ring[0][1] === ring.at(-1)[1]
+    ? ring.slice(0, -1) : ring
+  const longitudes = points.map((point) => Number(point[0])).filter(Number.isFinite)
+  const latitudes = points.map((point) => Number(point[1])).filter(Number.isFinite)
+  if (!longitudes.length || !latitudes.length) return null
+  return {
+    longitude: (Math.min(...longitudes) + Math.max(...longitudes)) / 2,
+    latitude: (Math.min(...latitudes) + Math.max(...latitudes)) / 2,
+  }
+}
+
+function csvCell(value) {
+  const text = value == null ? '' : String(value)
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+}
+
+function downloadText(filename, content, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
 export default function WorkPage() {
   const { t, formatDate } = useI18n()
   const [searchParams, setSearchParams] = useSearchParams()
   const [account, setAccount] = useState(null)
   const [zones, setZones] = useState([])
   const [cases, setCases] = useState([])
+  const [periods, setPeriods] = useState([])
+  const [groundTruth, setGroundTruth] = useState(EMPTY_GROUND_TRUTH)
   const [selectedCase, setSelectedCase] = useState(null)
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('active')
@@ -45,6 +89,11 @@ export default function WorkPage() {
   const [createForm, setCreateForm] = useState(EMPTY_CREATE)
   const [editForm, setEditForm] = useState(null)
   const [timelineForm, setTimelineForm] = useState(EMPTY_UPDATE)
+  const [validationForm, setValidationForm] = useState({
+    observed_class: 'agriculture', observer_confidence: 'high', period_id: '',
+    observed_at: localDateTimeValue(), latitude: '', longitude: '', note: '',
+  })
+  const [locating, setLocating] = useState(false)
 
   const cloudMode = account?.user?.email_verified === true
 
@@ -81,11 +130,15 @@ export default function WorkPage() {
       const session = await fetchCurrentAccount()
       setAccount(session)
       if (session?.user?.email_verified) {
-        const [caseResult, zoneResult] = await Promise.all([fetchFieldCases(), fetchAccountZones()])
+        const [caseResult, zoneResult, periodResult, validationResult] = await Promise.all([
+          fetchFieldCases(), fetchAccountZones(), fetchPeriods(), fetchGroundTruthDataset(),
+        ])
         const caseItems = caseResult.cases || []
         const zoneItems = zoneResult.zones || []
         setCases(caseItems)
         setZones(zoneItems)
+        setPeriods(periodResult || [])
+        setGroundTruth(validationResult || EMPTY_GROUND_TRUTH)
         const requestedCase = searchParams.get('case')
         if (requestedCase) await openCase(requestedCase, { updateUrl: false })
         else if (caseItems.length) await openCase(caseItems[0].id, { updateUrl: false })
@@ -133,6 +186,21 @@ export default function WorkPage() {
       resolution: selectedCase.resolution || '',
     })
   }, [selectedCase])
+
+  useEffect(() => {
+    if (!selectedCase) return
+    const center = geometryCenter(selectedCase.zone_geometry)
+    const latestPeriod = periods.filter((item) => item.available).at(-1) || periods.at(-1)
+    setValidationForm({
+      observed_class: 'agriculture',
+      observer_confidence: 'high',
+      period_id: latestPeriod?.period_id || '',
+      observed_at: localDateTimeValue(),
+      latitude: center ? center.latitude.toFixed(6) : '',
+      longitude: center ? center.longitude.toFixed(6) : '',
+      note: '',
+    })
+  }, [selectedCase?.id, periods])
 
   const filteredCases = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase()
@@ -233,12 +301,122 @@ export default function WorkPage() {
     }
   }
 
+  async function addValidation(event) {
+    event.preventDefault()
+    if (!selectedCase) return
+    const latitude = Number(validationForm.latitude)
+    const longitude = Number(validationForm.longitude)
+    const observedDate = new Date(validationForm.observed_at)
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Number.isNaN(observedDate.getTime())) {
+      setError(t('work.validation.invalidLocation'))
+      return
+    }
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const result = await createFieldValidation(selectedCase.id, {
+        latitude,
+        longitude,
+        observed_at: observedDate.toISOString(),
+        period_id: validationForm.period_id,
+        observed_class: validationForm.observed_class,
+        observer_confidence: validationForm.observer_confidence,
+        note: validationForm.note,
+      })
+      const created = result.update
+      setSelectedCase((current) => ({
+        ...current,
+        updated_at: created.created_at,
+        update_count: (current.update_count || 0) + 1,
+        updates: [created, ...(current.updates || [])],
+      }))
+      setCases((current) => current.map((item) => item.id === selectedCase.id
+        ? { ...item, updated_at: created.created_at, update_count: (item.update_count || 0) + 1 }
+        : item))
+      setGroundTruth((current) => ({
+        summary: result.summary,
+        samples: result.sample
+          ? [result.sample, ...current.samples.filter((sample) => sample.id !== result.sample.id)]
+          : current.samples,
+      }))
+      setValidationForm((current) => ({ ...current, note: '' }))
+      setNotice(t(`work.validation.saved.${result.sample?.comparison || 'unclassified'}`))
+    } catch (requestError) {
+      setError(requestError.message || t('work.validation.saveError'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function useCurrentLocation() {
+    if (!navigator.geolocation) {
+      setError(t('work.validation.locationUnavailable'))
+      return
+    }
+    setLocating(true)
+    setError('')
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        setValidationForm((current) => ({
+          ...current,
+          latitude: coords.latitude.toFixed(6),
+          longitude: coords.longitude.toFixed(6),
+        }))
+        setLocating(false)
+      },
+      () => {
+        setError(t('work.validation.locationDenied'))
+        setLocating(false)
+      },
+      { enableHighAccuracy: true, timeout: 12_000, maximumAge: 30_000 },
+    )
+  }
+
+  function exportGroundTruth(format) {
+    if (!groundTruth.samples.length) return
+    const filename = `geoai-ground-truth-${todayIso()}`
+    if (format === 'geojson') {
+      const collection = {
+        type: 'FeatureCollection',
+        name: 'GeoAI TKO ground truth',
+        features: groundTruth.samples.map((sample) => ({
+          type: 'Feature',
+          id: sample.id,
+          geometry: { type: 'Point', coordinates: [sample.longitude, sample.latitude] },
+          properties: {
+            case_id: sample.case_id, case_title: sample.case_title,
+            zone_id: sample.zone_id, zone_name: sample.zone_name, assignee: sample.assignee,
+            observed_at: sample.observed_at, observed_class: sample.observed_class,
+            observer_confidence: sample.observer_confidence, comparison: sample.comparison,
+            satellite_period: sample.satellite_period, satellite_class: sample.satellite_class,
+            satellite_confidence: sample.satellite_confidence, data_version: sample.data_version,
+            ...sample.indices,
+          },
+        })),
+      }
+      downloadText(`${filename}.geojson`, JSON.stringify(collection, null, 2), 'application/geo+json;charset=utf-8')
+      return
+    }
+    const fields = [
+      'id', 'case_id', 'case_title', 'zone_id', 'zone_name', 'assignee', 'latitude', 'longitude',
+      'observed_at', 'observed_class', 'observer_confidence', 'comparison', 'satellite_period',
+      'satellite_class', 'satellite_confidence', 'data_version', 'ndvi', 'ndwi', 'ndre', 'ndmi',
+      'bsi', 'savi', 'nbr', 'note',
+    ]
+    const rows = groundTruth.samples.map((sample) => fields.map((field) => (
+      csvCell(Object.hasOwn(sample.indices || {}, field) ? sample.indices[field] : sample[field])
+    )).join(','))
+    downloadText(`${filename}.csv`, `\uFEFF${fields.join(',')}\r\n${rows.join('\r\n')}`, 'text/csv;charset=utf-8')
+  }
+
   async function removeCase() {
     if (!selectedCase || !window.confirm(t('work.deleteConfirm'))) return
     setBusy(true)
     setError('')
     try {
       await deleteFieldCase(selectedCase.id)
+      setGroundTruth(await fetchGroundTruthDataset())
       const remaining = cases.filter((item) => item.id !== selectedCase.id)
       setCases(remaining)
       setSelectedCase(null)
@@ -260,6 +438,26 @@ export default function WorkPage() {
     })
   }
 
+  function renderValidationResult(update) {
+    const validation = update.evidence?.ground_truth
+    if (!validation) return null
+    const satellite = validation.satellite || {}
+    return (
+      <div className={`timeline-validation ${validation.comparison}`}>
+        <div>
+          <span>{t('work.validation.ground')}</span>
+          <strong>{t(`lulc.${validation.observed_class}`)}</strong>
+        </div>
+        <span aria-hidden="true">↔</span>
+        <div>
+          <span>{t('work.validation.satellite')}</span>
+          <strong>{satellite.class ? t(`lulc.${satellite.class}`) : t('work.validation.noModel')}</strong>
+        </div>
+        <small>{t(`work.validation.result.${validation.comparison}`)} · {satellite.period_id}</small>
+      </div>
+    )
+  }
+
   const selectedMapUrl = selectedCase
     ? `/map?${new URLSearchParams({
       zone: selectedCase.zone_id,
@@ -267,6 +465,10 @@ export default function WorkPage() {
       ...(selectedCase.source_alert?.period_id ? { period: selectedCase.source_alert.period_id } : {}),
     })}`
     : '/map'
+
+  const validationPeriodMismatch = validationForm.period_id.slice(0, 4)
+    && validationForm.observed_at.slice(0, 4)
+    && validationForm.period_id.slice(0, 4) !== validationForm.observed_at.slice(0, 4)
 
   return (
     <div className="page-shell">
@@ -307,6 +509,24 @@ export default function WorkPage() {
               <article><span>{t('work.metric.inProgress')}</span><strong>{metrics.inProgress}</strong><small>{t('work.metric.inProgressHint')}</small></article>
               <article className={metrics.overdue ? 'metric-warning' : ''}><span>{t('work.metric.overdue')}</span><strong>{metrics.overdue}</strong><small>{t('work.metric.overdueHint')}</small></article>
               <article><span>{t('work.metric.closed')}</span><strong>{metrics.closed}</strong><small>{t('work.metric.closedHint')}</small></article>
+            </section>
+
+            <section className="ground-truth-overview" aria-labelledby="ground-truth-title">
+              <div className="ground-truth-intro">
+                <span className="page-eyebrow">VALIDATION DATASET</span>
+                <h2 id="ground-truth-title">{t('work.validation.datasetTitle')}</h2>
+                <p>{t('work.validation.datasetHelp')}</p>
+              </div>
+              <div className="ground-truth-stats">
+                <article><strong>{groundTruth.summary.total}</strong><span>{t('work.validation.samples')}</span></article>
+                <article><strong>{groundTruth.summary.comparable}</strong><span>{t('work.validation.comparable')}</span></article>
+                <article className={groundTruth.summary.conflicts ? 'has-conflicts' : ''}><strong>{groundTruth.summary.conflicts}</strong><span>{t('work.validation.conflicts')}</span></article>
+                <article><strong>{groundTruth.summary.agreement_percent == null ? '—' : `${groundTruth.summary.agreement_percent}%`}</strong><span>{t('work.validation.agreement')}</span></article>
+              </div>
+              <div className="ground-truth-actions">
+                <button type="button" onClick={() => exportGroundTruth('csv')} disabled={!groundTruth.samples.length}>{t('work.validation.exportCsv')}</button>
+                <button type="button" onClick={() => exportGroundTruth('geojson')} disabled={!groundTruth.samples.length}>{t('work.validation.exportGeojson')}</button>
+              </div>
             </section>
 
             <section className="work-toolbar">
@@ -380,6 +600,30 @@ export default function WorkPage() {
                       </section>
                     )}
 
+                    <section className="case-validation" aria-labelledby="case-validation-title">
+                      <div className="case-section-heading">
+                        <div><span className="page-eyebrow">GROUND TRUTH</span><h3 id="case-validation-title">{t('work.validation.title')}</h3></div>
+                        <small>{t('work.validation.caseSamples', { count: groundTruth.samples.filter((sample) => sample.case_id === selectedCase.id).length })}</small>
+                      </div>
+                      <p className="case-validation-help">{t('work.validation.help')}</p>
+                      <form className="validation-form" onSubmit={addValidation}>
+                        <label><span>{t('work.validation.observedClass')}</span><select value={validationForm.observed_class} onChange={(event) => setValidationForm({ ...validationForm, observed_class: event.target.value })}>{LAND_COVER_OPTIONS.map((item) => <option value={item} key={item}>{t(`lulc.${item}`)}</option>)}</select></label>
+                        <label><span>{t('work.validation.confidence')}</span><select value={validationForm.observer_confidence} onChange={(event) => setValidationForm({ ...validationForm, observer_confidence: event.target.value })}>{['high', 'medium', 'low'].map((item) => <option value={item} key={item}>{t(`work.validation.confidence.${item}`)}</option>)}</select></label>
+                        <label><span>{t('work.validation.period')}</span><select required value={validationForm.period_id} onChange={(event) => setValidationForm({ ...validationForm, period_id: event.target.value })}>{periods.map((item) => <option value={item.period_id} key={item.period_id} disabled={!item.available}>{item.label || item.period_id}{!item.available ? ` · ${t('work.validation.unavailable')}` : ''}</option>)}</select></label>
+                        <label><span>{t('work.validation.observedAt')}</span><input required type="datetime-local" value={validationForm.observed_at} onChange={(event) => setValidationForm({ ...validationForm, observed_at: event.target.value })} /></label>
+                        <label><span>{t('work.validation.latitude')}</span><input required inputMode="decimal" value={validationForm.latitude} onChange={(event) => setValidationForm({ ...validationForm, latitude: event.target.value })} /></label>
+                        <label><span>{t('work.validation.longitude')}</span><input required inputMode="decimal" value={validationForm.longitude} onChange={(event) => setValidationForm({ ...validationForm, longitude: event.target.value })} /></label>
+                        <label className="wide"><span>{t('work.validation.note')}</span><textarea rows="2" value={validationForm.note} onChange={(event) => setValidationForm({ ...validationForm, note: event.target.value })} placeholder={t('work.validation.notePlaceholder')} /></label>
+                        <div className="validation-form-footer wide">
+                          <button type="button" className="location-action" onClick={useCurrentLocation} disabled={locating}>{locating ? t('common.wait') : t('work.validation.useLocation')}</button>
+                          <div>
+                            {validationPeriodMismatch && <small className="validation-warning">{t('work.validation.periodWarning')}</small>}
+                            <button type="submit" className="primary-action compact" disabled={busy || !validationForm.period_id}>{busy ? t('common.wait') : t('work.validation.compare')}</button>
+                          </div>
+                        </div>
+                      </form>
+                    </section>
+
                     <form className="case-editor" onSubmit={saveCase}>
                       <div className="case-editor-grid">
                         <label className="wide"><span>{t('work.field.title')}</span><input required value={editForm.title} onChange={(event) => setEditForm({ ...editForm, title: event.target.value })} /></label>
@@ -416,6 +660,7 @@ export default function WorkPage() {
                             <div>
                               <div><strong>{t(`work.updateKind.${update.kind}`)}</strong><time>{displayDate(update.created_at, { dateStyle: 'medium', timeStyle: 'short' })}</time></div>
                               <p>{renderTimelineBody(update)}</p>
+                              {renderValidationResult(update)}
                               {Number.isFinite(update.latitude) && Number.isFinite(update.longitude) && <small>{update.latitude.toFixed(5)}, {update.longitude.toFixed(5)}</small>}
                             </div>
                           </article>

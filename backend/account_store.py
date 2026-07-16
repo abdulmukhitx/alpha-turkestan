@@ -448,6 +448,48 @@ class AccountStore:
             "created_at": row["created_at"],
         }
 
+    @staticmethod
+    def _public_ground_truth_sample(row: sqlite3.Row) -> dict | None:
+        """Flatten a structured field validation into a GIS/export-friendly record."""
+        evidence = json.loads(row["evidence_json"])
+        ground_truth = evidence.get("ground_truth")
+        if not isinstance(ground_truth, dict):
+            return None
+        satellite = ground_truth.get("satellite")
+        if not isinstance(satellite, dict):
+            satellite = {}
+        comparison = ground_truth.get("comparison", "unclassified")
+        match = None
+        if comparison == "match":
+            match = True
+        elif comparison == "conflict":
+            match = False
+        return {
+            "id": row["id"],
+            "case_id": row["case_id"],
+            "case_title": row["case_title"],
+            "zone_id": row["zone_id"],
+            "zone_name": row["zone_name"],
+            "assignee": row["assignee"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "observed_at": row["observed_at"],
+            "recorded_at": row["created_at"],
+            "note": row["body"],
+            "observed_class": ground_truth.get("observed_class"),
+            "observer_confidence": ground_truth.get("observer_confidence"),
+            "inside_zone": ground_truth.get("inside_zone"),
+            "period_match": ground_truth.get("period_match"),
+            "comparison": comparison,
+            "match": match,
+            "satellite_period": satellite.get("period_id"),
+            "satellite_class": satellite.get("class"),
+            "satellite_confidence": satellite.get("confidence"),
+            "indices": satellite.get("indices") or {},
+            "data_version": (satellite.get("evidence") or {}).get("data_version"),
+            "satellite_evidence": satellite.get("evidence") or {},
+        }
+
     def create_user(self, email: str, display_name: str, password: str) -> dict:
         user_id = str(uuid.uuid4())
         now = utc_now()
@@ -1182,6 +1224,57 @@ class AccountStore:
                 (user_id, case_id),
             )
         return result.rowcount > 0
+
+    def ground_truth_dataset(self, user_id: str, limit: int = 1000) -> dict:
+        """Return structured field labels plus model-agreement quality metrics."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT field_case_updates.*, field_cases.zone_id, field_cases.zone_name, "
+                "field_cases.title AS case_title, field_cases.assignee "
+                "FROM field_case_updates JOIN field_cases "
+                "ON field_cases.id = field_case_updates.case_id "
+                "WHERE field_case_updates.user_id = ? "
+                "AND field_case_updates.kind = 'field_observation' "
+                "AND field_case_updates.evidence_json LIKE '%\"ground_truth\"%' "
+                "ORDER BY field_case_updates.created_at DESC, field_case_updates.rowid DESC "
+                "LIMIT ?",
+                (user_id, max(1, min(limit, 5000))),
+            ).fetchall()
+
+        samples = []
+        for row in rows:
+            sample = self._public_ground_truth_sample(row)
+            if sample is not None:
+                samples.append(sample)
+
+        comparable = [sample for sample in samples if sample["comparison"] in {"match", "conflict"}]
+        matches = sum(sample["comparison"] == "match" for sample in comparable)
+        conflicts = len(comparable) - matches
+        by_class: dict[str, dict] = {}
+        for sample in samples:
+            label = sample.get("observed_class") or "unknown"
+            row = by_class.setdefault(label, {"samples": 0, "comparable": 0, "matches": 0, "conflicts": 0})
+            row["samples"] += 1
+            if sample["comparison"] in {"match", "conflict"}:
+                row["comparable"] += 1
+                row["matches"] += int(sample["comparison"] == "match")
+                row["conflicts"] += int(sample["comparison"] == "conflict")
+
+        return {
+            "samples": samples,
+            "summary": {
+                "total": len(samples),
+                "comparable": len(comparable),
+                "matches": matches,
+                "conflicts": conflicts,
+                "excluded": len(samples) - len(comparable),
+                "agreement_percent": round(matches * 100 / len(comparable), 1) if comparable else None,
+                "out_of_period": sum(sample["comparison"] == "out_of_period" for sample in samples),
+                "outside_zone": sum(sample["comparison"] == "outside_zone" for sample in samples),
+                "unclassified": sum(sample["comparison"] == "unclassified" for sample in samples),
+                "by_class": by_class,
+            },
+        }
 
     def monitoring_targets(self, user_id: str | None = None) -> list[dict]:
         """Return verified users, preferences and zones eligible for monitoring."""

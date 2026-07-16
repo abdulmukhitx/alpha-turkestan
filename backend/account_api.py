@@ -344,6 +344,70 @@ class CaseTimelineUpdateRequest(BaseModel):
         return value
 
 
+GroundTruthClass = Literal[
+    "agriculture", "dense_vegetation", "sparse_vegetation",
+    "bare_soil", "urban", "water",
+]
+ObserverConfidence = Literal["low", "medium", "high"]
+
+
+class CaseValidationRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    observed_at: str = Field(min_length=10, max_length=40)
+    period_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    observed_class: GroundTruthClass
+    observer_confidence: ObserverConfidence = "high"
+    note: str = Field(default="", max_length=4000)
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: str) -> str:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("Use an ISO 8601 observation date") from exc
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def clean_note(cls, value: str) -> str:
+        return value.strip()
+
+
+def _point_on_segment(lon: float, lat: float, start: list, end: list) -> bool:
+    x1, y1 = float(start[0]), float(start[1])
+    x2, y2 = float(end[0]), float(end[1])
+    cross = (lon - x1) * (y2 - y1) - (lat - y1) * (x2 - x1)
+    if abs(cross) > 1e-9:
+        return False
+    return min(x1, x2) - 1e-9 <= lon <= max(x1, x2) + 1e-9 and min(y1, y2) - 1e-9 <= lat <= max(y1, y2) + 1e-9
+
+
+def _point_in_ring(lon: float, lat: float, ring: list) -> bool:
+    inside = False
+    for index in range(len(ring) - 1):
+        start, end = ring[index], ring[index + 1]
+        if _point_on_segment(lon, lat, start, end):
+            return True
+        x1, y1 = float(start[0]), float(start[1])
+        x2, y2 = float(end[0]), float(end[1])
+        if (y1 > lat) != (y2 > lat):
+            crossing = (x2 - x1) * (lat - y1) / (y2 - y1) + x1
+            if lon < crossing:
+                inside = not inside
+    return inside
+
+
+def _point_in_polygon(lon: float, lat: float, geometry: dict) -> bool:
+    if geometry.get("type") != "Polygon":
+        return False
+    rings = geometry.get("coordinates") or []
+    if not rings or not _point_in_ring(lon, lat, rings[0]):
+        return False
+    return not any(_point_in_ring(lon, lat, hole) for hole in rings[1:])
+
+
 class AttemptLimiter:
     """Small in-process login throttle suitable for the current deployment."""
 
@@ -386,6 +450,7 @@ def create_account_router(
     google_token_verifier: Callable[[str, str], dict] | None = None,
     monitoring_runner: Callable[[str], dict] | None = None,
     monitoring_status: Callable[[], dict] | None = None,
+    ground_truth_sampler: Callable[[float, float, str], dict] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/account", tags=["account"])
     login_limiter = AttemptLimiter()
@@ -887,6 +952,13 @@ def create_account_router(
     ):
         return {"cases": store.list_cases(user["id"], limit=limit)}
 
+    @router.get("/ground-truth")
+    def get_ground_truth_dataset(
+        limit: int = 1000,
+        user: dict = Depends(verified_user),
+    ):
+        return store.ground_truth_dataset(user["id"], limit=limit)
+
     @router.post("/cases", status_code=status.HTTP_201_CREATED)
     def create_field_case(
         payload: CaseCreateRequest,
@@ -954,6 +1026,92 @@ def create_account_router(
         if not created:
             raise HTTPException(status_code=404, detail="Field case not found")
         return created
+
+    @router.post("/cases/{case_id}/validations", status_code=status.HTTP_201_CREATED)
+    def add_field_validation(
+        case_id: str,
+        payload: CaseValidationRequest,
+        _: None = Depends(require_mutation_request),
+        user: dict = Depends(verified_user),
+    ):
+        if len(case_id) > 120:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        current = store.get_case(user["id"], case_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        if ground_truth_sampler is None:
+            raise HTTPException(status_code=503, detail="Satellite validation is not configured")
+
+        try:
+            satellite_sample = ground_truth_sampler(
+                payload.latitude, payload.longitude, payload.period_id,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logging.getLogger("geoai_tko.account").warning(
+                "ground-truth sampling failed: %s", type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The satellite sample could not be calculated",
+            ) from exc
+
+        observed_year = datetime.fromisoformat(
+            payload.observed_at.replace("Z", "+00:00")
+        ).year
+        period_year_match = re.match(r"^(\d{4})", payload.period_id)
+        period_match = bool(period_year_match and int(period_year_match.group(1)) == observed_year)
+        inside_zone = _point_in_polygon(
+            payload.longitude, payload.latitude, current["zone_geometry"],
+        )
+        satellite_class = satellite_sample.get("ml_class")
+        if not inside_zone:
+            comparison = "outside_zone"
+        elif not period_match:
+            comparison = "out_of_period"
+        elif not satellite_class:
+            comparison = "unclassified"
+        elif satellite_class == payload.observed_class:
+            comparison = "match"
+        else:
+            comparison = "conflict"
+
+        indices = {
+            key: satellite_sample.get(key)
+            for key in ("ndvi", "ndwi", "ndre", "ndmi", "bsi", "savi", "nbr")
+            if isinstance(satellite_sample.get(key), (int, float))
+        }
+        evidence = {
+            "ground_truth": {
+                "schema_version": 1,
+                "observed_class": payload.observed_class,
+                "observer_confidence": payload.observer_confidence,
+                "inside_zone": inside_zone,
+                "period_match": period_match,
+                "comparison": comparison,
+                "satellite": {
+                    "period_id": payload.period_id,
+                    "class": satellite_class,
+                    "confidence": satellite_sample.get("ml_confidence"),
+                    "indices": indices,
+                    "evidence": satellite_sample.get("evidence") or {},
+                },
+            }
+        }
+        created = store.add_case_update(user["id"], case_id, {
+            "kind": "field_observation",
+            "body": payload.note or f"Ground truth: {payload.observed_class}",
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "observed_at": payload.observed_at,
+            "evidence": evidence,
+        })
+        if not created:
+            raise HTTPException(status_code=404, detail="Field case not found")
+        dataset = store.ground_truth_dataset(user["id"], limit=5000)
+        sample = next((item for item in dataset["samples"] if item["id"] == created["id"]), None)
+        return {"update": created, "sample": sample, "summary": dataset["summary"]}
 
     @router.delete("/cases/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_field_case(
