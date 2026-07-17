@@ -164,6 +164,36 @@ S2_BANDS = ["B02", "B03", "B04", "B05", "B08", "B8A", "B11"]
 # old PC-based files (2023_summer/s2_mosaic_cog.tif, s2_mosaic_cog_v2.tif)
 # are left on disk untouched as an archival reference, just no longer read.
 PERIODS = {
+    "2018_summer": {
+        "label": "Лето 2018",
+        "date_range": "01.06.2018 – 31.08.2018",
+        "cog_path": MOSAICS_DIR / "2018_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
+    "2019_summer": {
+        "label": "Лето 2019",
+        "date_range": "01.06.2019 – 31.08.2019",
+        "cog_path": MOSAICS_DIR / "2019_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
+    "2020_summer": {
+        "label": "Лето 2020",
+        "date_range": "01.06.2020 – 31.08.2020",
+        "cog_path": MOSAICS_DIR / "2020_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
+    "2021_summer": {
+        "label": "Лето 2021",
+        "date_range": "01.06.2021 – 31.08.2021",
+        "cog_path": MOSAICS_DIR / "2021_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
+    "2022_summer": {
+        "label": "Лето 2022",
+        "date_range": "01.06.2022 – 31.08.2022",
+        "cog_path": MOSAICS_DIR / "2022_summer" / "s2_mosaic_cog.tif",
+        "storage": "reflectance",
+    },
     "2023_summer": {
         "label": "Лето 2023",
         "date_range": "01.06.2023 – 31.08.2023",
