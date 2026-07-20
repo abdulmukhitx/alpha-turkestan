@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -188,7 +189,9 @@ class PipelineConfig:
     http_attempts: int = 8
     tile_nodata_max_pct: float = 0.5
     aoi_nodata_max_pct: float = 0.5
-    gdal_threads: str = "2"
+    gdal_threads: str = "4"
+    cog_compression: str = "ZSTD"
+    cog_level: int = 1
     strict_cog: bool = True
     cleanup_raw_after_qa: bool = False
     cleanup_work_after_qa: bool = False
@@ -1271,19 +1274,46 @@ def translate_to_cog(paths: YearPaths, config: PipelineConfig, fingerprint: str)
         with rasterio.Env() as environment:
             if "COG" not in environment.drivers():
                 raise PipelineError("this GDAL/rasterio build does not provide the COG driver")
-        log(f"{paths.year}: translating staging raster with GDAL COG driver")
-        raster_copy(
-            paths.staging,
-            part,
-            driver="COG",
-            BLOCKSIZE=str(BLOCK_SIZE),
-            COMPRESS="DEFLATE",
-            PREDICTOR="FLOATING_POINT",
-            BIGTIFF="YES",
-            OVERVIEWS="AUTO",
-            RESAMPLING="NEAREST",
-            NUM_THREADS=config.gdal_threads,
+        log(
+            f"{paths.year}: translating staging raster with GDAL COG driver "
+            f"(compression={config.cog_compression}, level={config.cog_level}, "
+            f"threads={config.gdal_threads})"
         )
+        heartbeat_stop = threading.Event()
+
+        def report_translation_progress() -> None:
+            started = time.monotonic()
+            while not heartbeat_stop.wait(60):
+                size_gb = part.stat().st_size / 1e9 if part.exists() else 0.0
+                elapsed_minutes = (time.monotonic() - started) / 60
+                log(
+                    f"{paths.year}: COG translation heartbeat - output={size_gb:.2f} GB, "
+                    f"elapsed={elapsed_minutes:.1f} min"
+                )
+
+        heartbeat = threading.Thread(
+            target=report_translation_progress,
+            name=f"cog-heartbeat-{paths.year}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            raster_copy(
+                paths.staging,
+                part,
+                driver="COG",
+                BLOCKSIZE=str(BLOCK_SIZE),
+                COMPRESS=config.cog_compression,
+                LEVEL=str(config.cog_level),
+                PREDICTOR="FLOATING_POINT",
+                BIGTIFF="YES",
+                OVERVIEWS="AUTO",
+                RESAMPLING="NEAREST",
+                NUM_THREADS=config.gdal_threads,
+            )
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=5)
     else:
         log(f"{paths.year}: creating application-optimized tiled GeoTIFF")
         shutil.copy2(paths.staging, part)
@@ -1585,7 +1615,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--http-attempts", type=int, default=8)
     parser.add_argument("--tile-nodata-max-pct", type=float, default=0.5)
     parser.add_argument("--aoi-nodata-max-pct", type=float, default=0.5)
-    parser.add_argument("--gdal-threads", default="2")
+    parser.add_argument("--gdal-threads", default="4")
+    parser.add_argument(
+        "--cog-compression",
+        choices=["ZSTD", "DEFLATE", "LZW"],
+        default="ZSTD",
+        help="GDAL COG compression (ZSTD is substantially faster than DEFLATE)",
+    )
+    parser.add_argument("--cog-level", type=int, default=1)
     parser.add_argument("--keep-going", action="store_true", help="continue later years after a failed year")
     parser.add_argument("--cleanup-raw-after-qa", action="store_true")
     parser.add_argument("--cleanup-work-after-qa", action="store_true")
@@ -1623,6 +1660,8 @@ def main(argv: list[str] | None = None) -> int:
         tile_nodata_max_pct=args.tile_nodata_max_pct,
         aoi_nodata_max_pct=args.aoi_nodata_max_pct,
         gdal_threads=str(args.gdal_threads),
+        cog_compression=args.cog_compression,
+        cog_level=args.cog_level,
         strict_cog=args.strict_cog,
         cleanup_raw_after_qa=args.cleanup_raw_after_qa,
         cleanup_work_after_qa=args.cleanup_work_after_qa,

@@ -26,6 +26,8 @@ checkpoint.
   footprints are measured after the build; additional products are downloaded
   automatically when a tile still has too much nodata.
 - Resumable mosaic merge and strict translation through GDAL's COG driver.
+  The final copy uses fast ZSTD level 1 compression and reports a heartbeat
+  with output size every minute, so long COG operations remain observable.
 - Full read-back QA inside the official Turkestan boundary: structure,
   overviews, nodata coverage, finite/range checks for all bands, vegetation
   B08 sanity check, preview, provenance manifest, and final metadata.
