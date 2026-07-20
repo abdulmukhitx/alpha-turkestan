@@ -14,7 +14,7 @@ Environment=OPENBLAS_NUM_THREADS=2
 Environment=MKL_NUM_THREADS=2
 Environment=NUMEXPR_NUM_THREADS=2
 Environment=GDAL_CACHEMAX=512
-ExecStart=%h/geoai-tko/.venv313/bin/python src/processing/historical_mosaic_pipeline.py --years 2018 2019 2020 2021 2022 --keep-going --cleanup-work-after-qa --gdal-threads 4 --cog-compression ZSTD --cog-level 1
+ExecStart=%h/geoai-tko/.venv313/bin/python src/processing/historical_mosaic_pipeline.py --years 2018 2019 2020 2021 2022 --keep-going --cleanup-work-after-qa --tile-nodata-max-pct 20 --gdal-threads 4 --cog-compression ZSTD --cog-level 1
 Restart=on-failure
 RestartSec=300s
 TimeoutStopSec=120s

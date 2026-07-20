@@ -25,6 +25,10 @@ checkpoint.
 - Block-wise reprojection and compositing with bounded RAM. Real pixel
   footprints are measured after the build; additional products are downloaded
   automatically when a tile still has too much nodata.
+- Full-tile repair starts above 20% nodata. This intentionally ignores the
+  approximately 12% rectangular corner area created when UTM-zone-42 MGRS
+  squares are reprojected into the common zone-41 grid; exact boundary QA
+  remains strict and independently allows at most 0.5% nodata.
 - Resumable mosaic merge and strict translation through GDAL's COG driver.
   The final copy uses fast ZSTD level 1 compression and reports a heartbeat
   with output size every minute, so long COG operations remain observable.

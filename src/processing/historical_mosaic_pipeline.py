@@ -187,7 +187,11 @@ class PipelineConfig:
     max_candidates: int = 6
     download_attempts: int = 8
     http_attempts: int = 8
-    tile_nodata_max_pct: float = 0.5
+    # Reprojecting a full UTM-zone-42 MGRS square into the common zone-41
+    # north-up grid creates roughly 12% honest nodata in the rectangular
+    # corners. Candidate repair is meant for the 33-98% orbit-footprint
+    # failures seen in production, not those unavoidable reprojection corners.
+    tile_nodata_max_pct: float = 20.0
     aoi_nodata_max_pct: float = 0.5
     gdal_threads: str = "4"
     cog_compression: str = "ZSTD"
@@ -1613,7 +1617,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, default=6)
     parser.add_argument("--download-attempts", type=int, default=8)
     parser.add_argument("--http-attempts", type=int, default=8)
-    parser.add_argument("--tile-nodata-max-pct", type=float, default=0.5)
+    parser.add_argument(
+        "--tile-nodata-max-pct",
+        type=float,
+        default=20.0,
+        help=(
+            "add repair candidates above this full reprojected-tile nodata percentage; "
+            "20% ignores expected ~12% UTM reprojection corners while catching orbit gaps"
+        ),
+    )
     parser.add_argument("--aoi-nodata-max-pct", type=float, default=0.5)
     parser.add_argument("--gdal-threads", default="4")
     parser.add_argument(
