@@ -2,6 +2,7 @@
 Description=GeoAI TKO unattended Sentinel-2 historical mosaic pipeline
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,18 +14,21 @@ Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
 Environment=MKL_NUM_THREADS=2
 Environment=NUMEXPR_NUM_THREADS=2
-Environment=GDAL_CACHEMAX=512
-ExecStart=%h/geoai-tko/.venv313/bin/python src/processing/historical_mosaic_pipeline.py --years 2018 2019 2020 2021 2022 --keep-going --cleanup-work-after-qa --tile-nodata-max-pct 20 --gdal-threads 4 --cog-compression ZSTD --cog-level 1
+Environment=GDAL_CACHEMAX=256
+ExecStart=%h/geoai-tko/.venv313/bin/python src/processing/historical_mosaic_pipeline.py --years 2018 2019 2020 2021 2022 --cleanup-work-after-qa --tile-nodata-max-pct 20 --gdal-threads 2 --cog-compression ZSTD --cog-level 1 --cog-stall-minutes 45
 Restart=on-failure
 RestartSec=300s
 TimeoutStopSec=120s
 KillSignal=SIGINT
+KillMode=control-group
 UMask=0077
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
-MemoryHigh=4G
-MemoryMax=6G
+CPUQuota=200%
+MemoryHigh=3G
+MemoryMax=5G
+MemorySwapMax=1G
 LimitNOFILE=8192
 
 [Install]

@@ -95,6 +95,9 @@ BLOCK_SIZE = 512
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32, 64]
 BASELINE_RE = re.compile(r"_N(\d{4})_")
 MGRS_RE = re.compile(r"_T(\d{2}[A-Z]{3})_")
+COG_STALL_EXIT_CODE = 75
+COG_ACTIVITY_IO_THRESHOLD = 1024 * 1024
+COG_ACTIVITY_CPU_THRESHOLD_SECONDS = 0.5
 
 # Same padded discovery AOI that produced the verified 43-tile archive.  QA is
 # always performed against the exact boundary GeoJSON, not this rectangle.
@@ -193,9 +196,10 @@ class PipelineConfig:
     # failures seen in production, not those unavoidable reprojection corners.
     tile_nodata_max_pct: float = 20.0
     aoi_nodata_max_pct: float = 0.5
-    gdal_threads: str = "4"
+    gdal_threads: str = "2"
     cog_compression: str = "ZSTD"
     cog_level: int = 1
+    cog_stall_minutes: float = 45.0
     strict_cog: bool = True
     cleanup_raw_after_qa: bool = False
     cleanup_work_after_qa: bool = False
@@ -233,6 +237,80 @@ def update_state(paths: YearPaths, stage: str, status: str, **extra: Any) -> Non
         **extra,
     })
     atomic_write_json(paths.state, state)
+
+
+@dataclass(frozen=True)
+class CogActivitySnapshot:
+    monotonic_seconds: float
+    cpu_seconds: float
+    read_bytes: int | None
+    write_bytes: int | None
+    output_bytes: int
+    temporary_bytes: int
+
+
+def process_io_bytes() -> tuple[int | None, int | None]:
+    """Return actual process disk I/O on Linux when /proc is available."""
+    try:
+        values = {}
+        for line in Path("/proc/self/io").read_text(encoding="ascii").splitlines():
+            key, value = line.split(":", 1)
+            values[key] = int(value.strip())
+        return values.get("read_bytes"), values.get("write_bytes")
+    except (OSError, ValueError):
+        return None, None
+
+
+def directory_file_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        for candidate in path.rglob("*"):
+            try:
+                if candidate.is_file():
+                    total += candidate.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def capture_cog_activity(part: Path, temporary_dir: Path) -> CogActivitySnapshot:
+    read_bytes, write_bytes = process_io_bytes()
+    try:
+        output_bytes = part.stat().st_size
+    except OSError:
+        output_bytes = 0
+    return CogActivitySnapshot(
+        monotonic_seconds=time.monotonic(),
+        cpu_seconds=time.process_time(),
+        read_bytes=read_bytes,
+        write_bytes=write_bytes,
+        output_bytes=output_bytes,
+        temporary_bytes=directory_file_bytes(temporary_dir),
+    )
+
+
+def cog_activity_advanced(previous: CogActivitySnapshot, current: CogActivitySnapshot) -> bool:
+    if current.output_bytes != previous.output_bytes:
+        return True
+    if current.temporary_bytes != previous.temporary_bytes:
+        return True
+    if current.cpu_seconds - previous.cpu_seconds >= COG_ACTIVITY_CPU_THRESHOLD_SECONDS:
+        return True
+    for old_value, new_value in (
+        (previous.read_bytes, current.read_bytes),
+        (previous.write_bytes, current.write_bytes),
+    ):
+        if (
+            old_value is not None
+            and new_value is not None
+            and new_value - old_value >= COG_ACTIVITY_IO_THRESHOLD
+        ):
+            return True
+    return False
 
 
 def retry_delay(attempt: int, cap: int = 300) -> int:
@@ -1274,6 +1352,10 @@ def translate_to_cog(paths: YearPaths, config: PipelineConfig, fingerprint: str)
 
     part = paths.cog.with_name(paths.cog.name + ".part")
     part.unlink(missing_ok=True)
+    temporary_dir = paths.mosaic_dir / ".cog_tmp"
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir)
+    temporary_dir.mkdir(parents=True)
     if config.strict_cog:
         with rasterio.Env() as environment:
             if "COG" not in environment.drivers():
@@ -1287,13 +1369,58 @@ def translate_to_cog(paths: YearPaths, config: PipelineConfig, fingerprint: str)
 
         def report_translation_progress() -> None:
             started = time.monotonic()
+            previous = capture_cog_activity(part, temporary_dir)
+            last_activity = previous.monotonic_seconds
             while not heartbeat_stop.wait(60):
-                size_gb = part.stat().st_size / 1e9 if part.exists() else 0.0
-                elapsed_minutes = (time.monotonic() - started) / 60
-                log(
-                    f"{paths.year}: COG translation heartbeat - output={size_gb:.2f} GB, "
-                    f"elapsed={elapsed_minutes:.1f} min"
+                current = capture_cog_activity(part, temporary_dir)
+                if cog_activity_advanced(previous, current):
+                    last_activity = current.monotonic_seconds
+                stalled_minutes = (current.monotonic_seconds - last_activity) / 60
+                elapsed_minutes = (current.monotonic_seconds - started) / 60
+                read_delta = (
+                    None
+                    if previous.read_bytes is None or current.read_bytes is None
+                    else current.read_bytes - previous.read_bytes
                 )
+                write_delta = (
+                    None
+                    if previous.write_bytes is None or current.write_bytes is None
+                    else current.write_bytes - previous.write_bytes
+                )
+                heartbeat_details = {
+                    "heartbeat_at": utc_now(),
+                    "elapsed_minutes": round(elapsed_minutes, 1),
+                    "inactive_minutes": round(stalled_minutes, 1),
+                    "output_bytes": current.output_bytes,
+                    "temporary_bytes": current.temporary_bytes,
+                    "cpu_seconds_last_minute": round(current.cpu_seconds - previous.cpu_seconds, 2),
+                    "read_bytes_last_minute": read_delta,
+                    "write_bytes_last_minute": write_delta,
+                }
+                update_state(paths, "cog_translate", "running", **heartbeat_details)
+                log(
+                    f"{paths.year}: COG heartbeat - output={current.output_bytes / 1e9:.2f} GB, "
+                    f"temporary={current.temporary_bytes / 1e9:.2f} GB, "
+                    f"CPU={current.cpu_seconds - previous.cpu_seconds:.1f}s/min, "
+                    f"I/O read={0 if read_delta is None else read_delta / 1e6:.1f} MB/min, "
+                    f"write={0 if write_delta is None else write_delta / 1e6:.1f} MB/min, "
+                    f"inactive={stalled_minutes:.1f}/{config.cog_stall_minutes:.1f} min"
+                )
+                if stalled_minutes >= config.cog_stall_minutes:
+                    reason = (
+                        f"no COG CPU, disk I/O, output, or temporary-file activity for "
+                        f"{stalled_minutes:.1f} minutes; exiting for systemd checkpoint restart"
+                    )
+                    update_state(
+                        paths,
+                        "cog_translate",
+                        "stalled",
+                        error=reason,
+                        **heartbeat_details,
+                    )
+                    log(f"{paths.year}: STALLED - {reason}")
+                    os._exit(COG_STALL_EXIT_CODE)
+                previous = current
 
         heartbeat = threading.Thread(
             target=report_translation_progress,
@@ -1302,19 +1429,20 @@ def translate_to_cog(paths: YearPaths, config: PipelineConfig, fingerprint: str)
         )
         heartbeat.start()
         try:
-            raster_copy(
-                paths.staging,
-                part,
-                driver="COG",
-                BLOCKSIZE=str(BLOCK_SIZE),
-                COMPRESS=config.cog_compression,
-                LEVEL=str(config.cog_level),
-                PREDICTOR="FLOATING_POINT",
-                BIGTIFF="YES",
-                OVERVIEWS="AUTO",
-                RESAMPLING="NEAREST",
-                NUM_THREADS=config.gdal_threads,
-            )
+            with rasterio.Env(CPL_TMPDIR=str(temporary_dir.resolve())):
+                raster_copy(
+                    paths.staging,
+                    part,
+                    driver="COG",
+                    BLOCKSIZE=str(BLOCK_SIZE),
+                    COMPRESS=config.cog_compression,
+                    LEVEL=str(config.cog_level),
+                    PREDICTOR="FLOATING_POINT",
+                    BIGTIFF="YES",
+                    OVERVIEWS="AUTO",
+                    RESAMPLING="NEAREST",
+                    NUM_THREADS=config.gdal_threads,
+                )
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=5)
@@ -1324,6 +1452,7 @@ def translate_to_cog(paths: YearPaths, config: PipelineConfig, fingerprint: str)
         with rasterio.open(part, "r+") as destination:
             destination.build_overviews(OVERVIEW_FACTORS, Resampling.nearest)
             destination.update_tags(ns="rio_overview", resampling="nearest")
+    shutil.rmtree(temporary_dir, ignore_errors=True)
     if not config.strict_cog:
         with rasterio.open(part, "r+") as destination:
             destination.update_tags(PIPELINE_VERSION=PIPELINE_VERSION, SOURCE_FINGERPRINT=fingerprint)
@@ -1627,7 +1756,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--aoi-nodata-max-pct", type=float, default=0.5)
-    parser.add_argument("--gdal-threads", default="4")
+    parser.add_argument("--gdal-threads", default="2")
     parser.add_argument(
         "--cog-compression",
         choices=["ZSTD", "DEFLATE", "LZW"],
@@ -1635,6 +1764,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="GDAL COG compression (ZSTD is substantially faster than DEFLATE)",
     )
     parser.add_argument("--cog-level", type=int, default=1)
+    parser.add_argument(
+        "--cog-stall-minutes",
+        type=float,
+        default=45.0,
+        help="restart through systemd if COG translation has no CPU, disk, or file activity",
+    )
     parser.add_argument("--keep-going", action="store_true", help="continue later years after a failed year")
     parser.add_argument("--cleanup-raw-after-qa", action="store_true")
     parser.add_argument("--cleanup-work-after-qa", action="store_true")
@@ -1653,6 +1788,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("years must be complete Sentinel-2 seasons from 2017 through last year")
     if args.top_n < 1 or args.max_candidates < args.top_n:
         raise SystemExit("--max-candidates must be >= --top-n >= 1")
+    if args.cog_stall_minutes < 5:
+        raise SystemExit("--cog-stall-minutes must be at least 5")
 
     username = os.environ.get("CDSE_USERNAME", "").strip()
     password = os.environ.get("CDSE_PASSWORD", "").strip()
@@ -1674,6 +1811,7 @@ def main(argv: list[str] | None = None) -> int:
         gdal_threads=str(args.gdal_threads),
         cog_compression=args.cog_compression,
         cog_level=args.cog_level,
+        cog_stall_minutes=args.cog_stall_minutes,
         strict_cog=args.strict_cog,
         cleanup_raw_after_qa=args.cleanup_raw_after_qa,
         cleanup_work_after_qa=args.cleanup_work_after_qa,

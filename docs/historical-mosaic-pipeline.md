@@ -31,7 +31,9 @@ checkpoint.
   remains strict and independently allows at most 0.5% nodata.
 - Resumable mosaic merge and strict translation through GDAL's COG driver.
   The final copy uses fast ZSTD level 1 compression and reports a heartbeat
-  with output size every minute, so long COG operations remain observable.
+  with output size, temporary size, CPU, and disk I/O every minute. If all
+  four stop changing for 45 minutes, the process exits and systemd restarts
+  it from the last trustworthy checkpoint.
 - Full read-back QA inside the official Turkestan boundary: structure,
   overviews, nodata coverage, finite/range checks for all bands, vegetation
   B08 sanity check, preview, provenance manifest, and final metadata.
@@ -91,6 +93,18 @@ server reboot. Follow progress with:
 journalctl --user -u geoai-s2-history.service -f
 systemctl --user status geoai-s2-history.service
 find /srv/geoai-tko-data/mosaics -name pipeline_state.json -print -exec cat {} \;
+```
+
+The unit deliberately processes years strictly in sorted order without
+`--keep-going`: a failed or stalled year is retried until its COG passes QA;
+only then does the next year begin. It uses two GDAL threads, a 200% CPU cap,
+and bounded memory/swap so the server and SSH remain responsive. Confirm
+logout persistence once after installation:
+
+```bash
+loginctl show-user "$USER" -p Linger
+# If it prints Linger=no:
+sudo loginctl enable-linger "$USER"
 ```
 
 Stopping and starting is safe:

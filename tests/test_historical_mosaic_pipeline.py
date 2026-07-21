@@ -11,6 +11,35 @@ from src.processing import historical_mosaic_pipeline as pipeline
 
 
 class HistoricalMosaicPipelineTests(unittest.TestCase):
+    def test_cog_activity_detects_cpu_io_and_file_progress(self):
+        base = pipeline.CogActivitySnapshot(0.0, 10.0, 100, 200, 300, 400)
+        idle = pipeline.CogActivitySnapshot(60.0, 10.1, 100, 200, 300, 400)
+        cpu = pipeline.CogActivitySnapshot(60.0, 10.6, 100, 200, 300, 400)
+        io = pipeline.CogActivitySnapshot(
+            60.0,
+            10.1,
+            100 + pipeline.COG_ACTIVITY_IO_THRESHOLD,
+            200,
+            300,
+            400,
+        )
+        output = pipeline.CogActivitySnapshot(60.0, 10.1, 100, 200, 301, 400)
+        temporary = pipeline.CogActivitySnapshot(60.0, 10.1, 100, 200, 300, 401)
+
+        self.assertFalse(pipeline.cog_activity_advanced(base, idle))
+        self.assertTrue(pipeline.cog_activity_advanced(base, cpu))
+        self.assertTrue(pipeline.cog_activity_advanced(base, io))
+        self.assertTrue(pipeline.cog_activity_advanced(base, output))
+        self.assertTrue(pipeline.cog_activity_advanced(base, temporary))
+
+    def test_systemd_service_retries_the_first_incomplete_year(self):
+        unit = (pipeline.PROJECT_ROOT / "deploy/ubuntu/geoai-s2-history.service").read_text()
+        self.assertNotIn("--keep-going", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("StartLimitIntervalSec=0", unit)
+        self.assertIn("--gdal-threads 2", unit)
+        self.assertIn("--cog-stall-minutes 45", unit)
+
     def test_baseline_fallback_applies_offset_only_from_0400(self):
         self.assertEqual(
             pipeline.fallback_reflectance_recipe(
