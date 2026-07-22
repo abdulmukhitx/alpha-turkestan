@@ -98,8 +98,11 @@ find /srv/geoai-tko-data/mosaics -name pipeline_state.json -print -exec cat {} \
 The unit deliberately processes years strictly in sorted order without
 `--keep-going`: a failed or stalled year is retried until its COG passes QA;
 only then does the next year begin. It uses two GDAL threads, a 200% CPU cap,
-and bounded memory/swap so the server and SSH remain responsive. Confirm
-logout persistence once after installation:
+and bounded memory/swap so the server and SSH remain responsive. The production
+limits (`MemoryHigh=5G`, `MemoryMax=6G`, `MemorySwapMax=2G`) are sized for the
+7.2 GiB server: a 3 GiB high watermark caused near-continuous cgroup reclaim
+during GDAL overview construction even though the disk was idle. Confirm logout
+persistence once after installation:
 
 ```bash
 loginctl show-user "$USER" -p Linger
