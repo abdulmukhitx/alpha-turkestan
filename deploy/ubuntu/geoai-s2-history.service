@@ -26,7 +26,6 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 CPUQuota=200%
-MemoryHigh=5G
 MemoryMax=6G
 MemorySwapMax=2G
 LimitNOFILE=8192

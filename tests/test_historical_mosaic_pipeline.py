@@ -39,7 +39,7 @@ class HistoricalMosaicPipelineTests(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=0", unit)
         self.assertIn("--gdal-threads 2", unit)
         self.assertIn("--cog-stall-minutes 45", unit)
-        self.assertIn("MemoryHigh=5G", unit)
+        self.assertNotIn("MemoryHigh=", unit)
         self.assertIn("MemoryMax=6G", unit)
         self.assertIn("MemorySwapMax=2G", unit)
 

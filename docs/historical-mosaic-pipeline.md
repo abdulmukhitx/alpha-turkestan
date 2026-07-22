@@ -99,10 +99,11 @@ The unit deliberately processes years strictly in sorted order without
 `--keep-going`: a failed or stalled year is retried until its COG passes QA;
 only then does the next year begin. It uses two GDAL threads, a 200% CPU cap,
 and bounded memory/swap so the server and SSH remain responsive. The production
-limits (`MemoryHigh=5G`, `MemoryMax=6G`, `MemorySwapMax=2G`) are sized for the
-7.2 GiB server: a 3 GiB high watermark caused near-continuous cgroup reclaim
-during GDAL overview construction even though the disk was idle. Confirm logout
-persistence once after installation:
+limits (`MemoryMax=6G`, `MemorySwapMax=2G`) are sized for the 7.2 GiB server.
+There is intentionally no `MemoryHigh` soft limit: 3 GiB and 5 GiB high
+watermarks both caused near-continuous cgroup reclaim during GDAL overview
+construction even though the disk was idle. The hard limit still protects the
+rest of the server. Confirm logout persistence once after installation:
 
 ```bash
 loginctl show-user "$USER" -p Linger
